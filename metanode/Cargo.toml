@@ -1,0 +1,68 @@
+[package]
+name = "metanode-consensus"
+version = "0.1.0"
+edition = "2021"
+authors = ["MetaNode Team"]
+license = "Apache-2.0"
+
+[dependencies]
+# Sui Consensus dependencies - using local copies
+consensus-core = { path = "sui-consensus/core" }
+consensus-config = { path = "sui-consensus/config" }
+consensus-types = { path = "sui-consensus/types" }
+
+# Async runtime - match Sui workspace versions
+tokio = "=1.47.1"
+tokio-stream = { version = "0.1.14", features = ["sync", "net"] }
+
+# Serialization - match Sui workspace versions
+serde = { version = "1.0.144", features = ["derive", "rc"] }
+serde_json = { version = "1.0.95", features = ["preserve_order"] }
+bcs = "0.1.4"
+
+# Error handling - match Sui workspace versions
+anyhow = "1.0.71"
+thiserror = "1.0.40"
+
+# Logging - match Sui workspace versions
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.15", default-features = false, features = ["std", "env-filter", "fmt"] }
+
+# Network
+mysten-network = { path = "../sui/crates/mysten-network" }
+mysten-metrics = { path = "../sui/crates/mysten-metrics" }
+mysten-common = { path = "../sui/crates/mysten-common" }
+
+# Storage
+typed-store = { path = "../sui/crates/typed-store" }
+
+# Protocol
+sui-protocol-config = { path = "../sui/crates/sui-protocol-config" }
+
+# Crypto - use git source like Sui workspace
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "4db0e90c732bbf7420ca20de808b698883148d9c" }
+shared-crypto = { path = "../sui/crates/shared-crypto" }
+
+# Utilities - match Sui workspace versions
+parking_lot = { version = "0.12.3", features = ["arc_lock"] }
+itertools = "0.13.0"
+prometheus = "0.13.3"
+rand = "0.8.5"
+toml = { version = "0.7.4", features = ["preserve_order"] }
+base64 = "0.21.2"
+
+# CLI - match Sui workspace versions
+clap = { version = "4.4", features = ["derive", "wrap_help"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+
+# Patch dependencies to fix axum-server compilation issue
+[patch.crates-io]
+# Try to use a compatible version of hyper-util
+# This is a workaround for axum-server compilation issue in Sui's dependency chain
+
+[[bin]]
+name = "metanode"
+path = "src/main.rs"
+

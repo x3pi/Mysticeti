@@ -1,0 +1,93 @@
+# Rust build artifacts
+**/target/
+**/*.rs.bk
+**/*.pdb
+
+# Cargo
+Cargo.lock
+**/Cargo.lock
+
+# Logs
+**/logs/
+*.log
+**/*.log
+
+# Node configuration and keys (IMPORTANT: Contains private keys!)
+metanode/config/node_*_protocol_key.json
+metanode/config/node_*_network_key.json
+metanode/config/node_*.toml
+metanode/config/committee.json
+metanode/config/epoch_timestamp.txt
+
+# Storage databases
+metanode/config/storage/
+**/consensus_db/
+**/*.sst
+**/*.log
+**/CURRENT
+**/IDENTITY
+**/LOCK
+**/LOG*
+**/MANIFEST-*
+**/OPTIONS-*
+
+# IDE and editor files
+**/.idea/
+**/.vscode/
+**/.vs/
+**/*.swp
+**/*.swo
+**/*~
+**/.DS_Store
+**/Thumbs.db
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+**/*.tmp
+**/*.temp
+**/*.bak
+**/*.backup
+
+# Test coverage
+**/coverage/
+**/*.gcda
+**/*.gcno
+**/*.gcov
+
+# Documentation builds
+**/book/
+**/_book/
+
+# Node modules (if any)
+**/node_modules/
+
+# Environment files
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Compiled binaries (keep source, ignore binaries)
+**/*.exe
+**/*.dll
+**/*.so
+**/*.dylib
+
+# Backup files
+**/*~
+**/*.orig
+
+# tmux session files
+**/.tmux/
+
+# System files
+**/.fuse_hidden*
+**/.nfs*
+

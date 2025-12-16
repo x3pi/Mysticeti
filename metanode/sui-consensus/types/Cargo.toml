@@ -1,0 +1,13 @@
+[package]
+name = "consensus-types"
+version = "0.1.0"
+license = "Apache-2.0"
+authors = ["Mysten Labs <build@mystenlabs.com>"]
+edition = "2021"
+publish = false
+
+[dependencies]
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "4db0e90c732bbf7420ca20de808b698883148d9c" }
+serde = { version = "1.0.144", features = ["derive", "rc"] }
+base64 = "0.21.2"
+consensus-config = { path = "../config" }
