@@ -7,18 +7,16 @@ use consensus_core::{
     ConsensusAuthority, NetworkType, Clock, TransactionClient,
     CommitConsumerArgs,
 };
-use crate::transaction::NoopTransactionVerifier;
 use prometheus::Registry;
 use std::sync::Arc;
 use sui_protocol_config::ProtocolConfig;
 use tracing::info;
-use fastcrypto::hash::{HashFunction, Blake2b256};
 
 use crate::config::NodeConfig;
+use crate::transaction::NoopTransactionVerifier;
 
 pub struct ConsensusNode {
     authority: ConsensusAuthority,
-    #[allow(dead_code)] // Reserved for future use
     transaction_client: Arc<TransactionClient>,
 }
 
@@ -58,44 +56,13 @@ impl ConsensusNode {
         // Spawn tasks to consume commits and blocks to prevent channel overflow
         tokio::spawn(async move {
             use tracing::info;
-            use fastcrypto::hash::{HashFunction, Blake2b256};
-            use consensus_core::BlockAPI;
-            
             while let Some(subdag) = commit_receiver.recv().await {
-                let mut total_transactions = 0;
-                let mut transaction_hashes = Vec::new();
-                
-                // Extract transaction information from all blocks in commit
-                for block in &subdag.blocks {
-                    let transactions = block.transactions();
-                    total_transactions += transactions.len();
-                    
-                    // Calculate hashes for each transaction
-                    for tx in transactions {
-                        let tx_data = tx.data();
-                        let tx_hash = Blake2b256::digest(tx_data).to_vec();
-                        let tx_hash_hex = hex::encode(&tx_hash[..8]); // First 8 bytes
-                        transaction_hashes.push(tx_hash_hex);
-                    }
-                }
-                
-                if total_transactions > 0 {
-                    info!(
-                        "✅ Commit confirmed: index={}, leader={:?}, blocks={}, total_transactions={}, tx_hashes=[{}]",
-                        subdag.commit_ref.index,
-                        subdag.leader,
-                        subdag.blocks.len(),
-                        total_transactions,
-                        transaction_hashes.iter().take(10).map(|h| h.as_str()).collect::<Vec<_>>().join(", ")
-                    );
-                } else {
-                    info!(
-                        "✅ Commit confirmed: index={}, leader={:?}, blocks={}, total_transactions=0",
-                        subdag.commit_ref.index,
-                        subdag.leader,
-                        subdag.blocks.len()
-                    );
-                }
+                info!(
+                    "Received commit: index={}, leader={:?}, blocks={}",
+                    subdag.commit_ref.index,
+                    subdag.leader,
+                    subdag.blocks.len()
+                );
             }
         });
         
@@ -147,7 +114,6 @@ impl ConsensusNode {
         })
     }
 
-    #[allow(dead_code)] // Reserved for future use
     pub fn transaction_client(&self) -> Arc<TransactionClient> {
         self.transaction_client.clone()
     }

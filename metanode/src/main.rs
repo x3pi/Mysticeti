@@ -9,9 +9,11 @@ use tracing::info;
 mod config;
 mod node;
 mod transaction;
+mod rpc;
 
 use config::NodeConfig;
 use node::ConsensusNode;
+use tracing::error;
 
 #[derive(Parser)]
 #[command(name = "metanode")]
@@ -61,9 +63,19 @@ async fn main() -> Result<()> {
             info!("Node ID: {}", node_config.node_id);
             info!("Network address: {}", node_config.network_address);
 
-            let node = ConsensusNode::new(node_config).await?;
+            let node = ConsensusNode::new(node_config.clone()).await?;
+            
+            // Start RPC server for client submissions
+            let rpc_port = node_config.metrics_port + 1000; // RPC port = metrics_port + 1000
+            let rpc_server = rpc::RpcServer::new(node.transaction_client(), rpc_port);
+            tokio::spawn(async move {
+                if let Err(e) = rpc_server.start().await {
+                    error!("RPC server error: {}", e);
+                }
+            });
             
             info!("Consensus node started successfully");
+            info!("RPC server available at http://127.0.0.1:{}", rpc_port);
             info!("Press Ctrl+C to stop the node");
 
             // Wait for shutdown signal
