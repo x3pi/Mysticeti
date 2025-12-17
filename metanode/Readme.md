@@ -332,13 +332,20 @@ tail -f logs/node_0.log | grep ERROR
 ## 📚 Tài liệu
 
 ### Tài liệu MetaNode
-Xem thêm tài liệu chi tiết trong thư mục [docs/](../docs/metanode/):
-- [DEPLOYMENT.md](../docs/metanode/DEPLOYMENT.md) - Hướng dẫn triển khai chi tiết
-- [TROUBLESHOOTING.md](../docs/metanode/TROUBLESHOOTING.md) - Xử lý các vấn đề thường gặp
-- [COPY_MODULES.md](../docs/metanode/COPY_MODULES.md) - Giải thích về việc copy Sui consensus modules
-- [GENESIS_FIX.md](../docs/metanode/GENESIS_FIX.md) - Fix vấn đề đồng bộ genesis blocks
-- [COMMIT_CONSUMER_FIX.md](../docs/metanode/COMMIT_CONSUMER_FIX.md) - Fix vấn đề commit consumer
-- [LOG_ANALYSIS_LATEST.md](../docs/metanode/LOG_ANALYSIS_LATEST.md) - Phân tích logs và trạng thái hệ thống
+
+Xem thêm tài liệu chi tiết trong thư mục [docs/](./docs/):
+
+#### Tài liệu kỹ thuật
+- [docs/README.md](./docs/README.md) - Mục lục và tổng quan tài liệu
+- [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) - Kiến trúc hệ thống và các thành phần
+- [docs/CONSENSUS.md](./docs/CONSENSUS.md) - Cơ chế consensus và DAG
+- [docs/TRANSACTIONS.md](./docs/TRANSACTIONS.md) - Xử lý transactions và commit processing
+- [docs/RPC_API.md](./docs/RPC_API.md) - RPC API documentation
+
+#### Hướng dẫn sử dụng
+- [docs/CONFIGURATION.md](./docs/CONFIGURATION.md) - Cấu hình hệ thống
+- [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) - Triển khai và vận hành
+- [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md) - Xử lý sự cố và debugging
 
 ### Tài liệu Tham khảo
 - [Sui Documentation](https://docs.sui.io/)
