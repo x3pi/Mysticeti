@@ -12,6 +12,7 @@ Tài liệu chi tiết về hệ thống MetaNode Consensus Engine.
 - [CONSENSUS.md](./CONSENSUS.md) - Cơ chế consensus và DAG
 - [TRANSACTIONS.md](./TRANSACTIONS.md) - Xử lý transactions và commit processing
 - [RPC_API.md](./RPC_API.md) - RPC API documentation
+- [COMMITTEE.md](./COMMITTEE.md) - Giải thích về committee.json và cấu hình authorities
 
 ### Hướng dẫn sử dụng
 - [CONFIGURATION.md](./CONFIGURATION.md) - Cấu hình hệ thống

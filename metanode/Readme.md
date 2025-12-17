@@ -341,6 +341,7 @@ Xem thêm tài liệu chi tiết trong thư mục [docs/](./docs/):
 - [docs/CONSENSUS.md](./docs/CONSENSUS.md) - Cơ chế consensus và DAG
 - [docs/TRANSACTIONS.md](./docs/TRANSACTIONS.md) - Xử lý transactions và commit processing
 - [docs/RPC_API.md](./docs/RPC_API.md) - RPC API documentation
+- [docs/COMMITTEE.md](./docs/COMMITTEE.md) - Giải thích về committee.json và cấu hình authorities
 
 #### Hướng dẫn sử dụng
 - [docs/CONFIGURATION.md](./docs/CONFIGURATION.md) - Cấu hình hệ thống
