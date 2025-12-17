@@ -12,7 +12,6 @@ use prometheus::Registry;
 use std::sync::Arc;
 use sui_protocol_config::ProtocolConfig;
 use tracing::info;
-use fastcrypto::hash::{HashFunction, Blake2b256};
 
 use crate::config::NodeConfig;
 
@@ -53,52 +52,17 @@ impl ConsensusNode {
         let transaction_verifier = Arc::new(NoopTransactionVerifier);
 
         // Create commit consumer args
-        let (commit_consumer, mut commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
+        let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
         
-        // Spawn tasks to consume commits and blocks to prevent channel overflow
+        // Create ordered commit processor
+        let commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver);
         tokio::spawn(async move {
-            use tracing::info;
-            use fastcrypto::hash::{HashFunction, Blake2b256};
-            use consensus_core::BlockAPI;
-            
-            while let Some(subdag) = commit_receiver.recv().await {
-                let mut total_transactions = 0;
-                let mut transaction_hashes = Vec::new();
-                
-                // Extract transaction information from all blocks in commit
-                for block in &subdag.blocks {
-                    let transactions = block.transactions();
-                    total_transactions += transactions.len();
-                    
-                    // Calculate hashes for each transaction
-                    for tx in transactions {
-                        let tx_data = tx.data();
-                        let tx_hash = Blake2b256::digest(tx_data).to_vec();
-                        let tx_hash_hex = hex::encode(&tx_hash[..8]); // First 8 bytes
-                        transaction_hashes.push(tx_hash_hex);
-                    }
-                }
-                
-                if total_transactions > 0 {
-                    info!(
-                        "✅ Commit confirmed: index={}, leader={:?}, blocks={}, total_transactions={}, tx_hashes=[{}]",
-                        subdag.commit_ref.index,
-                        subdag.leader,
-                        subdag.blocks.len(),
-                        total_transactions,
-                        transaction_hashes.iter().take(10).map(|h| h.as_str()).collect::<Vec<_>>().join(", ")
-                    );
-                } else {
-                    info!(
-                        "✅ Commit confirmed: index={}, leader={:?}, blocks={}, total_transactions=0",
-                        subdag.commit_ref.index,
-                        subdag.leader,
-                        subdag.blocks.len()
-                    );
-                }
+            if let Err(e) = commit_processor.run().await {
+                tracing::error!("Commit processor error: {}", e);
             }
         });
         
+        // Spawn task to consume blocks (for logging)
         tokio::spawn(async move {
             use tracing::debug;
             while let Some(output) = block_receiver.recv().await {

@@ -241,6 +241,94 @@ Mỗi node có thể expose metrics qua Prometheus:
 2. Node IDs phải match với committee
 3. Regenerate committee nếu cần
 
+## 📋 Xem Logs
+
+### Xem log real-time
+
+**Xem tất cả logs của node 0:**
+```bash
+tail -f logs/node_0.log
+```
+
+**Xem chỉ commits được execute:**
+```bash
+tail -f logs/node_0.log | grep 'Executing commit'
+```
+
+**Xem transactions được submit:**
+```bash
+tail -f logs/node_0.log | grep -E 'Transaction submitted|Transaction included'
+```
+
+**Xem cả commits và transactions:**
+```bash
+tail -f logs/node_0.log | grep -E 'Executing commit|Transaction submitted|Transaction included'
+```
+
+### Xem log của tất cả nodes
+
+**Xem log của tất cả nodes cùng lúc:**
+```bash
+tail -f logs/node_*.log
+```
+
+**Xem log của node cụ thể:**
+```bash
+tail -f logs/node_1.log  # Node 1
+tail -f logs/node_2.log  # Node 2
+tail -f logs/node_3.log  # Node 3
+```
+
+### Tìm kiếm trong logs
+
+**Tìm commit theo index:**
+```bash
+grep "commit #110470" logs/node_0.log
+```
+
+**Tìm transaction theo hash:**
+```bash
+grep "a1b2c3d4" logs/node_0.log
+```
+
+**Đếm số commits:**
+```bash
+grep -c "Executing commit" logs/node_0.log
+```
+
+**Xem commits có transactions:**
+```bash
+grep "Executing commit" logs/node_0.log | grep -v "transactions=0"
+```
+
+**Xem 100 dòng log cuối cùng:**
+```bash
+tail -n 100 logs/node_0.log
+```
+
+**Xem log từ thời điểm cụ thể:**
+```bash
+grep "2025-12-16T10:37" logs/node_0.log
+```
+
+### Xem log với màu sắc (nếu có cài ccze)
+
+```bash
+tail -f logs/node_0.log | ccze -A
+```
+
+### Xem log và lọc theo mức độ
+
+**Chỉ xem INFO và WARN:**
+```bash
+tail -f logs/node_0.log | grep -E 'INFO|WARN'
+```
+
+**Chỉ xem ERROR:**
+```bash
+tail -f logs/node_0.log | grep ERROR
+```
+
 ## 📚 Tài liệu
 
 ### Tài liệu MetaNode
@@ -269,3 +357,24 @@ Apache 2.0 - Giống như Sui
 
 **Lưu ý**: Đây là một implementation đơn giản dựa trên Sui consensus. Để sử dụng trong production, vui lòng tham khảo Sui main repository và best practices.
 
+
+```bash
+
+   # 1. Rebuild
+    cd metanode
+    cargo build --release
+
+    # 2. Restart nodes
+    ./stop_nodes.sh
+    ./run_nodes.sh
+
+    # 3. Xem logs
+    tail -f logs/node_0.log | grep 'Executing commit'
+
+    # 4. Submit transaction (trong terminal khác)
+    cd ../client
+    ./target/release/metanode-client submit \
+        --endpoint http://127.0.0.1:10100 \
+        --data "Hello, Blockchain!"
+
+```

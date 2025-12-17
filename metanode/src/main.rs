@@ -10,6 +10,7 @@ mod config;
 mod node;
 mod transaction;
 mod rpc;
+mod commit_processor;
 
 use config::NodeConfig;
 use node::ConsensusNode;
