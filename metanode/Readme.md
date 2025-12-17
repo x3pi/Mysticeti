@@ -342,6 +342,7 @@ Xem thêm tài liệu chi tiết trong thư mục [docs/](./docs/):
 - [docs/TRANSACTIONS.md](./docs/TRANSACTIONS.md) - Xử lý transactions và commit processing
 - [docs/RPC_API.md](./docs/RPC_API.md) - RPC API documentation
 - [docs/COMMITTEE.md](./docs/COMMITTEE.md) - Giải thích về committee.json và cấu hình authorities
+- [docs/RECOVERY.md](./docs/RECOVERY.md) - Recovery process và commit replay khi khởi động
 
 #### Hướng dẫn sử dụng
 - [docs/CONFIGURATION.md](./docs/CONFIGURATION.md) - Cấu hình hệ thống

@@ -13,6 +13,7 @@ Tài liệu chi tiết về hệ thống MetaNode Consensus Engine.
 - [TRANSACTIONS.md](./TRANSACTIONS.md) - Xử lý transactions và commit processing
 - [RPC_API.md](./RPC_API.md) - RPC API documentation
 - [COMMITTEE.md](./COMMITTEE.md) - Giải thích về committee.json và cấu hình authorities
+- [RECOVERY.md](./RECOVERY.md) - Recovery process và commit replay khi khởi động
 
 ### Hướng dẫn sử dụng
 - [CONFIGURATION.md](./CONFIGURATION.md) - Cấu hình hệ thống
