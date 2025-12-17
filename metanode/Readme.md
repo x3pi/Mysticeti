@@ -343,6 +343,8 @@ Xem thêm tài liệu chi tiết trong thư mục [docs/](./docs/):
 - [docs/RPC_API.md](./docs/RPC_API.md) - RPC API documentation
 - [docs/COMMITTEE.md](./docs/COMMITTEE.md) - Giải thích về committee.json và cấu hình authorities
 - [docs/RECOVERY.md](./docs/RECOVERY.md) - Recovery process và commit replay khi khởi động
+- [docs/EPOCH.md](./docs/EPOCH.md) - Epoch và cách triển khai epoch transition
+- [docs/EPOCH_PRODUCTION.md](./docs/EPOCH_PRODUCTION.md) - Best practices cho epoch transition trong production
 
 #### Hướng dẫn sử dụng
 - [docs/CONFIGURATION.md](./docs/CONFIGURATION.md) - Cấu hình hệ thống

@@ -14,6 +14,8 @@ Tài liệu chi tiết về hệ thống MetaNode Consensus Engine.
 - [RPC_API.md](./RPC_API.md) - RPC API documentation
 - [COMMITTEE.md](./COMMITTEE.md) - Giải thích về committee.json và cấu hình authorities
 - [RECOVERY.md](./RECOVERY.md) - Recovery process và commit replay khi khởi động
+- [EPOCH.md](./EPOCH.md) - Epoch và cách triển khai epoch transition
+- [EPOCH_PRODUCTION.md](./EPOCH_PRODUCTION.md) - Best practices cho epoch transition trong production
 
 ### Hướng dẫn sử dụng
 - [CONFIGURATION.md](./CONFIGURATION.md) - Cấu hình hệ thống
