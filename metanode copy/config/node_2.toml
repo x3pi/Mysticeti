@@ -1,0 +1,12 @@
+node_id = 2
+network_address = "127.0.0.1:9002"
+protocol_key_path = "config/node_2_protocol_key.json"
+network_key_path = "config/node_2_network_key.json"
+committee_path = "config/committee.json"
+storage_path = "config/storage/node_2"
+enable_metrics = true
+metrics_port = 9102
+
+# Speed multiplier: 0.05 = 20x slower (1/20 = 0.05)
+# Set to 1.0 for normal speed, 0.05 for 20x slower
+speed_multiplier = 0.05

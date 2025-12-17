@@ -1,0 +1,40 @@
+{
+  "epoch": 0,
+  "total_stake": 4,
+  "quorum_threshold": 3,
+  "validity_threshold": 2,
+  "authorities": [
+    {
+      "stake": 1,
+      "address": "/ip4/127.0.0.1/tcp/9000",
+      "hostname": "node-0",
+      "authority_key": "qigf4InpYaAXB1JkBE6UuqjgSnT7rjggcR+co0iqhZKqsObC1+mSlI0ObOBxQ4q8F4jbtqXdwRF2lO62UAHvIsC2XLoAJ/FFtwijjwdUQydS8JiuRjzEuXu7F3tW4Akf",
+      "protocol_key": "tZ9tp5ixpRpUWW6mSn361fX/02a15/RI3CLpg9tBnts=",
+      "network_key": "Fefgf36/pkgrpc3Gn8ZBou3c7/CiFvyLeNxq3taS7BU="
+    },
+    {
+      "stake": 1,
+      "address": "/ip4/127.0.0.1/tcp/9001",
+      "hostname": "node-1",
+      "authority_key": "jEP0U6EBE3DuqANABLgDYbLW8BFpLvomGQGJOaZNocIowkfKfl4EZ71ZaN8lDlMSFQNKbgIsQ0tJCrEdh6MmWrmFcpLLyRVeOBhdkNE0jQg1SII7DWHavTKwVpnsXvuH",
+      "protocol_key": "wcbkbn+qY8OZd/xXckfmXuLbdvEGepgrbss5bz7t9M4=",
+      "network_key": "TOZ3TGw9Vt3wwp6Bc3fC+ZZ+WePaLJMD4VWAy3TPBFI="
+    },
+    {
+      "stake": 1,
+      "address": "/ip4/127.0.0.1/tcp/9002",
+      "hostname": "node-2",
+      "authority_key": "qIqJFjCUhMBxGfIVOgHG01uWL/lsR40NtW2t+eka9tcWheCFh68cJZCh3Zw/2Mw8FJ3pVBS/LeQNFvWm5e4EKwdoMxTWJ6Al0N9gINtXKqSnLRUacamgsLiXhz6dYDEY",
+      "protocol_key": "qWD9E1/EZTL3dmm2jlpd7PZmiG9Qgsf97EHLwLaDqwk=",
+      "network_key": "72Ipx7UGnfAek+veu1WDRtVNWLaEEMB59LqR4EQHoXk="
+    },
+    {
+      "stake": 1,
+      "address": "/ip4/127.0.0.1/tcp/9003",
+      "hostname": "node-3",
+      "authority_key": "odWnCPXqpDwwfA9OSrmH6KJKglbuNbJthxd6GJ1HT1HmfxUHG5m0T8gWeMygOLe+A4Mdb8aUIuwT5sm2SencV7mIwvP+mc9l6gD0/3OgWJOokKSLpUJdd+LXUDDlN/mo",
+      "protocol_key": "oiIDsjaej785q5JnwllWAhKWTag5QOXMf04eaP6DC6A=",
+      "network_key": "247FkTJDZb68a7Ub/TDhDfJWgy2IIftsjD5k3Q8DZow="
+    }
+  ]
+}
