@@ -17,6 +17,7 @@ Tài liệu chi tiết về hệ thống MetaNode Consensus Engine.
 - [CONFIGURATION.md](./CONFIGURATION.md) - Cấu hình hệ thống
 - [DEPLOYMENT.md](./DEPLOYMENT.md) - Triển khai và vận hành
 - [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) - Xử lý sự cố và debugging
+- [FAQ.md](./FAQ.md) - Câu hỏi thường gặp về khởi động, recovery, và các vấn đề khác
 
 ## 🚀 Bắt đầu nhanh
 

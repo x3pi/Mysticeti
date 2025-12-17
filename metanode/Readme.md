@@ -346,6 +346,7 @@ Xem thêm tài liệu chi tiết trong thư mục [docs/](./docs/):
 - [docs/CONFIGURATION.md](./docs/CONFIGURATION.md) - Cấu hình hệ thống
 - [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) - Triển khai và vận hành
 - [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md) - Xử lý sự cố và debugging
+- [docs/FAQ.md](./docs/FAQ.md) - Câu hỏi thường gặp về khởi động, recovery, và các vấn đề khác
 
 ### Tài liệu Tham khảo
 - [Sui Documentation](https://docs.sui.io/)
