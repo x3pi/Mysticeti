@@ -247,7 +247,7 @@ impl ConsensusNode {
 
         // Clone protocol_keypair before it's moved into ConsensusAuthority
         let protocol_keypair_for_epoch_task = protocol_keypair.clone();
-        
+
         // Start authority node
         info!("Starting consensus authority node...");
         let authority = ConsensusAuthority::start(
@@ -288,12 +288,16 @@ impl ConsensusNode {
             let protocol_keypair_for_task = protocol_keypair_for_epoch_task.clone();
             let own_index_clone = own_index;
             
+            let clock_sync_manager_clone_for_epoch_task = clock_sync_manager.clone();
+            let ntp_enabled_for_epoch_task = config.enable_ntp_sync;
             tokio::spawn(async move {
                 let mut last_epoch_log = SystemTime::now();
+                let mut last_skip_pending_log = SystemTime::now() - Duration::from_secs(300);
+                let mut last_ntp_unhealthy_log = SystemTime::now() - Duration::from_secs(300);
                 loop {
                     tokio::time::sleep(Duration::from_secs(5)).await; // Check every 5 seconds
                     
-                    let manager = epoch_change_manager_clone.read().await;
+                    let mut manager = epoch_change_manager_clone.write().await;
                     let current_epoch = manager.current_epoch();
                     
                     // Log epoch status every 30 seconds
@@ -344,6 +348,21 @@ impl ConsensusNode {
                         drop(manager);
                         
                         if !has_pending {
+                            // Production gate: if NTP sync is enabled and unhealthy, do NOT propose.
+                            // This prevents a badly-drifted node from constantly proposing.
+                            if ntp_enabled_for_epoch_task {
+                                let clock_ok = clock_sync_manager_clone_for_epoch_task.read().await.is_healthy();
+                                if !clock_ok {
+                                    if last_ntp_unhealthy_log.elapsed().unwrap_or(Duration::from_secs(0))
+                                        >= Duration::from_secs(60)
+                                    {
+                                        warn!("⏱️  Skipping epoch proposal: clock/NTP sync unhealthy (production safety gate)");
+                                        last_ntp_unhealthy_log = SystemTime::now();
+                                    }
+                                    continue;
+                                }
+                            }
+
                             info!("🔄 Time-based epoch change trigger: epoch {} -> {} ({} minutes elapsed)", 
                                 current_epoch, current_epoch + 1, epoch_duration_minutes);
                             
@@ -393,7 +412,14 @@ impl ConsensusNode {
                                 }
                             }
                         } else {
-                            info!("⏭️  Skipping proposal creation: already have pending proposal for epoch {}", current_epoch + 1);
+                            // Throttle this log to avoid spamming when we're waiting for commit-index barrier.
+                            if last_skip_pending_log.elapsed().unwrap_or(Duration::from_secs(0)) >= Duration::from_secs(30) {
+                                info!(
+                                    "⏭️  Skipping proposal creation: already have pending proposal for epoch {}",
+                                    current_epoch + 1
+                                );
+                                last_skip_pending_log = SystemTime::now();
+                            }
                         }
                     }
                 }
@@ -406,6 +432,8 @@ impl ConsensusNode {
         
         tokio::spawn(async move {
             let mut last_quorum_check = SystemTime::now();
+            let mut last_waiting_log = SystemTime::now() - Duration::from_secs(300);
+            let mut last_waiting_commit_index: u32 = 0;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 
@@ -436,15 +464,24 @@ impl ConsensusNode {
                                         transition_commit_index
                                     );
                                 } else {
-                                    info!(
-                                        "⏳ EPOCH TRANSITION WAITING FOR COMMIT INDEX: epoch {} -> {}, proposal_hash={}, votes={}, commit_index={} (need {})",
-                                        proposal.new_epoch - 1,
-                                        proposal.new_epoch,
-                                        hash_hex,
-                                        votes,
-                                        current_commit_index,
-                                        transition_commit_index
-                                    );
+                                    // Throttle waiting log: log at most once per 10s OR when commit index advances by >= 25.
+                                    let should_log = last_waiting_log
+                                        .elapsed()
+                                        .unwrap_or(Duration::from_secs(0)) >= Duration::from_secs(10)
+                                        || current_commit_index.saturating_sub(last_waiting_commit_index) >= 25;
+                                    if should_log {
+                                        info!(
+                                            "⏳ EPOCH TRANSITION WAITING FOR COMMIT INDEX: epoch {} -> {}, proposal_hash={}, votes={}, commit_index={} (need {})",
+                                            proposal.new_epoch - 1,
+                                            proposal.new_epoch,
+                                            hash_hex,
+                                            votes,
+                                            current_commit_index,
+                                            transition_commit_index
+                                        );
+                                        last_waiting_log = SystemTime::now();
+                                        last_waiting_commit_index = current_commit_index;
+                                    }
                                 }
                             } else {
                                 info!(

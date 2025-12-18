@@ -105,6 +105,11 @@ pub(crate) struct CommitSyncer<C: NetworkClient> {
     // The commit index that is the max of highest local commit index and commit index inflight to Core.
     // Used to determine if fetched blocks can be sent to Core without gaps.
     synced_commit_index: CommitIndex,
+
+    // --- log throttling ---
+    last_schedule_log_at: tokio::time::Instant,
+    last_logged_quorum_commit_index: CommitIndex,
+    last_logged_local_commit_index: CommitIndex,
 }
 
 impl<C: NetworkClient> CommitSyncer<C> {
@@ -137,6 +142,9 @@ impl<C: NetworkClient> CommitSyncer<C> {
             highest_scheduled_index: None,
             highest_fetched_commit_index: 0,
             synced_commit_index,
+            last_schedule_log_at: tokio::time::Instant::now() - Duration::from_secs(300),
+            last_logged_quorum_commit_index: 0,
+            last_logged_local_commit_index: 0,
         }
     }
 
@@ -201,14 +209,37 @@ impl<C: NetworkClient> CommitSyncer<C> {
         // local commit index.
         self.synced_commit_index = self.synced_commit_index.max(local_commit_index);
         let unhandled_commits_threshold = self.unhandled_commits_threshold();
-        info!(
-            "Checking to schedule fetches: synced_commit_index={}, highest_handled_index={}, highest_scheduled_index={}, quorum_commit_index={}, unhandled_commits_threshold={}",
-            self.synced_commit_index,
-            highest_handled_index,
-            highest_scheduled_index,
-            quorum_commit_index,
-            unhandled_commits_threshold,
-        );
+        // Throttle noisy logs:
+        // - When healthy (no lag): log at most once per 120s.
+        // - When lagging (quorum ahead of local): log at most once per 30s, or when lag jumps notably.
+        let now = tokio::time::Instant::now();
+        let lag = quorum_commit_index.saturating_sub(local_commit_index);
+        let last_lag = self
+            .last_logged_quorum_commit_index
+            .saturating_sub(self.last_logged_local_commit_index);
+        let min_interval = if lag == 0 {
+            Duration::from_secs(120)
+        } else {
+            Duration::from_secs(30)
+        };
+        let lag_jump = lag > last_lag + (unhandled_commits_threshold / 2).max(1);
+        if now.duration_since(self.last_schedule_log_at) >= min_interval
+            || lag_jump
+            || quorum_commit_index != self.last_logged_quorum_commit_index && lag > 0 && now.duration_since(self.last_schedule_log_at) >= Duration::from_secs(10)
+        {
+            info!(
+                "Checking to schedule fetches: synced_commit_index={}, highest_handled_index={}, highest_scheduled_index={}, quorum_commit_index={}, unhandled_commits_threshold={}, lag={}",
+                self.synced_commit_index,
+                highest_handled_index,
+                highest_scheduled_index,
+                quorum_commit_index,
+                unhandled_commits_threshold,
+                lag,
+            );
+            self.last_schedule_log_at = now;
+            self.last_logged_quorum_commit_index = quorum_commit_index;
+            self.last_logged_local_commit_index = local_commit_index;
+        }
 
         // TODO: cleanup inflight fetches that are no longer needed.
         let fetch_after_index = self

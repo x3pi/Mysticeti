@@ -227,6 +227,9 @@ pub struct EpochChangeManager {
     /// Max clock drift allowed (in milliseconds)
     #[allow(dead_code)] // Will be used when implementing clock sync validation
     max_clock_drift_ms: u64,
+
+    /// Throttle noisy time-based check logs.
+    last_time_based_check_log_ms: u64,
 }
 
 impl EpochChangeManager {
@@ -252,6 +255,7 @@ impl EpochChangeManager {
             time_based_enabled,
             epoch_duration_seconds,
             max_clock_drift_ms,
+            last_time_based_check_log_ms: 0,
         }
     }
 
@@ -274,6 +278,9 @@ impl EpochChangeManager {
         self.proposal_history.clear();
         self.seen_proposals.clear();
         self.quorum_logged.clear();
+
+        // Reset log throttling state for new epoch.
+        self.last_time_based_check_log_ms = 0;
     }
 
     /// Returns true if we've already logged quorum for this proposal hash.
@@ -301,7 +308,7 @@ impl EpochChangeManager {
     }
 
     /// Check if time-based proposal should be triggered
-    pub fn should_propose_time_based(&self) -> bool {
+    pub fn should_propose_time_based(&mut self) -> bool {
         if !self.time_based_enabled {
             return false;
         }
@@ -316,16 +323,31 @@ impl EpochChangeManager {
         // Propose when enough time has elapsed (may drift a few seconds due to clock drift)
         let should_propose = elapsed_seconds >= self.epoch_duration_seconds;
         
-        // Log when checking (only when close to threshold or when should propose)
-        if should_propose || elapsed_seconds >= self.epoch_duration_seconds.saturating_sub(30) {
-            let remaining = self.epoch_duration_seconds.saturating_sub(elapsed_seconds);
+        // Log throttling:
+        // - When close to threshold (last 30s): log at most once per 5s.
+        // - When past threshold: log at most once per 60s to avoid spam while waiting for barrier.
+        let remaining = self.epoch_duration_seconds.saturating_sub(elapsed_seconds);
+        let close_to_threshold = elapsed_seconds >= self.epoch_duration_seconds.saturating_sub(30);
+        let last_ms = self.last_time_based_check_log_ms;
+        let min_interval_ms = if should_propose { 60_000 } else { 5_000 };
+        if close_to_threshold && now_ms.saturating_sub(last_ms) >= min_interval_ms {
             if should_propose {
-                info!("⏰ EPOCH CHANGE CHECK: epoch={}, elapsed={}s, duration={}s, should_propose=YES (time reached!)",
-                    self.current_epoch, elapsed_seconds, self.epoch_duration_seconds);
+                info!(
+                    "⏰ EPOCH CHANGE CHECK: epoch={}, elapsed={}s, duration={}s, should_propose=YES (time reached!)",
+                    self.current_epoch,
+                    elapsed_seconds,
+                    self.epoch_duration_seconds
+                );
             } else {
-                info!("⏰ EPOCH CHANGE CHECK: epoch={}, elapsed={}s, remaining={}s, duration={}s, should_propose=NO",
-                    self.current_epoch, elapsed_seconds, remaining, self.epoch_duration_seconds);
+                info!(
+                    "⏰ EPOCH CHANGE CHECK: epoch={}, elapsed={}s, remaining={}s, duration={}s, should_propose=NO",
+                    self.current_epoch,
+                    elapsed_seconds,
+                    remaining,
+                    self.epoch_duration_seconds
+                );
             }
+            self.last_time_based_check_log_ms = now_ms;
         }
         
         should_propose

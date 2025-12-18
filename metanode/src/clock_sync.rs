@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, Duration};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio::process::Command;
 use tracing::{info, warn, error};
 
 /// Manager for clock synchronization with NTP servers
@@ -36,8 +37,11 @@ impl ClockSyncManager {
     }
 
     /// Sync with NTP servers
-    /// Note: This is a placeholder implementation
-    /// In production, you would use an NTP client library or system NTP
+    /// Production implementation (Option B): query system time sync (chrony).
+    ///
+    /// We intentionally do NOT implement a full NTP client inside the consensus process. Instead:
+    /// - Use system chrony/ntpd to keep OS clock in sync (battle-tested)
+    /// - Read current offset/health from the system and apply gating for epoch proposals
     pub async fn sync_with_ntp(&mut self) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -48,21 +52,77 @@ impl ClockSyncManager {
             return Ok(());
         }
 
-        // Placeholder: In production, query NTP servers and calculate offset
-        // For now, we'll just log that sync would happen
-        info!("NTP sync would query servers: {:?}", self.ntp_servers);
-        
-        // In a real implementation:
-        // 1. Query each NTP server
-        // 2. Calculate average/median offset
-        // 3. Update clock_offset_ms
-        // 4. Update last_sync_time
-        
+        // We keep ntp_servers in config for ops documentation, but the actual sync is done by chrony.
+        // This method reads chrony's tracking offset (system time vs NTP time).
+        let offset_ms = self.query_chrony_offset_ms().await?;
         self.last_sync_time = Some(SystemTime::now());
-        self.clock_offset_ms = 0; // Placeholder
-        
-        info!("Clock sync completed: offset={}ms", self.clock_offset_ms);
+        self.clock_offset_ms = offset_ms;
+        info!("Clock sync completed (chrony): offset={}ms", self.clock_offset_ms);
         Ok(())
+    }
+
+    /// Query chrony for current clock offset.
+    /// Returns offset in milliseconds (positive = local clock ahead, negative = behind).
+    async fn query_chrony_offset_ms(&self) -> Result<i64> {
+        // `chronyc tracking` output examples:
+        // - "System time     : 0.000000123 seconds fast of NTP time"
+        // - "System time     : 0.000000123 seconds slow of NTP time"
+        // - "Last offset     : +0.000001234 seconds"
+        //
+        // We prefer "System time" line if present because it's explicit about fast/slow.
+        let output = Command::new("chronyc")
+            .arg("tracking")
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to execute chronyc (is chrony installed?): {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("chronyc tracking failed: {}", stderr.trim());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        self.parse_chronyc_tracking_offset_ms(&stdout)
+            .ok_or_else(|| anyhow::anyhow!("Unable to parse clock offset from `chronyc tracking` output"))
+    }
+
+    fn parse_chronyc_tracking_offset_ms(&self, tracking_output: &str) -> Option<i64> {
+        // 1) Try "System time" line with fast/slow of NTP time.
+        for line in tracking_output.lines() {
+            let line = line.trim();
+            if line.starts_with("System time") {
+                // Extract "...: <value> seconds fast|slow of NTP time"
+                // Split on ':' then parse first token as f64 seconds.
+                let rhs = line.splitn(2, ':').nth(1)?.trim();
+                let mut parts = rhs.split_whitespace();
+                let secs_str = parts.next()?;
+                let secs: f64 = secs_str.parse().ok()?;
+                let direction = rhs;
+                let ms = (secs * 1000.0).round() as i64;
+                if direction.contains("fast of NTP time") {
+                    return Some(ms);
+                }
+                if direction.contains("slow of NTP time") {
+                    return Some(-ms);
+                }
+                // If direction unknown, fallthrough to "Last offset".
+            }
+        }
+
+        // 2) Fallback: "Last offset : +0.000001 seconds"
+        for line in tracking_output.lines() {
+            let line = line.trim();
+            if line.starts_with("Last offset") {
+                let rhs = line.splitn(2, ':').nth(1)?.trim();
+                let mut parts = rhs.split_whitespace();
+                let signed_secs_str = parts.next()?; // may include '+'/'-'
+                let secs: f64 = signed_secs_str.parse().ok()?;
+                let ms = (secs * 1000.0).round() as i64;
+                return Some(ms);
+            }
+        }
+
+        None
     }
 
     /// Get synchronized time (local time + offset)
