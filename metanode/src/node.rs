@@ -513,15 +513,14 @@ impl ConsensusNode {
                         transition_commit_index
                     );
                     info!(
-                        "  ⚠️  NOTE: Actual transition logic needs to be implemented"
+                        "  🔁 Transition: in-process authority restart (implemented)"
                     );
                     info!(
                         "🚀 ========================================"
                     );
                     
-                    // Note: Actual transition will be handled by external coordinator
-                    // or through a separate mechanism that has access to ConsensusNode
-                    // For now, we just log that transition is ready
+                    // Note: Actual transition is handled by the coordinator (main.rs) which calls
+                    // `transition_to_epoch()` on the ConsensusNode when it is ready.
                 }
             }
         });

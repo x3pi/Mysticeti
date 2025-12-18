@@ -820,7 +820,12 @@ impl<C: NetworkClient, V: BlockVerifier, D: CoreThreadDispatcher> Synchronizer<C
                                         }
                                     },
                                     Err(err) => {
-                                        warn!("Error {err} while fetching our own block from peer {authority_index}. Will retry.");
+                                        // During startup (or right after epoch restart) peers may not have their network
+                                        // service ready yet, which results in transient connect errors.
+                                        // Keep this at DEBUG to avoid alarming operators; the retry loop will handle it.
+                                        debug!(
+                                            "Error {err} while fetching our own block from peer {authority_index}. Will retry."
+                                        );
                                         results.push(fetch_own_block(authority_index, FETCH_OWN_BLOCK_RETRY_DELAY));
                                     }
                                 }

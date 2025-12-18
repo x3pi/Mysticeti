@@ -87,7 +87,8 @@ impl CommitProcessor {
                     }
                 }
                 None => {
-                    warn!("Commit receiver closed");
+                    // Expected during epoch transition / authority restart (commit consumer is dropped).
+                    tracing::debug!("Commit receiver closed");
                     break;
                 }
             }

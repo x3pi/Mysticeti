@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use prometheus::Registry;
 use sui_protocol_config::ProtocolConfig;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{
     CommitConsumerArgs,
@@ -373,8 +373,10 @@ where
             if e.is_panic() {
                 std::panic::resume_unwind(e.into_panic());
             }
-            warn!(
-                "Failed to stop synchronizer when shutting down consensus: {:?}",
+            // Cancellation can happen during an epoch transition where we intentionally abort in-flight tasks.
+            // Keep it at DEBUG to avoid alarming operators.
+            tracing::debug!(
+                "Synchronizer stop returned error during shutdown: {:?}",
                 e
             );
         };
