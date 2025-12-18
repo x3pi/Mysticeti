@@ -550,8 +550,7 @@ impl EpochChangeManager {
             .sum();
 
         let quorum_threshold = self.committee.quorum_threshold();
-        let total_stake = self.committee.total_stake();
-        
+
         // Check quorum approve
         if approve_stake >= quorum_threshold {
             // Do NOT log here (this function is called in many loops and would spam).
@@ -562,23 +561,6 @@ impl EpochChangeManager {
         if reject_stake >= quorum_threshold {
             // Do NOT log here (avoid spam).
             return Some(false);
-        }
-
-        // Log quorum progress periodically (every 5 votes or when significant change)
-        if votes.len() % 5 == 0 || approve_stake + reject_stake >= quorum_threshold / 2 {
-            let proposal_hash_hex = hex::encode(&proposal_hash[..8]);
-            info!(
-                "📊 Quorum progress: proposal_hash={}, epoch {} -> {}, approve_stake={}/{}, reject_stake={}/{}, threshold={}, votes={}",
-                proposal_hash_hex,
-                proposal.new_epoch - 1,
-                proposal.new_epoch,
-                approve_stake,
-                total_stake,
-                reject_stake,
-                total_stake,
-                quorum_threshold,
-                votes.len()
-            );
         }
 
         None // Not reached quorum yet
@@ -801,10 +783,63 @@ impl EpochChangeManager {
         self.validate_vote(&vote)?;
 
         // Store vote de-duplicated by voter.
-        self.proposal_votes
+        let prev = self.proposal_votes
             .entry(vote.proposal_hash.clone())
             .or_insert_with(HashMap::new)
-            .insert(vote.voter_value, vote);
+            .insert(vote.voter_value, vote.clone());
+
+        // Emit quorum progress ONLY when we accepted a NEW vote (prevents log spam from repeated checks).
+        if prev.is_none() {
+            if let Some(proposal) = self.pending_proposals.get(&vote.proposal_hash) {
+                if let Some(votes_map) = self.proposal_votes.get(&vote.proposal_hash) {
+                    let votes: Vec<&EpochChangeVote> = votes_map.values().collect();
+
+                    let approve_stake: Stake = votes
+                        .iter()
+                        .filter(|v| v.approve)
+                        .map(|v| {
+                            let voter = v.voter();
+                            if self.committee.is_valid_index(voter) {
+                                self.committee.authority(voter).stake
+                            } else {
+                                0
+                            }
+                        })
+                        .sum();
+
+                    let reject_stake: Stake = votes
+                        .iter()
+                        .filter(|v| !v.approve)
+                        .map(|v| {
+                            let voter = v.voter();
+                            if self.committee.is_valid_index(voter) {
+                                self.committee.authority(voter).stake
+                            } else {
+                                0
+                            }
+                        })
+                        .sum();
+
+                    let quorum_threshold = self.committee.quorum_threshold();
+                    let total_stake = self.committee.total_stake();
+                    let proposal_hash_hex =
+                        hex::encode(&vote.proposal_hash[..8.min(vote.proposal_hash.len())]);
+
+                    info!(
+                        "📊 Quorum progress: proposal_hash={}, epoch {} -> {}, approve_stake={}/{}, reject_stake={}/{}, threshold={}, votes={}",
+                        proposal_hash_hex,
+                        proposal.new_epoch - 1,
+                        proposal.new_epoch,
+                        approve_stake,
+                        total_stake,
+                        reject_stake,
+                        total_stake,
+                        quorum_threshold,
+                        votes.len()
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
