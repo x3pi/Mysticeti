@@ -2,21 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use consensus_core::TransactionClient;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, error};
 use fastcrypto::hash::{HashFunction, Blake2b256};
+use crate::tx_submitter::TransactionSubmitter;
 
 /// Simple HTTP RPC server for submitting transactions
 pub struct RpcServer {
-    transaction_client: Arc<TransactionClient>,
+    transaction_client: Arc<dyn TransactionSubmitter>,
     port: u16,
 }
 
 impl RpcServer {
-    pub fn new(transaction_client: Arc<TransactionClient>, port: u16) -> Self {
+    pub fn new(transaction_client: Arc<dyn TransactionSubmitter>, port: u16) -> Self {
         Self {
             transaction_client,
             port,

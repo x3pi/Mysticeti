@@ -259,6 +259,16 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
                 .add_voted_blocks(vec![(verified_block.clone(), reject_txn_votes)]);
         }
 
+        // Process epoch change data from block before accepting into DAG
+        let proposal_bytes = verified_block.epoch_change_proposal().map(|v| v.as_slice());
+        let votes_bytes: Vec<Vec<u8>> = verified_block.epoch_change_votes()
+            .iter()
+            .map(|v| v.clone())
+            .collect();
+        if proposal_bytes.is_some() || !votes_bytes.is_empty() {
+            crate::epoch_change_provider::process_block_epoch_change(proposal_bytes, &votes_bytes);
+        }
+
         // Try to accept the block into the DAG.
         let missing_ancestors = self
             .core_dispatcher

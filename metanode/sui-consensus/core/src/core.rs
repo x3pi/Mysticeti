@@ -637,8 +637,11 @@ impl Core {
             vec![]
         };
 
+        // Get epoch change data to include in block
+        let (epoch_change_proposal, epoch_change_votes) = crate::epoch_change_provider::get_epoch_change_data();
+        
         // Create the block and insert to storage.
-        let block = if self.context.protocol_config.mysticeti_fastpath() {
+        let mut block = if self.context.protocol_config.mysticeti_fastpath() {
             Block::V2(BlockV2::new(
                 self.context.committee.epoch(),
                 clock_round,
@@ -662,6 +665,13 @@ impl Core {
                 vec![],
             ))
         };
+        
+        // Include epoch change data in block
+        // NOTE: All nodes must have updated code (no backward compatibility)
+        // For production, use BlockV2 with versioning or separate epoch change messages
+        block.set_epoch_change_proposal(epoch_change_proposal);
+        block.set_epoch_change_votes(epoch_change_votes);
+        
         let signed_block =
             SignedBlock::new(block, &self.block_signer).expect("Block signing failed.");
         let serialized = signed_block

@@ -20,6 +20,7 @@ mod core;
 mod core_thread;
 mod dag_state;
 mod error;
+pub mod epoch_change_provider;
 mod leader_schedule;
 mod leader_scoring;
 mod leader_timeout;

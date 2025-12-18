@@ -90,6 +90,12 @@ pub(crate) struct BlockV1 {
     transactions: Vec<Transaction>,
     commit_votes: Vec<CommitVote>,
     misbehavior_reports: Vec<MisbehaviorReport>,
+    /// Epoch change proposal (serialized as bytes to avoid cross-crate dependencies)
+    /// NOTE: BCS does not support default values, so these fields are always serialized
+    /// For backward compatibility, we need to ensure all nodes start fresh or migrate storage
+    epoch_change_proposal: Option<Vec<u8>>,
+    /// Epoch change votes (serialized as bytes)
+    epoch_change_votes: Vec<Vec<u8>>,
 }
 
 impl BlockV1 {
@@ -112,7 +118,29 @@ impl BlockV1 {
             transactions,
             commit_votes,
             misbehavior_reports,
+            epoch_change_proposal: None,
+            epoch_change_votes: Vec::new(),
         }
+    }
+
+    /// Set epoch change proposal
+    pub(crate) fn set_epoch_change_proposal(&mut self, proposal: Option<Vec<u8>>) {
+        self.epoch_change_proposal = proposal;
+    }
+
+    /// Get epoch change proposal
+    pub(crate) fn epoch_change_proposal(&self) -> Option<&Vec<u8>> {
+        self.epoch_change_proposal.as_ref()
+    }
+
+    /// Set epoch change votes
+    pub(crate) fn set_epoch_change_votes(&mut self, votes: Vec<Vec<u8>>) {
+        self.epoch_change_votes = votes;
+    }
+
+    /// Get epoch change votes
+    pub(crate) fn epoch_change_votes(&self) -> &[Vec<u8>] {
+        &self.epoch_change_votes
     }
 
     fn genesis_block(context: &Context, author: AuthorityIndex) -> Self {
@@ -125,6 +153,8 @@ impl BlockV1 {
             transactions: vec![],
             commit_votes: vec![],
             misbehavior_reports: vec![],
+            epoch_change_proposal: None,
+            epoch_change_votes: vec![],
         }
     }
 }
@@ -186,6 +216,12 @@ pub(crate) struct BlockV2 {
     transaction_votes: Vec<BlockTransactionVotes>,
     commit_votes: Vec<CommitVote>,
     misbehavior_reports: Vec<MisbehaviorReport>,
+    /// Epoch change proposal (serialized as bytes to avoid cross-crate dependencies)
+    /// NOTE: BCS does not support default values, so these fields are always serialized
+    /// For backward compatibility, we need to ensure all nodes start fresh or migrate storage
+    epoch_change_proposal: Option<Vec<u8>>,
+    /// Epoch change votes (serialized as bytes)
+    epoch_change_votes: Vec<Vec<u8>>,
 }
 
 #[allow(unused)]
@@ -211,7 +247,29 @@ impl BlockV2 {
             commit_votes,
             transaction_votes,
             misbehavior_reports,
+            epoch_change_proposal: None,
+            epoch_change_votes: Vec::new(),
         }
+    }
+
+    /// Set epoch change proposal
+    pub(crate) fn set_epoch_change_proposal(&mut self, proposal: Option<Vec<u8>>) {
+        self.epoch_change_proposal = proposal;
+    }
+
+    /// Get epoch change proposal
+    pub(crate) fn epoch_change_proposal(&self) -> Option<&Vec<u8>> {
+        self.epoch_change_proposal.as_ref()
+    }
+
+    /// Set epoch change votes
+    pub(crate) fn set_epoch_change_votes(&mut self, votes: Vec<Vec<u8>>) {
+        self.epoch_change_votes = votes;
+    }
+
+    /// Get epoch change votes
+    pub(crate) fn epoch_change_votes(&self) -> &[Vec<u8>] {
+        &self.epoch_change_votes
     }
 
     fn genesis_block(context: &Context, author: AuthorityIndex) -> Self {
@@ -225,6 +283,8 @@ impl BlockV2 {
             commit_votes: vec![],
             transaction_votes: vec![],
             misbehavior_reports: vec![],
+            epoch_change_proposal: None,
+            epoch_change_votes: vec![],
         }
     }
 }
@@ -300,6 +360,46 @@ impl Slot {
 impl From<BlockRef> for Slot {
     fn from(value: BlockRef) -> Self {
         Slot::new(value.round, value.author)
+    }
+}
+
+impl Block {
+    /// Get epoch change proposal (serialized bytes)
+    pub fn epoch_change_proposal(&self) -> Option<&Vec<u8>> {
+        match self {
+            Block::V1(block) => block.epoch_change_proposal(),
+            Block::V2(block) => block.epoch_change_proposal(),
+        }
+    }
+
+    /// Get epoch change votes (serialized bytes)
+    pub fn epoch_change_votes(&self) -> &[Vec<u8>] {
+        match self {
+            Block::V1(block) => block.epoch_change_votes(),
+            Block::V2(block) => block.epoch_change_votes(),
+        }
+    }
+
+    /// Set epoch change proposal
+    pub fn set_epoch_change_proposal(&mut self, proposal: Option<Vec<u8>>) {
+        match self {
+            Block::V1(block) => block.set_epoch_change_proposal(proposal),
+            Block::V2(block) => block.set_epoch_change_proposal(proposal),
+        }
+    }
+
+    /// Set epoch change votes
+    pub fn set_epoch_change_votes(&mut self, votes: Vec<Vec<u8>>) {
+        match self {
+            Block::V1(block) => block.set_epoch_change_votes(votes),
+            Block::V2(block) => block.set_epoch_change_votes(votes),
+        }
+    }
+
+    /// Check if block version supports epoch change
+    pub fn is_epoch_change_supported(&self) -> bool {
+        // Both V1 and V2 support epoch change
+        true
     }
 }
 

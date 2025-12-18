@@ -11,10 +11,17 @@ mod node;
 mod transaction;
 mod rpc;
 mod commit_processor;
+mod epoch_change;
+mod epoch_change_bridge;
+mod epoch_change_hook;
+mod clock_sync;
+mod tx_submitter;
 
 use config::NodeConfig;
 use node::ConsensusNode;
 use tracing::error;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Parser)]
 #[command(name = "metanode")]
@@ -64,14 +71,49 @@ async fn main() -> Result<()> {
             info!("Node ID: {}", node_config.node_id);
             info!("Network address: {}", node_config.network_address);
 
-            let node = ConsensusNode::new(node_config.clone()).await?;
+            let node = Arc::new(Mutex::new(ConsensusNode::new(node_config.clone()).await?));
             
             // Start RPC server for client submissions
             let rpc_port = node_config.metrics_port + 1000; // RPC port = metrics_port + 1000
-            let rpc_server = rpc::RpcServer::new(node.transaction_client(), rpc_port);
+            let tx_client = { node.lock().await.transaction_submitter() };
+            let rpc_server = rpc::RpcServer::new(tx_client, rpc_port);
             tokio::spawn(async move {
                 if let Err(e) = rpc_server.start().await {
                     error!("RPC server error: {}", e);
+                }
+            });
+
+            // Epoch transition coordinator:
+            // If a proposal is quorum-approved AND commit-index barrier is passed,
+            // call node.transition_to_epoch() to persist config + clear state + stop process.
+            let node_for_epoch = node.clone();
+            tokio::spawn(async move {
+                let mut last_triggered: Option<Vec<u8>> = None;
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                    // Read state without holding lock too long
+                    let (manager, commit_index) = {
+                        let guard = node_for_epoch.lock().await;
+                        (guard.epoch_change_manager(), guard.current_commit_index())
+                    };
+
+                    let manager_guard = manager.read().await;
+                    if let Some(proposal) = manager_guard.get_transition_ready_proposal(commit_index) {
+                        let hash = manager_guard.hash_proposal(&proposal);
+                        // Trigger once per proposal hash
+                        if last_triggered.as_ref() == Some(&hash) {
+                            continue;
+                        }
+                        last_triggered = Some(hash);
+                        drop(manager_guard);
+
+                        // Perform real transition (this will exit process on success)
+                        let mut guard = node_for_epoch.lock().await;
+                        if let Err(e) = guard.transition_to_epoch(&proposal, commit_index).await {
+                            error!("Epoch transition failed: {}", e);
+                        }
+                    }
                 }
             });
             
@@ -83,7 +125,14 @@ async fn main() -> Result<()> {
             tokio::signal::ctrl_c().await?;
             info!("Shutting down node...");
             
-            node.shutdown().await?;
+            // If epoch transition already stopped the process, we won't reach here.
+            // Otherwise, shutdown normally.
+            let node = Arc::try_unwrap(node)
+                .ok()
+                .map(|m| m.into_inner());
+            if let Some(node) = node {
+                node.shutdown().await?;
+            }
             info!("Node stopped");
         }
         Commands::Generate { nodes, output } => {

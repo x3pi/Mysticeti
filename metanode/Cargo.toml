@@ -51,6 +51,7 @@ rand = "0.8.5"
 toml = { version = "0.7.4", features = ["preserve_order"] }
 base64 = "0.21.2"
 hex = "0.4.3"
+async-trait = "0.1.80"
 
 # CLI - match Sui workspace versions
 clap = { version = "4.4", features = ["derive", "wrap_help"] }
