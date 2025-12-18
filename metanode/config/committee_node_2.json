@@ -1,5 +1,5 @@
 {
-  "epoch": 3,
+  "epoch": 17,
   "total_stake": 4,
   "quorum_threshold": 3,
   "validity_threshold": 2,
@@ -37,5 +37,5 @@
       "network_key": "vh4yLeTgFvflAHznC3IMKFvlYPk855DWTXaZVTtUT6A="
     }
   ],
-  "epoch_timestamp_ms": 1766041875473
+  "epoch_timestamp_ms": 1766046216489
 }
