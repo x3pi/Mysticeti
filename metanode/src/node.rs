@@ -213,8 +213,23 @@ impl ConsensusNode {
                 epoch_duration_seconds,
                 epoch_duration_seconds / 60,
                 epoch_start_timestamp);
+            info!(
+                "📅 EPOCH STARTED: epoch={}, duration={}s, enable_ntp_sync={}, max_clock_drift_seconds={}, db_path={:?}",
+                current_epoch,
+                epoch_duration_seconds,
+                config.enable_ntp_sync,
+                config.max_clock_drift_seconds,
+                parameters.db_path
+            );
         } else {
             info!("📅 EPOCH INFO: current_epoch={}, time_based_epoch_change=DISABLED", current_epoch);
+            info!(
+                "📅 EPOCH STARTED: epoch={}, time_based_epoch_change=DISABLED, enable_ntp_sync={}, max_clock_drift_seconds={}, db_path={:?}",
+                current_epoch,
+                config.enable_ntp_sync,
+                config.max_clock_drift_seconds,
+                parameters.db_path
+            );
         }
 
         // Initialize clock sync manager
@@ -464,11 +479,12 @@ impl ConsensusNode {
                                         transition_commit_index
                                     );
                                 } else {
-                                    // Throttle waiting log: log at most once per 10s OR when commit index advances by >= 25.
+                                    // Throttle waiting log: waiting is expected; keep logs clean.
+                                    // Log at most once per 30s OR when commit index advances significantly.
                                     let should_log = last_waiting_log
                                         .elapsed()
-                                        .unwrap_or(Duration::from_secs(0)) >= Duration::from_secs(10)
-                                        || current_commit_index.saturating_sub(last_waiting_commit_index) >= 25;
+                                        .unwrap_or(Duration::from_secs(0)) >= Duration::from_secs(30)
+                                        || current_commit_index.saturating_sub(last_waiting_commit_index) >= 100;
                                     if should_log {
                                         info!(
                                             "⏳ EPOCH TRANSITION WAITING FOR COMMIT INDEX: epoch {} -> {}, proposal_hash={}, votes={}, commit_index={} (need {})",

@@ -10,6 +10,12 @@ BINARY="./target/release/metanode"
 CONFIG_DIR="config"
 LOG_DIR="logs"
 
+# Optional: reset epoch_timestamp_ms at startup (test-friendly).
+# - If epoch_timestamp_ms is old, nodes will instantly propose epoch change on boot.
+# - Resetting makes "epoch_duration_seconds" behave like a fresh timer per run.
+# Set to 0 to disable: RESET_EPOCH_TIMESTAMP_MS=0 ./run_nodes.sh
+RESET_EPOCH_TIMESTAMP_MS="${RESET_EPOCH_TIMESTAMP_MS:-1}"
+
 # Create a per-run log directory so we never lose early startup / epoch-transition logs
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_LOG_DIR="$LOG_DIR/run-$RUN_ID"
@@ -60,6 +66,56 @@ for i in $(seq 0 $((NODES-1))); do
 done
 
 sleep 1
+
+# Optionally reset epoch_timestamp_ms in per-node committee files (and shared template, if present).
+if [ "$RESET_EPOCH_TIMESTAMP_MS" = "1" ]; then
+    print_info "Resetting epoch_timestamp_ms in per-node committee files (test-friendly)..."
+    NOW_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
+
+    for i in $(seq 0 $((NODES-1))); do
+        committee_file="$CONFIG_DIR/committee_node_${i}.json"
+        if [ -f "$committee_file" ]; then
+            python3 - "$committee_file" "$NOW_MS" <<'PY'
+import json, sys
+path = sys.argv[1]
+now_ms = int(sys.argv[2])
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+data["epoch_timestamp_ms"] = now_ms
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, sort_keys=False)
+    f.write("\n")
+import os
+os.replace(tmp, path)
+PY
+        else
+            print_warn "Missing per-node committee file: $committee_file (skipping reset)"
+        fi
+    done
+
+    # Best-effort: also refresh shared committee template if it exists.
+    if [ -f "$CONFIG_DIR/committee.json" ]; then
+        python3 - "$CONFIG_DIR/committee.json" "$NOW_MS" <<'PY'
+import json, sys
+path = sys.argv[1]
+now_ms = int(sys.argv[2])
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+data["epoch_timestamp_ms"] = now_ms
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, sort_keys=False)
+    f.write("\n")
+import os
+os.replace(tmp, path)
+PY
+    fi
+
+    print_info "epoch_timestamp_ms reset to NOW_MS=$NOW_MS"
+else
+    print_info "Keeping existing epoch_timestamp_ms (RESET_EPOCH_TIMESTAMP_MS=0)"
+fi
 
 # Start nodes
 print_info "Starting $NODES nodes..."

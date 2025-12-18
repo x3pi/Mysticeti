@@ -224,8 +224,8 @@ impl NodeConfig {
             Ok(config) => Ok(config.committee),
             Err(_) => {
                 // Fallback: try loading as plain Committee (for backward compatibility)
-                let committee: Committee = serde_json::from_str(&content)?;
-                Ok(committee)
+        let committee: Committee = serde_json::from_str(&content)?;
+        Ok(committee)
             }
         }
     }

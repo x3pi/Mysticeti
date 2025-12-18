@@ -227,15 +227,15 @@ impl<C: NetworkClient> CommitSyncer<C> {
             || lag_jump
             || quorum_commit_index != self.last_logged_quorum_commit_index && lag > 0 && now.duration_since(self.last_schedule_log_at) >= Duration::from_secs(10)
         {
-            info!(
+        info!(
                 "Checking to schedule fetches: synced_commit_index={}, highest_handled_index={}, highest_scheduled_index={}, quorum_commit_index={}, unhandled_commits_threshold={}, lag={}",
-                self.synced_commit_index,
-                highest_handled_index,
-                highest_scheduled_index,
-                quorum_commit_index,
-                unhandled_commits_threshold,
+            self.synced_commit_index,
+            highest_handled_index,
+            highest_scheduled_index,
+            quorum_commit_index,
+            unhandled_commits_threshold,
                 lag,
-            );
+        );
             self.last_schedule_log_at = now;
             self.last_logged_quorum_commit_index = quorum_commit_index;
             self.last_logged_local_commit_index = local_commit_index;

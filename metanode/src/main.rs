@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
                 .ok()
                 .map(|m| m.into_inner());
             if let Some(node) = node {
-                node.shutdown().await?;
+            node.shutdown().await?;
             }
             info!("Node stopped");
         }
