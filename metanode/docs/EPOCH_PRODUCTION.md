@@ -489,7 +489,6 @@ impl PhasedEpochTransition {
 - [ ] **State Backup**
   - Backup consensus database
   - Backup committee.json
-  - Backup epoch_timestamp.txt
   - Create snapshot of current state
 
 - [ ] **Testing**
@@ -553,7 +552,6 @@ pkill -f metanode
 
 # 2. Restore backup
 cp config/committee_epoch0.json config/committee.json
-cp config/epoch_timestamp_epoch0.txt config/epoch_timestamp.txt
 restore_consensus_db_backup.sh
 
 # 3. Restart nodes

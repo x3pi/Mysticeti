@@ -110,23 +110,29 @@ impl NodeConfig {
             .unwrap()
             .as_millis() as u64;
 
-        // Save committee with epoch timestamp
-        let committee_path = output_dir.join("committee.json");
+        // Save a shared committee with epoch timestamp (template / convenience).
+        // IMPORTANT: for multi-node on a single machine, each node SHOULD use its own committee file
+        // to avoid concurrent writes during in-process epoch transitions.
+        let shared_committee_path = output_dir.join("committee.json");
         let committee_config = CommitteeConfig {
             committee: committee.clone(),
             epoch_timestamp_ms: Some(epoch_start_timestamp),
         };
         let committee_json = serde_json::to_string_pretty(&committee_config)?;
-        fs::write(&committee_path, committee_json)?;
+        fs::write(&shared_committee_path, &committee_json)?;
 
         // Generate individual node configs
         for (idx, (protocol_keypair, network_keypair, _authority_keypair)) in keypairs.iter().enumerate() {
+            // Per-node committee file (prevents nodes clobbering each other's committee.json on epoch transition).
+            let node_committee_path = output_dir.join(format!("committee_node_{}.json", idx));
+            fs::write(&node_committee_path, &committee_json)?;
+
             let config = NodeConfig {
                 node_id: idx,
                 network_address: format!("127.0.0.1:{}", 9000 + idx),
                 protocol_key_path: Some(output_dir.join(format!("node_{}_protocol_key.json", idx))),
                 network_key_path: Some(output_dir.join(format!("node_{}_network_key.json", idx))),
-                committee_path: Some(committee_path.clone()),
+                committee_path: Some(node_committee_path),
                 storage_path: output_dir.join(format!("storage/node_{}", idx)),
                 enable_metrics: true,
                 metrics_port: 9100 + idx as u16,

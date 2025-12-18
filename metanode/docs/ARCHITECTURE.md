@@ -118,14 +118,23 @@ Quản lý cấu hình cho nodes và committee.
 - Generate keypairs cho từng node
 - Load/save configuration files (TOML)
 - Load/save keypairs (Base64 encoded)
-- Quản lý epoch timestamp
+- Quản lý epoch timestamp (được lưu trong `committee.json`)
 
 **Cấu trúc:**
 - `committee.json` - Committee configuration chung
 - `node_X.toml` - Config cho từng node
 - `node_X_protocol_key.json` - Protocol keypair
 - `node_X_network_key.json` - Network keypair
-- `epoch_timestamp.txt` - Epoch start timestamp
+- *(Không còn dùng `epoch_timestamp.txt`)*: epoch start timestamp được lưu trong `committee.json` (field `epoch_timestamp_ms`)
+
+### 6. Epoch Change + Clock Sync (production-ready)
+
+Hệ thống hiện tại đã có epoch change “thật” với các thành phần:
+
+- `EpochChangeManager` (`src/epoch_change.rs`): propose/vote/quorum, time-based trigger, commit-index barrier coordination.
+- `EpochChangeHook` (`src/epoch_change_hook.rs`): bridge để đưa proposal/vote đi cùng block, auto-vote idempotent.
+- `ClockSyncManager` (`src/clock_sync.rs`): NTP/clock health-gate (Option B: đọc offset từ `chronyc tracking`).
+- `ConsensusNode::transition_to_epoch` (`src/node.rs`): in-process authority restart, per-epoch consensus DB path.
 
 ### 5. Transaction Handling (`src/transaction.rs`)
 
@@ -189,7 +198,11 @@ Mỗi node lưu trữ:
 - **Commit History**: Lịch sử các commits
 - **Leader Schedule**: Lịch trình leader election
 
-**Location:** `config/storage/node_X/consensus_db/`
+**Location (per-epoch):** `config/storage/node_X/epochs/epoch_N/consensus_db/`
+
+Lý do:
+- Epoch mới cần DAG/round sạch → tách consensus DB theo epoch.
+- Vẫn giữ được lịch sử cũ theo folder epoch nếu cần debug/audit.
 
 ### Recovery Process
 

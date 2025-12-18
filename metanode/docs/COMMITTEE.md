@@ -8,23 +8,27 @@ File `committee.json` là file cấu hình chung cho tất cả nodes trong cons
 
 ```json
 {
-  "epoch": 0,
-  "total_stake": 4,
-  "quorum_threshold": 3,
-  "validity_threshold": 2,
-  "authorities": [
-    {
-      "stake": 1,
-      "address": "/ip4/127.0.0.1/tcp/9000",
-      "hostname": "node-0",
-      "authority_key": "...",
-      "protocol_key": "...",
-      "network_key": "..."
-    },
-    ...
-  ]
+  "committee": {
+    "epoch": 0,
+    "total_stake": 4,
+    "quorum_threshold": 3,
+    "validity_threshold": 2,
+    "authorities": [
+      {
+        "stake": 1,
+        "address": "/ip4/127.0.0.1/tcp/9000",
+        "hostname": "node-0",
+        "authority_key": "...",
+        "protocol_key": "...",
+        "network_key": "..."
+      }
+    ]
+  },
+  "epoch_timestamp_ms": 1766032959787
 }
 ```
+
+**Lưu ý:** Hệ thống hiện tại dùng định dạng “extended” (wrapper) để lưu `epoch_timestamp_ms` chung cho tất cả nodes.
 
 ## Các Trường Chính
 

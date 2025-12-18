@@ -83,7 +83,6 @@ Lệnh generate sẽ tạo:
 ```
 config/
 ├── committee.json              # Committee configuration
-├── epoch_timestamp.txt         # Epoch start timestamp
 ├── node_0.toml                 # Node 0 config
 ├── node_0_protocol_key.json    # Node 0 protocol keypair
 ├── node_0_network_key.json    # Node 0 network keypair
@@ -96,6 +95,8 @@ config/
     ├── node_1/                 # Node 1 storage
     └── ...
 ```
+
+**Lưu ý:** Hệ thống hiện tại **không còn dùng `epoch_timestamp.txt`**. Epoch start timestamp được lưu trong `committee.json` (field `epoch_timestamp_ms`) để đảm bảo tất cả nodes dùng cùng timestamp.
 
 ## Keypairs
 
@@ -182,11 +183,13 @@ Và cập nhật `committee.json` với địa chỉ đúng:
 Mỗi node có storage riêng:
 ```
 config/storage/node_X/
-└── consensus_db/          # RocksDB database
-    ├── CURRENT
-    ├── MANIFEST-*
-    ├── *.sst              # SST files
-    └── ...
+└── epochs/
+    ├── epoch_0/
+    │   └── consensus_db/          # RocksDB database (DAG/round/commit state) cho epoch_0
+    ├── epoch_1/
+    │   └── consensus_db/          # epoch_1
+    └── epoch_N/
+        └── consensus_db/          # epoch_N
 ```
 
 ### Storage Options
@@ -203,19 +206,21 @@ storage_path = "/data/metanode/node_0"
 
 ## Epoch Configuration
 
-### Epoch Timestamp
+### Epoch Timestamp (đã chuyển sang committee.json)
 
 Tất cả nodes phải dùng cùng epoch start timestamp:
-- File: `config/epoch_timestamp.txt`
-- Format: Unix timestamp (milliseconds)
-- Generated tự động khi generate config
+- File: `config/committee.json`
+- Field: `epoch_timestamp_ms` (milliseconds)
+- Được update atomically trong quá trình epoch transition
 
 ### Epoch Management
 
-Hiện tại chỉ support epoch 0. Để thay đổi epoch:
-1. Update `committee.json` với epoch mới
-2. Update `epoch_timestamp.txt`
-3. Restart tất cả nodes
+Epoch hiện tại được thay đổi bằng cơ chế epoch change (time-based trigger + consensus vote + commit-index barrier + in-process restart).
+
+Nếu bạn muốn **manual override** (chỉ nên dùng cho dev):
+1. Dừng toàn bộ nodes
+2. Update `committee.json` (epoch + epoch_timestamp_ms) một cách đồng bộ cho tất cả nodes
+3. Restart
 
 ## Metrics Configuration
 

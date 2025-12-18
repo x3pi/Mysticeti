@@ -21,8 +21,21 @@ Tài liệu chi tiết về hệ thống MetaNode Consensus Engine.
 ### Hướng dẫn sử dụng
 - [CONFIGURATION.md](./CONFIGURATION.md) - Cấu hình hệ thống
 - [DEPLOYMENT.md](./DEPLOYMENT.md) - Triển khai và vận hành
+- [DEPLOYMENT_CHECKLIST.md](./DEPLOYMENT_CHECKLIST.md) - Checklist deploy (đã cập nhật theo hệ thống hiện tại)
 - [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) - Xử lý sự cố và debugging
 - [FAQ.md](./FAQ.md) - Câu hỏi thường gặp về khởi động, recovery, và các vấn đề khác
+
+### Tài liệu lịch sử (tham khảo, không phải “source of truth”)
+
+Các file dưới đây chủ yếu là log/phân tích theo từng giai đoạn debug/triển khai; nội dung có thể trùng lặp hoặc không còn cần cho vận hành hằng ngày:
+- `EPOCH_CHANGE_ANALYSIS.md`
+- `EPOCH_CHANGE_FIXES.md`
+- `EPOCH_CHANGE_IMPLEMENTATION_COMPLETE.md`
+- `EPOCH_CHANGE_TIMING.md`
+- `FORK_SAFETY_IMPROVEMENTS.md`
+- `FORK_SAFETY_VERIFICATION.md`
+- `FORK_SAFETY_VERIFICATION_FINAL.md`
+- `EPOCH_CHANGE_VOTING.md`
 
 ## 🚀 Bắt đầu nhanh
 
