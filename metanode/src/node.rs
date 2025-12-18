@@ -48,6 +48,8 @@ pub struct ConsensusNode {
     parameters: consensus_config::Parameters,
     own_index: AuthorityIndex,
     boot_counter: u64,
+    /// Ensure we only run transition once per proposal hash.
+    last_transition_hash: Option<Vec<u8>>,
 }
 
 impl ConsensusNode {
@@ -540,6 +542,7 @@ impl ConsensusNode {
             parameters,
             own_index,
             boot_counter: 0,
+            last_transition_hash: None,
         })
     }
 
@@ -610,6 +613,16 @@ impl ConsensusNode {
         proposal: &crate::epoch_change::EpochChangeProposal,
         current_commit_index: u32,
     ) -> Result<()> {
+        // Guard: run once per proposal hash
+        let proposal_hash = {
+            let mgr = self.epoch_change_manager.read().await;
+            mgr.hash_proposal(proposal)
+        };
+        if self.last_transition_hash.as_ref() == Some(&proposal_hash) {
+            return Ok(());
+        }
+        self.last_transition_hash = Some(proposal_hash);
+
         info!("Transitioning to epoch {}...", proposal.new_epoch);
         
         // ✅ FORK-SAFETY VALIDATION 1: Commit Index Barrier

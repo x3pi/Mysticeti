@@ -236,7 +236,12 @@ impl NodeConfig {
             epoch_timestamp_ms: Some(epoch_timestamp_ms),
         };
         let committee_json = serde_json::to_string_pretty(&committee_config)?;
-        fs::write(committee_path, committee_json)?;
+
+        // Atomic write: write to temp file then rename.
+        // Prevents partial/corrupt committee.json if process crashes mid-write.
+        let tmp_path = committee_path.with_extension("json.tmp");
+        fs::write(&tmp_path, committee_json)?;
+        fs::rename(&tmp_path, committee_path)?;
         Ok(())
     }
 

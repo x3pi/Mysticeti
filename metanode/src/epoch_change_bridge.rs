@@ -26,16 +26,37 @@ impl EpochChangeBridge {
         if let Some(proposal_bytes) = block.epoch_change_proposal() {
             match EpochChangeProposal::from_bytes(proposal_bytes) {
                 Ok(proposal) => {
-                    info!("📥 Received epoch change proposal in block: epoch {} -> {}, proposal_hash={}", 
-                        proposal.new_epoch - 1, 
-                        proposal.new_epoch,
-                        hex::encode(&epoch_change_manager.read().await.hash_proposal(&proposal)[..8]));
-                    
                     let mut manager = epoch_change_manager.write().await;
-                    match manager.process_proposal(proposal.clone()) {
+                    let current_epoch = manager.current_epoch();
+
+                    // Ignore stale/out-of-order proposals (common around epoch boundaries).
+                    if proposal.new_epoch != current_epoch + 1 {
+                        tracing::debug!(
+                            "⏭️  Ignoring epoch change proposal: proposal targets epoch {} but current_epoch={} (expected {}), proposal_hash={}",
+                            proposal.new_epoch,
+                            current_epoch,
+                            current_epoch + 1,
+                            hex::encode(&manager.hash_proposal(&proposal)[..8]),
+                        );
+                        // Not an error.
+                    } else {
+                        let proposal_hash = manager.hash_proposal(&proposal);
+                        if !manager.has_pending_proposal_hash(&proposal_hash) {
+                            info!(
+                                "📥 Received epoch change proposal in block: epoch {} -> {}, proposal_hash={}",
+                                proposal.new_epoch - 1,
+                                proposal.new_epoch,
+                                hex::encode(&proposal_hash[..8])
+                            );
+                        }
+
+                        match manager.process_proposal(proposal.clone()) {
                         Ok(()) => {
-                            info!("✅ Processed epoch change proposal: epoch {} -> {}", 
-                                proposal.new_epoch - 1, proposal.new_epoch);
+                            tracing::debug!(
+                                "✅ Processed epoch change proposal: epoch {} -> {}",
+                                proposal.new_epoch - 1,
+                                proposal.new_epoch
+                            );
                             
                             // Note: Auto-vote requires protocol keypair which is not available in this context
                             // Auto-vote will be handled in block creation context where keypair is available
@@ -43,6 +64,7 @@ impl EpochChangeBridge {
                         Err(e) => {
                             warn!("❌ Failed to process epoch change proposal: {}", e);
                         }
+                    }
                     }
                 }
                 Err(e) => {
@@ -56,12 +78,23 @@ impl EpochChangeBridge {
             match EpochChangeVote::from_bytes(vote_bytes) {
                 Ok(vote) => {
                     let mut manager = epoch_change_manager.write().await;
+                    if !manager.has_pending_proposal_hash(&vote.proposal_hash) {
+                        tracing::debug!(
+                            "⏭️  Ignoring epoch change vote for unknown/stale proposal: voter={}, approve={}, proposal_hash={}",
+                            vote.voter().value(),
+                            vote.approve,
+                            hex::encode(&vote.proposal_hash[..8])
+                        );
+                        continue;
+                    }
                     match manager.process_vote(vote.clone()) {
                         Ok(()) => {
-                            info!("✅ Processed epoch change vote: voter={}, approve={}, proposal_hash={}", 
+                            tracing::debug!(
+                                "✅ Processed epoch change vote: voter={}, approve={}, proposal_hash={}",
                                 vote.voter().value(),
                                 vote.approve,
-                                hex::encode(&vote.proposal_hash[..8]));
+                                hex::encode(&vote.proposal_hash[..8])
+                            );
                             
                             // Check quorum after processing vote
                             if let Some(proposal) = manager.get_all_pending_proposals()

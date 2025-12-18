@@ -172,35 +172,78 @@ impl EpochChangeHook {
         if let Some(bytes) = proposal_bytes {
             match EpochChangeProposal::from_bytes(bytes) {
                 Ok(proposal) => {
-                    tracing::info!("📥 Received epoch change proposal in block: epoch {} -> {}, proposal_hash={}", 
-                        proposal.new_epoch - 1, 
-                        proposal.new_epoch,
-                        hex::encode(&self.epoch_change_manager.read().await.hash_proposal(&proposal)[..8]));
-                    
+                    // Take a write lock once and decide what to do (avoid log spam).
                     let mut manager = self.epoch_change_manager.write().await;
-                    match manager.process_proposal(proposal.clone()) {
+                    let current_epoch = manager.current_epoch();
+
+                    // Ignore stale / out-of-order proposals after we already transitioned.
+                    // This happens because old blocks can still propagate briefly.
+                    if proposal.new_epoch != current_epoch + 1 {
+                        tracing::debug!(
+                            "⏭️  Ignoring epoch change proposal: proposal targets epoch {} but current_epoch={} (expected {}), proposal_hash={}",
+                            proposal.new_epoch,
+                            current_epoch,
+                            current_epoch + 1,
+                            hex::encode(&manager.hash_proposal(&proposal)[..8]),
+                        );
+                        // Do not treat this as an error.
+                    } else {
+                        let proposal_hash = manager.hash_proposal(&proposal);
+                        let proposal_hash_hex = hex::encode(&proposal_hash[..8]);
+
+                        // Only log at INFO when we first see a new proposal hash.
+                        if !manager.has_pending_proposal_hash(&proposal_hash) {
+                            tracing::info!(
+                                "📥 Received epoch change proposal in block: epoch {} -> {}, proposal_hash={}",
+                                proposal.new_epoch - 1,
+                                proposal.new_epoch,
+                                proposal_hash_hex
+                            );
+                        } else {
+                            tracing::debug!(
+                                "📥 Received epoch change proposal (duplicate): epoch {} -> {}, proposal_hash={}",
+                                proposal.new_epoch - 1,
+                                proposal.new_epoch,
+                                proposal_hash_hex
+                            );
+                        }
+
+                        match manager.process_proposal(proposal.clone()) {
                         Ok(()) => {
-                            tracing::info!("✅ Processed epoch change proposal: epoch {} -> {}", 
-                                proposal.new_epoch - 1, proposal.new_epoch);
+                            // Idempotent: avoid spamming INFO for proposals included in many blocks.
+                            tracing::debug!(
+                                "✅ Processed epoch change proposal: epoch {} -> {}",
+                                proposal.new_epoch - 1,
+                                proposal.new_epoch
+                            );
                             
                             // Auto-vote on valid proposal
-                            match manager.vote_on_proposal(
-                                &proposal,
-                                self.own_index,
-                                &self.protocol_keypair,
-                            ) {
-                                Ok(vote) => {
-                                    tracing::info!("🗳️  Auto-voted on proposal: epoch {} -> {}, approve={}", 
-                                        proposal.new_epoch - 1, proposal.new_epoch, vote.approve);
-                                }
-                                Err(e) => {
-                                    tracing::warn!("⚠️  Failed to auto-vote on proposal: {}", e);
+                            // Avoid repeated auto-voting for the same proposal hash.
+                            if manager
+                                .get_vote_by_voter(&proposal_hash, self.own_index.value() as u32)
+                                .is_none()
+                            {
+                                match manager.vote_on_proposal(
+                                    &proposal,
+                                    self.own_index,
+                                    &self.protocol_keypair,
+                                ) {
+                                    Ok(vote) => {
+                                        tracing::info!("🗳️  Auto-voted on proposal: epoch {} -> {}, approve={}", 
+                                            proposal.new_epoch - 1, proposal.new_epoch, vote.approve);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("⚠️  Failed to auto-vote on proposal: {}", e);
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
+                            // If this is a stale / out-of-order proposal, we already ignored it above.
+                            // For genuine validation errors, keep WARN.
                             tracing::warn!("❌ Failed to process epoch change proposal: {}", e);
                         }
+                    }
                     }
                 }
                 Err(e) => {
@@ -214,14 +257,28 @@ impl EpochChangeHook {
             match EpochChangeVote::from_bytes(vote_bytes) {
                 Ok(vote) => {
                     let mut manager = self.epoch_change_manager.write().await;
+                    // Ignore votes for unknown proposals (common during epoch boundary propagation).
+                    if !manager.has_pending_proposal_hash(&vote.proposal_hash) {
+                        tracing::debug!(
+                            "⏭️  Ignoring epoch change vote for unknown/stale proposal: voter={}, approve={}, proposal_hash={}",
+                            vote.voter().value(),
+                            vote.approve,
+                            hex::encode(&vote.proposal_hash[..8])
+                        );
+                        continue;
+                    }
+
                     match manager.process_vote(vote.clone()) {
                         Ok(()) => {
-                            tracing::info!("✅ Processed epoch change vote: voter={}, approve={}, proposal_hash={}", 
+                            // Votes can be re-broadcast; keep this at DEBUG to avoid log spam.
+                            tracing::debug!(
+                                "✅ Processed epoch change vote: voter={}, approve={}, proposal_hash={}",
                                 vote.voter().value(),
                                 vote.approve,
-                                hex::encode(&vote.proposal_hash[..8]));
+                                hex::encode(&vote.proposal_hash[..8])
+                            );
                             
-                            // Check quorum after processing vote
+                            // Check quorum after processing vote (log once)
                             if let Some(proposal) = manager.get_all_pending_proposals()
                                 .iter()
                                 .find(|p| {
@@ -230,8 +287,12 @@ impl EpochChangeHook {
                                 }) {
                                 if let Some(approved) = manager.check_proposal_quorum(proposal) {
                                     if approved {
-                                        tracing::info!("🎉 QUORUM REACHED for epoch change proposal: epoch {} -> {}", 
-                                            proposal.new_epoch - 1, proposal.new_epoch);
+                                        let proposal_hash = manager.hash_proposal(proposal);
+                                        if !manager.quorum_already_logged(&proposal_hash) {
+                                            manager.mark_quorum_logged(proposal_hash);
+                                            tracing::info!("🎉 QUORUM REACHED for epoch change proposal: epoch {} -> {}", 
+                                                proposal.new_epoch - 1, proposal.new_epoch);
+                                        }
                                     }
                                 }
                             }

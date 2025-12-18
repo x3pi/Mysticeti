@@ -219,6 +219,8 @@ pub struct EpochChangeManager {
     proposal_history: Vec<EpochChangeProposal>,
     /// Seen proposals (for replay attack prevention)
     seen_proposals: HashSet<Vec<u8>>,
+    /// Quorum-reached already logged (per proposal hash) to avoid log spam
+    quorum_logged: HashSet<Vec<u8>>,
     /// Time-based epoch change configuration
     time_based_enabled: bool,
     epoch_duration_seconds: u64,
@@ -246,6 +248,7 @@ impl EpochChangeManager {
             proposal_votes: HashMap::new(),
             proposal_history: Vec::new(),
             seen_proposals: HashSet::new(),
+            quorum_logged: HashSet::new(),
             time_based_enabled,
             epoch_duration_seconds,
             max_clock_drift_ms,
@@ -270,6 +273,17 @@ impl EpochChangeManager {
         self.proposal_votes.clear();
         self.proposal_history.clear();
         self.seen_proposals.clear();
+        self.quorum_logged.clear();
+    }
+
+    /// Returns true if we've already logged quorum for this proposal hash.
+    pub fn quorum_already_logged(&self, proposal_hash: &[u8]) -> bool {
+        self.quorum_logged.contains(proposal_hash)
+    }
+
+    /// Mark quorum as logged for this proposal hash.
+    pub fn mark_quorum_logged(&mut self, proposal_hash: Vec<u8>) {
+        self.quorum_logged.insert(proposal_hash);
     }
 
     /// Hash a proposal for identification
@@ -518,37 +532,13 @@ impl EpochChangeManager {
         
         // Check quorum approve
         if approve_stake >= quorum_threshold {
-            let proposal_hash_hex = hex::encode(&proposal_hash[..8]);
-            info!(
-                "✅ QUORUM REACHED (APPROVE): proposal_hash={}, epoch {} -> {}, approve_stake={}/{}, reject_stake={}/{}, threshold={}, votes={}",
-                proposal_hash_hex,
-                proposal.new_epoch - 1,
-                proposal.new_epoch,
-                approve_stake,
-                total_stake,
-                reject_stake,
-                total_stake,
-                quorum_threshold,
-                votes.len()
-            );
+            // Do NOT log here (this function is called in many loops and would spam).
             return Some(true);
         }
 
         // Check quorum reject
         if reject_stake >= quorum_threshold {
-            let proposal_hash_hex = hex::encode(&proposal_hash[..8]);
-            info!(
-                "❌ QUORUM REACHED (REJECT): proposal_hash={}, epoch {} -> {}, approve_stake={}/{}, reject_stake={}/{}, threshold={}, votes={}",
-                proposal_hash_hex,
-                proposal.new_epoch - 1,
-                proposal.new_epoch,
-                approve_stake,
-                total_stake,
-                reject_stake,
-                total_stake,
-                quorum_threshold,
-                votes.len()
-            );
+            // Do NOT log here (avoid spam).
             return Some(false);
         }
 
@@ -744,6 +734,19 @@ impl EpochChangeManager {
             }
         }
         out
+    }
+
+    /// Get a previously stored vote for (proposal_hash, voter), if any.
+    pub fn get_vote_by_voter(&self, proposal_hash: &[u8], voter_value: u32) -> Option<EpochChangeVote> {
+        self.proposal_votes
+            .get(proposal_hash)
+            .and_then(|m| m.get(&voter_value))
+            .cloned()
+    }
+
+    /// Returns true if we currently track this proposal as pending (active) in this epoch.
+    pub fn has_pending_proposal_hash(&self, proposal_hash: &[u8]) -> bool {
+        self.pending_proposals.contains_key(proposal_hash)
     }
 
     /// Process a proposal received from another node
