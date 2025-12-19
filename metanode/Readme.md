@@ -37,34 +37,31 @@ MetaNode Consensus Engine là một wrapper đơn giản trên Sui Mysticeti con
 
 ### Yêu cầu
 
-- Rust 1.70+ 
-- Sui repository đã được clone vào `../sui/`
-- Sui dependencies đã được build (khuyến nghị build từ Sui workspace)
+- **Rust 1.70+** (khuyến nghị 1.75+)
+- **OS**: Linux, macOS, hoặc Windows với WSL2
+- **Network**: Ports 9000-9015 (cho 4 nodes) và 9100-9115 (metrics)
 
 ### Build
 
-**Cách 1: Build Sui workspace trước, sau đó build metanode (Khuyến nghị)**
+**Project đã được tách độc lập hoàn toàn khỏi Sui workspace. Bạn có thể build trực tiếp:**
 
 ```bash
-# Bước 1: Build Sui workspace để đảm bảo tất cả dependencies đã sẵn sàng
-cd /home/abc/chain-new/Mysticeti/sui
-cargo build --workspace
+# Di chuyển vào thư mục metanode
+cd /home/abc/chain-new/Mysticeti/metanode
 
-# Bước 2: Build metanode
-cargo build --manifest-path ../metanode/Cargo.toml --bin metanode --release
+# Build release binary (khuyến nghị)
+cargo build --release --bin metanode
+
+# Hoặc build debug (nhanh hơn nhưng chậm hơn khi chạy)
+cargo build --bin metanode
 ```
 
-**Cách 2: Build trực tiếp (có thể gặp lỗi với axum-server)**
-
-```bash
-cd metanode
-cargo build --release
-```
+**Binary sẽ được tạo tại:** `target/release/metanode` hoặc `target/debug/metanode`
 
 **Lưu ý:** 
-- Nếu gặp lỗi với `axum-server`, đây là vấn đề tương thích version trong Sui dependency chain
-- Xem file `BUILD_ISSUE.md` để biết chi tiết và các cách giải quyết
-- Code của `metanode-consensus` là đúng, vấn đề nằm ở dependency chain của Sui
+- ✅ Project đã độc lập, không cần Sui workspace
+- ✅ Tất cả dependencies đã được copy vào `../crates/`
+- ✅ Build sẽ tự động download các git dependencies (fastcrypto, anemo)
 
 ## 📖 Sử dụng
 

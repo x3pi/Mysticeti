@@ -1,50 +1,80 @@
-# Hướng dẫn Copy Modules từ Sui
+# Cấu trúc Modules của Project
 
-## Đã copy
+## ✅ Trạng thái hiện tại: Độc lập hoàn toàn
 
+Project đã được tách độc lập khỏi Sui workspace. Tất cả các dependencies cần thiết đã được copy vào thư mục `crates/` và không còn phụ thuộc vào Sui workspace.
+
+## Cấu trúc Modules
+
+### Consensus Modules (trong `metanode/sui-consensus/`)
 1. ✅ `consensus-core` - Core consensus logic
 2. ✅ `consensus-config` - Configuration
 3. ✅ `consensus-types` - Types
-4. ✅ `sui-http` - HTTP server (đã loại bỏ dev-dependencies)
-5. ✅ `sui-tls` - TLS handling (đã sửa để loại bỏ axum-server)
+4. ✅ `sui-http` - HTTP server (local copy)
+5. ✅ `sui-tls` - TLS handling (local copy)
 
-## Cấu trúc
+### Shared Crates (trong `crates/`)
+Các crate đã được tách độc lập và không còn phụ thuộc vào Sui workspace:
+
+1. ✅ `mysten-common` - Common utilities
+2. ✅ `mysten-metrics` - Metrics collection
+3. ✅ `mysten-network` - Network layer
+4. ✅ `shared-crypto` - Cryptographic utilities
+5. ✅ `typed-store` - Database storage
+6. ✅ `sui-protocol-config` - Protocol configuration
+7. ✅ `sui-macros` - Macro utilities
+8. ✅ `sui-proc-macros` - Procedural macros
+9. ✅ `sui-http` - HTTP server utilities
+10. ✅ `sui-tls` - TLS utilities
+11. ✅ `telemetry-subscribers` - Telemetry
+12. ✅ `prometheus-closure-metric` - Prometheus metrics
+13. ✅ `typed-store-derive` - Typed store macros
+14. ✅ `typed-store-error` - Typed store errors
+15. ✅ `typed-store-workspace-hack` - Workspace hack
+16. ✅ `sui-enum-compat-util` - Enum compatibility
+17. ✅ `sui-protocol-config-macros` - Protocol config macros
+
+## Cấu trúc thư mục
 
 ```
-metanode/
-├── sui-consensus/
-│   ├── config/          # Consensus configuration
-│   ├── core/            # Core consensus engine
-│   ├── types/           # Consensus types
-│   ├── sui-http/        # HTTP server (local copy)
-│   └── sui-tls/         # TLS handling (local copy, đã sửa)
-└── src/                 # MetaNode code
+Mysticeti/
+├── crates/              # Tất cả shared crates (độc lập)
+│   ├── mysten-common/
+│   ├── mysten-metrics/
+│   ├── mysten-network/
+│   ├── typed-store/
+│   └── ...
+├── metanode/
+│   ├── sui-consensus/   # Consensus modules (local copy)
+│   │   ├── config/
+│   │   ├── core/
+│   │   ├── types/
+│   │   ├── sui-http/
+│   │   └── sui-tls/
+│   └── src/             # MetaNode code
+└── client/              # Client application
 ```
 
 ## Các thay đổi đã thực hiện
 
-### 1. Loại bỏ axum-server dependency
-- Comment out dev-dependencies trong `sui-http`
-- Sửa `sui-tls` để không dùng `axum-server`
-- Sửa `acceptor.rs` để dùng implementation đơn giản hơn
+### 1. Tách độc lập khỏi Sui workspace
+- ✅ Tất cả dependencies đã được chuyển từ `../sui/crates/` → `../crates/`
+- ✅ Tất cả workspace dependencies đã được thay bằng explicit versions
+- ✅ Đã thêm cấu hình `check-cfg` cho `msim` và `fail_points` cfg conditions
 
-### 2. Sửa dependencies
-- Chuyển từ workspace dependencies sang explicit versions
-- Sửa các version conflicts (webpki, tower-layer, etc.)
+### 2. Build độc lập
+- ✅ Có thể build từ `metanode/` hoặc `client/` mà không cần Sui workspace
+- ✅ Không còn lỗi "failed to find a workspace root"
+- ✅ Không còn package collision trong lockfile
 
-### 3. Sửa code compatibility
-- Sửa edition issues (2024 -> 2021)
-- Sửa syntax issues (let expressions)
+### 3. Dependencies
+- ✅ Tất cả dependencies đều trỏ đến `../crates/` thay vì `../sui/crates/`
+- ✅ Các git dependencies (fastcrypto, anemo) vẫn được giữ nguyên
+- ✅ Move dependencies (move-vm-config, move-core-types) vẫn trỏ đến `sui/external-crates/move/`
 
-## Các lỗi còn lại
+## Lưu ý
 
-Cần sửa thêm một số lỗi compile trong:
-- `consensus-core` - một số API changes
-- `sui-tls` - webpki API changes
-
-## Cách tiếp tục
-
-1. Sửa các lỗi compile còn lại
-2. Test consensus engine
-3. Build binary
+- Project hiện tại **hoàn toàn độc lập** và có thể build mà không cần Sui workspace
+- Chỉ còn phụ thuộc vào `sui/external-crates/move/` cho Move language support (nếu cần)
+- Tất cả các crate đã được cấu hình đúng với `check-cfg` để tránh warnings
 

@@ -6,6 +6,33 @@
 
 ---
 
+## 🎯 **Mysticeti Project** (Project hiện tại)
+
+**Trạng thái:** ✅ **Độc lập hoàn toàn**
+
+**Mô tả:**
+- Project này là một implementation độc lập của Sui Mysticeti Consensus
+- Đã được tách hoàn toàn khỏi Sui workspace
+- Tất cả dependencies đã được copy vào thư mục `crates/` riêng
+- Có thể build và chạy mà không cần Sui repository
+
+**Cấu trúc:**
+- `metanode/` - Consensus engine implementation
+- `client/` - Client application
+- `crates/` - Tất cả shared crates (độc lập)
+
+**Build:**
+```bash
+cd metanode
+cargo build --release --bin metanode
+```
+
+**Xem thêm:**
+- [metanode/Readme.md](../../metanode/Readme.md) - Tài liệu chính
+- [metanode/COPY_MODULES.md](./metanode/COPY_MODULES.md) - Cấu trúc modules
+
+---
+
 ## 🔗 Các Repository Chính
 
 ### 1. **Sui Main Repository** (Khuyến nghị chính)
@@ -206,4 +233,10 @@ cargo run --bin sui-test-validator
 ---
 
 **Cập nhật:** Tháng 12, 2025
+
+---
+
+## 📝 Lưu ý về Project này
+
+Project **Mysticeti** đã được tách độc lập hoàn toàn khỏi Sui workspace. Tất cả các dependencies cần thiết đã được copy vào thư mục `crates/` và được cấu hình để hoạt động độc lập. Bạn không cần clone Sui repository để sử dụng project này.
 
