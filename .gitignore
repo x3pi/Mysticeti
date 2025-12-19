@@ -91,3 +91,4 @@ Thumbs.db
 **/.fuse_hidden*
 **/.nfs*
 
+metanode/config/committee_*.json
