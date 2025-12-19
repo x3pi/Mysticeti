@@ -1,0 +1,22 @@
+[package]
+name = "sui-proc-macros"
+version = "0.7.0"
+authors = ["Mysten Labs <build@mystenlabs.com>"]
+license = "Apache-2.0"
+publish = false
+edition = "2024"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(msim)',
+  'cfg(fail_points)',
+] }
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1.0.23"
+syn = { version = "2", features = ["full", "fold", "extra-traits"] }
+proc-macro2 = "1.0.47"
+sui-enum-compat-util = { path = "../sui-enum-compat-util" }

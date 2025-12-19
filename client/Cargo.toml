@@ -32,19 +32,19 @@ tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.15", default-features = false, features = ["std", "env-filter", "fmt"] }
 
 # Network
-mysten-network = { path = "../sui/crates/mysten-network" }
-mysten-metrics = { path = "../sui/crates/mysten-metrics" }
-mysten-common = { path = "../sui/crates/mysten-common" }
+mysten-network = { path = "../crates/mysten-network" }
+mysten-metrics = { path = "../crates/mysten-metrics" }
+mysten-common = { path = "../crates/mysten-common" }
 
 # Storage
-typed-store = { path = "../sui/crates/typed-store" }
+typed-store = { path = "../crates/typed-store" }
 
 # Protocol
-sui-protocol-config = { path = "../sui/crates/sui-protocol-config" }
+sui-protocol-config = { path = "../crates/sui-protocol-config" }
 
 # Crypto
 fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "4db0e90c732bbf7420ca20de808b698883148d9c" }
-shared-crypto = { path = "../sui/crates/shared-crypto" }
+shared-crypto = { path = "../crates/shared-crypto" }
 
 # Utilities
 parking_lot = { version = "0.12.3", features = ["arc_lock"] }
