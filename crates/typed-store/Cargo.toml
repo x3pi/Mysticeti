@@ -35,7 +35,7 @@ tracing = "0.1.37"
 typed-store-error = { path = "../typed-store-error" }
 typed-store-derive = { path = "../typed-store-derive" }
 typed-store-workspace-hack = { path = "../typed-store-workspace-hack" }
-sui-macros = { path = "../sui-macros" }
+meta-macros = { path = "../meta-macros" }
 rand = "0.8.5"
 async-trait = "0.1.61"
 itertools = "0.13.0"

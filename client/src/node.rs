@@ -9,7 +9,7 @@ use consensus_core::{
 };
 use prometheus::Registry;
 use std::sync::Arc;
-use sui_protocol_config::ProtocolConfig;
+use meta_protocol_config::ProtocolConfig;
 use tracing::info;
 
 use crate::config::NodeConfig;

@@ -43,7 +43,7 @@ use std::{
     time::Duration,
 };
 use std::{collections::HashSet, ffi::CStr};
-use sui_macros::{fail_point, nondeterministic};
+use meta_macros::{fail_point, nondeterministic};
 #[cfg(tidehunter)]
 use tidehunter::{db::Db as TideHunterDb, key_shape::KeySpace};
 use tokio::sync::oneshot;

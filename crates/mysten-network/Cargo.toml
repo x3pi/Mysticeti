@@ -40,7 +40,7 @@ tower = { version = "0.5", features = ["full", "util", "timeout", "load-shed", "
 tower-http = { version = "0.5", features = ["cors", "full", "trace", "set-header", "propagate-header"] }
 pin-project-lite = "0.2.13"
 tracing = "0.1.37"
-sui-http = { path = "../sui-http" }
+meta-http = { path = "../meta-http" }
 
 [dev-dependencies]
-sui-tls = { path = "../sui-tls" }
+meta-tls = { path = "../meta-tls" }

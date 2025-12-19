@@ -83,8 +83,8 @@ impl Config {
         connect_lazy_with_config(addr, tls_config, self)
     }
 
-    pub fn http_config(&self) -> sui_http::Config {
-        sui_http::Config::default()
+    pub fn http_config(&self) -> meta_http::Config {
+        meta_http::Config::default()
             .initial_stream_window_size(self.http2_initial_stream_window_size)
             .initial_connection_window_size(self.http2_initial_connection_window_size)
             .max_concurrent_streams(self.http2_max_concurrent_streams)

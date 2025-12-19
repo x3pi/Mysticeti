@@ -1,0 +1,29 @@
+[package]
+name = "meta-protocol-config"
+version = "0.1.0"
+authors = ["Mysten Labs <build@mystenlabs.com>"]
+license = "Apache-2.0"
+publish = false
+edition = "2024"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(msim)',
+  'cfg(fail_points)',
+] }
+
+[dependencies]
+serde = { version = "1.0.144", features = ["derive", "rc"] }
+tracing = "0.1.37"
+serde_with = "3.8"
+meta-protocol-config-macros = { path = "../meta-protocol-config-macros" }
+schemars = { version = "0.8.21", features = ["either"] }
+clap = { version = "4.4", features = ["derive", "wrap_help"] }
+move-vm-config = { path = "../../sui/external-crates/move/crates/move-vm-config" }
+serde-env = "0.2.0"
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "4db0e90c732bbf7420ca20de808b698883148d9c" }
+move-core-types = { path = "../../sui/external-crates/move/crates/move-core-types" }
+move-binary-format = { path = "../../sui/external-crates/move/crates/move-binary-format" }
+
+[dev-dependencies]
+insta = { version = "1.21.1", features = ["redactions", "yaml", "json"] }

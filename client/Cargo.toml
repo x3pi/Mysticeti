@@ -10,10 +10,10 @@ name = "metanode-client"
 path = "src/main.rs"
 
 [dependencies]
-# Sui Consensus dependencies - using local copies
-consensus-core = { path = "../metanode/sui-consensus/core" }
-consensus-config = { path = "../metanode/sui-consensus/config" }
-consensus-types = { path = "../metanode/sui-consensus/types" }
+# Meta Consensus dependencies - using local copies
+consensus-core = { path = "../metanode/meta-consensus/core" }
+consensus-config = { path = "../metanode/meta-consensus/config" }
+consensus-types = { path = "../metanode/meta-consensus/types" }
 
 # Async runtime
 tokio = "=1.47.1"
@@ -40,7 +40,7 @@ mysten-common = { path = "../crates/mysten-common" }
 typed-store = { path = "../crates/typed-store" }
 
 # Protocol
-sui-protocol-config = { path = "../crates/sui-protocol-config" }
+meta-protocol-config = { path = "../crates/meta-protocol-config" }
 
 # Crypto
 fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "4db0e90c732bbf7420ca20de808b698883148d9c" }

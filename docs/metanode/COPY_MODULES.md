@@ -10,8 +10,8 @@ Project đã được tách độc lập khỏi Sui workspace. Tất cả các d
 1. ✅ `consensus-core` - Core consensus logic
 2. ✅ `consensus-config` - Configuration
 3. ✅ `consensus-types` - Types
-4. ✅ `sui-http` - HTTP server (local copy)
-5. ✅ `sui-tls` - TLS handling (local copy)
+4. ✅ `meta-http` - HTTP server (local copy)
+5. ✅ `meta-tls` - TLS handling (local copy)
 
 ### Shared Crates (trong `crates/`)
 Các crate đã được tách độc lập và không còn phụ thuộc vào Sui workspace:
@@ -21,18 +21,18 @@ Các crate đã được tách độc lập và không còn phụ thuộc vào S
 3. ✅ `mysten-network` - Network layer
 4. ✅ `shared-crypto` - Cryptographic utilities
 5. ✅ `typed-store` - Database storage
-6. ✅ `sui-protocol-config` - Protocol configuration
-7. ✅ `sui-macros` - Macro utilities
-8. ✅ `sui-proc-macros` - Procedural macros
-9. ✅ `sui-http` - HTTP server utilities
-10. ✅ `sui-tls` - TLS utilities
+6. ✅ `meta-protocol-config` - Protocol configuration
+7. ✅ `meta-macros` - Macro utilities
+8. ✅ `meta-proc-macros` - Procedural macros
+9. ✅ `meta-http` - HTTP server utilities
+10. ✅ `meta-tls` - TLS utilities
 11. ✅ `telemetry-subscribers` - Telemetry
 12. ✅ `prometheus-closure-metric` - Prometheus metrics
 13. ✅ `typed-store-derive` - Typed store macros
 14. ✅ `typed-store-error` - Typed store errors
 15. ✅ `typed-store-workspace-hack` - Workspace hack
-16. ✅ `sui-enum-compat-util` - Enum compatibility
-17. ✅ `sui-protocol-config-macros` - Protocol config macros
+16. ✅ `meta-enum-compat-util` - Enum compatibility
+17. ✅ `meta-protocol-config-macros` - Protocol config macros
 
 ## Cấu trúc thư mục
 
@@ -49,8 +49,8 @@ Mysticeti/
 │   │   ├── config/
 │   │   ├── core/
 │   │   ├── types/
-│   │   ├── sui-http/
-│   │   └── sui-tls/
+│   │   ├── meta-http/
+│   │   └── meta-tls/
 │   └── src/             # MetaNode code
 └── client/              # Client application
 ```

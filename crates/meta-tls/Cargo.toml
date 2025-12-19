@@ -1,0 +1,33 @@
+[package]
+name = "meta-tls"
+version = "0.0.0"
+license = "Apache-2.0"
+authors = ["Brandon Williams <brandon@mystenlabs.com>"]
+description = "tools for rustls-based certificate generation and verification"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0.71"
+arc-swap = { version = "1.5.1", features = ["serde"] }
+ed25519 = { version = "2", features = ["pkcs8", "alloc", "zeroize"] }
+pkcs8 = { version = "0.10.0", features = ["std"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki = { version = "0.103", package = "rustls-webpki", features = ["alloc", "std"] }
+x509-parser = { version = "0.17.0", features = ["verify"] }
+
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "4db0e90c732bbf7420ca20de808b698883148d9c" }
+
+# reqwest support
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
+
+# Axum support
+axum = { version = "0.8", default-features = false, features = ["macros", "tokio", "http1", "http2", "json", "matched-path", "original-uri", "form", "query", "ws"] }
+axum-server = { git = "https://github.com/bmwill/axum-server.git", rev = "f44323e271afdd1365fd0c8b0a4c0bbdf4956cb7", version = "0.6", default-features = false, features = ["tls-rustls"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
+tower-layer = "0.3.2"
+tokio = "=1.47.1"
+
+[dev-dependencies]
+rand = "0.8.5"

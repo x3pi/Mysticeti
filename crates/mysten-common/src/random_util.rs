@@ -3,7 +3,7 @@
 
 use rand::Rng;
 use rand::seq::SliceRandom;
-use sui_macros::nondeterministic;
+use meta_macros::nondeterministic;
 
 use crate::in_test_configuration;
 use crate::random::get_rng;

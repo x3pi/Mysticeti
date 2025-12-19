@@ -14,7 +14,7 @@ use prometheus::Registry;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use sui_protocol_config::ProtocolConfig;
+use meta_protocol_config::ProtocolConfig;
 use tracing::{info, warn};
 use tokio::sync::RwLock;
 
