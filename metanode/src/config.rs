@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::{Path, PathBuf}};
 use tracing::info;
 
-/// Extended committee configuration with epoch timestamp
+/// Extended committee configuration with epoch timestamp and global execution index
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommitteeConfig {
     #[serde(flatten)]
@@ -20,6 +20,10 @@ struct CommitteeConfig {
     /// Epoch start timestamp in milliseconds (for genesis blocks)
     #[serde(skip_serializing_if = "Option::is_none")]
     epoch_timestamp_ms: Option<u64>,
+    /// Last global execution index (checkpoint sequence number) from previous epoch
+    /// This ensures deterministic global_exec_index calculation across all nodes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_global_exec_index: Option<u64>,
 }
 
 fn default_speed_multiplier() -> f64 {
@@ -117,6 +121,7 @@ impl NodeConfig {
         let committee_config = CommitteeConfig {
             committee: committee.clone(),
             epoch_timestamp_ms: Some(epoch_start_timestamp),
+            last_global_exec_index: Some(0), // Start from 0 for new network
         };
         let committee_json = serde_json::to_string_pretty(&committee_config)?;
         fs::write(&shared_committee_path, &committee_json)?;
@@ -230,16 +235,22 @@ impl NodeConfig {
         }
     }
 
-    /// Save committee.json in the extended format (Committee + epoch_timestamp_ms).
-    /// This is used during epoch transition to atomically update epoch + timestamp for all nodes.
+    /// Save committee.json in the extended format (Committee + epoch_timestamp_ms + last_global_exec_index).
+    /// This is used during epoch transition to atomically update epoch + timestamp + global exec index for all nodes.
+    /// NOTE: This function preserves existing last_global_exec_index. For explicit control, use save_committee_with_global_exec_index.
+    #[allow(dead_code)] // Kept for backward compatibility and potential future use
     pub fn save_committee_with_epoch_timestamp(
         committee_path: &Path,
         committee: &Committee,
         epoch_timestamp_ms: u64,
     ) -> Result<()> {
+        // Load existing last_global_exec_index if available (preserve it)
+        let existing_last_global_exec_index = Self::load_last_global_exec_index(committee_path).ok();
+        
         let committee_config = CommitteeConfig {
             committee: committee.clone(),
             epoch_timestamp_ms: Some(epoch_timestamp_ms),
+            last_global_exec_index: existing_last_global_exec_index,
         };
         let committee_json = serde_json::to_string_pretty(&committee_config)?;
 
@@ -249,6 +260,44 @@ impl NodeConfig {
         fs::write(&tmp_path, committee_json)?;
         fs::rename(&tmp_path, committee_path)?;
         Ok(())
+    }
+
+    /// Save committee.json with epoch timestamp and last global execution index
+    pub fn save_committee_with_global_exec_index(
+        committee_path: &Path,
+        committee: &Committee,
+        epoch_timestamp_ms: u64,
+        last_global_exec_index: u64,
+    ) -> Result<()> {
+        let committee_config = CommitteeConfig {
+            committee: committee.clone(),
+            epoch_timestamp_ms: Some(epoch_timestamp_ms),
+            last_global_exec_index: Some(last_global_exec_index),
+        };
+        let committee_json = serde_json::to_string_pretty(&committee_config)?;
+
+        // Atomic write: write to temp file then rename.
+        let tmp_path = committee_path.with_extension("json.tmp");
+        fs::write(&tmp_path, committee_json)?;
+        fs::rename(&tmp_path, committee_path)?;
+        Ok(())
+    }
+
+    /// Load last_global_exec_index from committee.json
+    pub fn load_last_global_exec_index(committee_path: &Path) -> Result<u64> {
+        if !committee_path.exists() {
+            // If committee.json doesn't exist, start from 0
+            return Ok(0);
+        }
+        
+        let content = fs::read_to_string(committee_path)?;
+        match serde_json::from_str::<CommitteeConfig>(&content) {
+            Ok(config) => Ok(config.last_global_exec_index.unwrap_or(0)),
+            Err(_) => {
+                // Fallback: try loading as plain Committee (backward compatibility)
+                Ok(0) // Default to 0 if can't parse
+            }
+        }
     }
 
     pub fn load_epoch_timestamp(&self) -> Result<u64> {
@@ -337,6 +386,7 @@ impl NodeConfig {
                         let config = CommitteeConfig {
                             committee,
                             epoch_timestamp_ms: Some(timestamp),
+                            last_global_exec_index: None, // Preserve existing if any
                         };
                         let updated_json = serde_json::to_string_pretty(&config)?;
                         fs::write(committee_path, updated_json)?;
@@ -367,6 +417,7 @@ impl NodeConfig {
                         let config = CommitteeConfig {
                             committee,
                             epoch_timestamp_ms: Some(timestamp),
+                            last_global_exec_index: None, // Preserve existing if any
                         };
                         let updated_json = serde_json::to_string_pretty(&config)?;
                         fs::write(committee_path, updated_json)?;

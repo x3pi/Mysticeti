@@ -20,6 +20,7 @@ use tokio::sync::RwLock;
 
 use crate::config::NodeConfig;
 use crate::tx_submitter::{TransactionClientProxy, TransactionSubmitter};
+use crate::checkpoint::calculate_global_exec_index;
 
 pub struct ConsensusNode {
     authority: Option<ConsensusAuthority>,
@@ -38,6 +39,10 @@ pub struct ConsensusNode {
     /// Paths needed for real epoch transition (persist + clean state)
     committee_path: std::path::PathBuf,
     storage_path: std::path::PathBuf,
+    /// Current epoch (for deterministic global_exec_index calculation)
+    current_epoch: u64,
+    /// Last global execution index (for deterministic global_exec_index calculation)
+    last_global_exec_index: u64,
 
     // --- restart support ---
     protocol_keypair: consensus_config::ProtocolKeyPair,
@@ -58,7 +63,8 @@ impl ConsensusNode {
 
         // Load committee
         let committee = config.load_committee()?;
-        info!("Loaded committee with {} authorities", committee.size());
+        let current_epoch = committee.epoch();
+        info!("Loaded committee with {} authorities, epoch={}", committee.size(), current_epoch);
 
         // Capture paths needed for epoch transition
         let committee_path = config
@@ -66,6 +72,11 @@ impl ConsensusNode {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Committee path not specified in config"))?;
         let storage_path = config.storage_path.clone();
+        
+        // Load last_global_exec_index from committee.json (for deterministic global_exec_index calculation)
+        let last_global_exec_index = crate::config::NodeConfig::load_last_global_exec_index(&committee_path)
+            .unwrap_or(0); // Default to 0 if not found (new network)
+        info!("Loaded last_global_exec_index={} (deterministic checkpoint sequence)", last_global_exec_index);
 
         // Load keypairs (kept for in-process restart)
         let protocol_keypair = config.load_protocol_keypair()?;
@@ -96,11 +107,12 @@ impl ConsensusNode {
         let current_commit_index = Arc::new(AtomicU32::new(0));
         let commit_index_for_callback = current_commit_index.clone();
         
-        // Create ordered commit processor with commit index tracking
+        // Create ordered commit processor with commit index tracking and epoch info
         let commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
             .with_commit_index_callback(move |index| {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
-            });
+            })
+            .with_epoch_info(current_epoch, last_global_exec_index);
         tokio::spawn(async move {
             if let Err(e) = commit_processor.run().await {
                 tracing::error!("Commit processor error: {}", e);
@@ -586,6 +598,8 @@ impl ConsensusNode {
             current_commit_index,
             committee_path,
             storage_path,
+            current_epoch,
+            last_global_exec_index,
             protocol_keypair,
             network_keypair,
             protocol_config,
@@ -724,19 +738,43 @@ impl ConsensusNode {
         // 1) Graceful shutdown current authority (best-effort)
         self.graceful_shutdown().await?;
 
-        // 2) Persist new epoch config (committee.json + epoch_timestamp_ms)
-        crate::config::NodeConfig::save_committee_with_epoch_timestamp(
+        // 2) Calculate new last_global_exec_index (deterministic)
+        // This ensures all nodes compute the same global_exec_index for new epoch
+        let old_epoch = self.current_epoch;
+        let last_commit_index = current_commit_index; // Last commit index of old epoch
+        let new_last_global_exec_index = calculate_global_exec_index(
+            old_epoch,
+            last_commit_index,
+            self.last_global_exec_index,
+        );
+        
+        info!(
+            "📊 Global execution index transition: epoch {} -> {}, last_commit_index={}, last_global_exec_index={} -> {}",
+            old_epoch,
+            proposal.new_epoch,
+            last_commit_index,
+            self.last_global_exec_index,
+            new_last_global_exec_index
+        );
+
+        // 3) Persist new epoch config (committee.json + epoch_timestamp_ms + last_global_exec_index)
+        crate::config::NodeConfig::save_committee_with_global_exec_index(
             &self.committee_path,
             &proposal.new_committee,
             proposal.new_epoch_timestamp_ms,
+            new_last_global_exec_index,
         )?;
 
-        // 3) Stop old authority (in-process restart)
+        // 4) Stop old authority (in-process restart)
         if let Some(authority) = self.authority.take() {
             authority.stop().await;
         }
 
-        // 4) Reset epoch-local state (manager + commit index)
+        // 5) Update epoch and last_global_exec_index for new epoch
+        self.current_epoch = proposal.new_epoch;
+        self.last_global_exec_index = new_last_global_exec_index;
+
+        // 6) Reset epoch-local state (manager + commit index)
         {
             let mut mgr = self.epoch_change_manager.write().await;
             mgr.reset_for_new_epoch(
@@ -747,7 +785,7 @@ impl ConsensusNode {
         }
         self.current_commit_index.store(0, Ordering::SeqCst);
 
-        // 5) Create fresh per-epoch DB path (do NOT delete old epoch DB)
+        // 7) Create fresh per-epoch DB path (do NOT delete old epoch DB)
         let db_path = self
             .storage_path
             .join("epochs")
@@ -755,13 +793,17 @@ impl ConsensusNode {
             .join("consensus_db");
         std::fs::create_dir_all(&db_path)?;
 
-        // 6) Recreate commit consumer + commit processor for the new epoch (clean DAG/round)
+        // 8) Recreate commit consumer + commit processor for the new epoch (clean DAG/round)
+        // NOTE: global_exec_index calculation is deterministic (all nodes compute same value)
         let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
         let commit_index_for_callback = self.current_commit_index.clone();
+        let new_epoch = proposal.new_epoch;
+        let new_last_global_exec_index = new_last_global_exec_index;
         let commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
             .with_commit_index_callback(move |index| {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
-            });
+            })
+            .with_epoch_info(new_epoch, new_last_global_exec_index);
         tokio::spawn(async move {
             if let Err(e) = commit_processor.run().await {
                 tracing::error!("Commit processor error: {}", e);

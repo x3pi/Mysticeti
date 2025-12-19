@@ -16,6 +16,7 @@ mod epoch_change_bridge;
 mod epoch_change_hook;
 mod clock_sync;
 mod tx_submitter;
+mod checkpoint;
 
 use config::NodeConfig;
 use node::ConsensusNode;

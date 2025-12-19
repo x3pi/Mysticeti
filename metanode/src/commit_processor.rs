@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::checkpoint::calculate_global_exec_index;
+
 /// Commit processor that ensures commits are executed in order
 pub struct CommitProcessor {
     receiver: UnboundedReceiver<CommittedSubDag>,
@@ -16,6 +18,10 @@ pub struct CommitProcessor {
     pending_commits: BTreeMap<u32, CommittedSubDag>,
     /// Optional callback to notify commit index updates (for epoch transition)
     commit_index_callback: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+    /// Current epoch (for deterministic global_exec_index calculation)
+    current_epoch: u64,
+    /// Last global execution index from previous epoch (for deterministic calculation)
+    last_global_exec_index: u64,
 }
 
 impl CommitProcessor {
@@ -25,6 +31,8 @@ impl CommitProcessor {
             next_expected_index: 1, // First commit after genesis has index 1
             pending_commits: BTreeMap::new(),
             commit_index_callback: None,
+            current_epoch: 0,
+            last_global_exec_index: 0,
         }
     }
 
@@ -37,12 +45,21 @@ impl CommitProcessor {
         self
     }
 
+    /// Set epoch and last_global_exec_index for deterministic global_exec_index calculation
+    pub fn with_epoch_info(mut self, epoch: u64, last_global_exec_index: u64) -> Self {
+        self.current_epoch = epoch;
+        self.last_global_exec_index = last_global_exec_index;
+        self
+    }
+
     /// Process commits in order
     pub async fn run(self) -> Result<()> {
         let mut receiver = self.receiver;
         let mut next_expected_index = self.next_expected_index;
         let mut pending_commits = self.pending_commits;
         let commit_index_callback = self.commit_index_callback;
+        let current_epoch = self.current_epoch;
+        let last_global_exec_index = self.last_global_exec_index;
         
         loop {
             match receiver.recv().await {
@@ -51,7 +68,14 @@ impl CommitProcessor {
                     
                     // If this is the next expected commit, process it immediately
                     if commit_index == next_expected_index {
-                        Self::process_commit(&subdag).await?;
+                        // Calculate deterministic global_exec_index (Checkpoint Sequence Number)
+                        let global_exec_index = calculate_global_exec_index(
+                            current_epoch,
+                            commit_index,
+                            last_global_exec_index,
+                        );
+                        
+                        Self::process_commit(&subdag, global_exec_index, current_epoch).await?;
                         
                         // Notify commit index update (for epoch transition)
                         if let Some(ref callback) = commit_index_callback {
@@ -62,7 +86,14 @@ impl CommitProcessor {
                         
                         // Process any pending commits that are now in order
                         while let Some(pending) = pending_commits.remove(&next_expected_index) {
-                            Self::process_commit(&pending).await?;
+                            // Calculate deterministic global_exec_index for pending commit
+                            let global_exec_index = calculate_global_exec_index(
+                                current_epoch,
+                                next_expected_index,
+                                last_global_exec_index,
+                            );
+                            
+                            Self::process_commit(&pending, global_exec_index, current_epoch).await?;
                             
                             // Notify commit index update
                             if let Some(ref callback) = commit_index_callback {
@@ -96,7 +127,11 @@ impl CommitProcessor {
         Ok(())
     }
 
-    async fn process_commit(subdag: &CommittedSubDag) -> Result<()> {
+    async fn process_commit(
+        subdag: &CommittedSubDag,
+        global_exec_index: u64,
+        epoch: u64,
+    ) -> Result<()> {
         let commit_index = subdag.commit_ref.index;
         let mut total_transactions = 0;
         let mut transaction_hashes = Vec::new();
@@ -129,8 +164,10 @@ impl CommitProcessor {
         
         if total_transactions > 0 {
             info!(
-                "🔷 Executing commit #{} (ordered): leader={:?}, {} blocks, {} total transactions, tx_hashes=[{}]",
+                "🔷 Executing commit #{} (checkpoint_seq={}, epoch={}): leader={:?}, {} blocks, {} total transactions, tx_hashes=[{}]",
                 commit_index,
+                global_exec_index,  // Deterministic Checkpoint Sequence Number (like Sui)
+                epoch,
                 subdag.leader,
                 subdag.blocks.len(),
                 total_transactions,
@@ -142,17 +179,15 @@ impl CommitProcessor {
                 block_details.join(", ")
             );
             
-            // TODO: Here you can execute transactions in order
+            // TODO: Here you can execute transactions in order with global_exec_index
             // For example:
-            // for block in &subdag.blocks {
-            //     for tx in block.transactions() {
-            //         execute_transaction(tx).await?;
-            //     }
-            // }
+            // executor.create_block(global_exec_index, subdag).await?;
         } else {
             info!(
-                "🔷 Executing commit #{} (ordered): leader={:?}, {} blocks, 0 transactions",
+                "🔷 Executing commit #{} (checkpoint_seq={}, epoch={}): leader={:?}, {} blocks, 0 transactions",
                 commit_index,
+                global_exec_index,  // Deterministic Checkpoint Sequence Number
+                epoch,
                 subdag.leader,
                 subdag.blocks.len()
             );
