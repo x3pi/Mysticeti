@@ -22,7 +22,9 @@ use config::NodeConfig;
 use node::ConsensusNode;
 use tracing::error;
 use std::sync::Arc;
+use std::net::SocketAddr;
 use tokio::sync::Mutex;
+use mysten_metrics::start_prometheus_server;
 
 #[derive(Parser)]
 #[command(name = "metanode")]
@@ -72,7 +74,26 @@ async fn main() -> Result<()> {
             info!("Node ID: {}", node_config.node_id);
             info!("Network address: {}", node_config.network_address);
 
-            let node = Arc::new(Mutex::new(ConsensusNode::new(node_config.clone()).await?));
+            // Start metrics server if enabled
+            // We need to create RegistryService first, then use its registry for ConsensusNode
+            let registry_service = if node_config.enable_metrics {
+                let metrics_addr = SocketAddr::from(([127, 0, 0, 1], node_config.metrics_port));
+                let registry_service = start_prometheus_server(metrics_addr);
+                info!("Metrics server started at http://127.0.0.1:{}/metrics", node_config.metrics_port);
+                Some(registry_service)
+            } else {
+                info!("Metrics server is disabled (enable_metrics = false)");
+                None
+            };
+
+            // Get registry from RegistryService if metrics is enabled, otherwise create a new one
+            let registry = if let Some(ref rs) = registry_service {
+                rs.default_registry()
+            } else {
+                prometheus::Registry::new()
+            };
+
+            let node = Arc::new(Mutex::new(ConsensusNode::new_with_registry(node_config.clone(), registry).await?));
             
             // Start RPC server for client submissions
             let rpc_port = node_config.metrics_port + 1000; // RPC port = metrics_port + 1000

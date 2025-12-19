@@ -58,7 +58,14 @@ pub struct ConsensusNode {
 }
 
 impl ConsensusNode {
+    /// Create a new ConsensusNode with a default registry
+    /// For metrics support, use `new_with_registry` instead
+    #[allow(dead_code)]
     pub async fn new(config: NodeConfig) -> Result<Self> {
+        Self::new_with_registry(config, Registry::new()).await
+    }
+
+    pub async fn new_with_registry(config: NodeConfig, registry: Registry) -> Result<Self> {
         info!("Initializing consensus node {}...", config.node_id);
 
         // Load committee
@@ -91,8 +98,7 @@ impl ConsensusNode {
         // Create storage directory
         std::fs::create_dir_all(&config.storage_path)?;
 
-        // Initialize metrics registry
-        let registry = Registry::new();
+        // Use provided registry (from metrics server if enabled)
 
         // Create clock (kept for in-process restart)
         let clock = Arc::new(Clock::default());
