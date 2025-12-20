@@ -7,10 +7,109 @@ use prometheus::{
     Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry,
     exponential_buckets, register_histogram_vec_with_registry, register_histogram_with_registry,
     register_int_counter_vec_with_registry, register_int_counter_with_registry,
-    register_int_gauge_vec_with_registry, register_int_gauge_with_registry,
+    register_int_gauge_vec_with_registry, register_int_gauge_with_registry, Error as PrometheusError,
 };
 
 use crate::network::metrics::NetworkMetrics;
+
+/// Helper function to register a metric or handle AlreadyReg error gracefully.
+/// For production: if metric already exists, this indicates a bug in registry management.
+/// Each epoch should use a fresh registry to avoid AlreadyReg errors.
+fn register_or_replace_int_gauge_vec(
+    name: &str,
+    help: &str,
+    labels: &[&str],
+    registry: &Registry,
+) -> IntGaugeVec {
+    match register_int_gauge_vec_with_registry!(name, help, labels, registry) {
+        Ok(metric) => metric,
+        Err(PrometheusError::AlreadyReg) => {
+            // Metric already exists - this should not happen if each epoch uses a fresh registry
+            tracing::error!("Metric '{}' already registered in registry. This indicates a bug: each epoch should use a fresh Registry instance.", name);
+            panic!("Metric '{}' already registered. Ensure each epoch uses a fresh Registry::new() instance.", name);
+        }
+        Err(e) => panic!("Failed to register metric '{}': {}", name, e),
+    }
+}
+
+fn register_or_replace_int_gauge(
+    name: &str,
+    help: &str,
+    registry: &Registry,
+) -> IntGauge {
+    match register_int_gauge_with_registry!(name, help, registry) {
+        Ok(metric) => metric,
+        Err(PrometheusError::AlreadyReg) => {
+            tracing::error!("Metric '{}' already registered in registry. This indicates a bug: each epoch should use a fresh Registry instance.", name);
+            panic!("Metric '{}' already registered. Ensure each epoch uses a fresh Registry::new() instance.", name);
+        }
+        Err(e) => panic!("Failed to register metric '{}': {}", name, e),
+    }
+}
+
+fn register_or_replace_histogram(
+    name: &str,
+    help: &str,
+    buckets: Vec<f64>,
+    registry: &Registry,
+) -> Histogram {
+    match register_histogram_with_registry!(name, help, buckets, registry) {
+        Ok(metric) => metric,
+        Err(PrometheusError::AlreadyReg) => {
+            tracing::error!("Metric '{}' already registered in registry. This indicates a bug: each epoch should use a fresh Registry instance.", name);
+            panic!("Metric '{}' already registered. Ensure each epoch uses a fresh Registry::new() instance.", name);
+        }
+        Err(e) => panic!("Failed to register metric '{}': {}", name, e),
+    }
+}
+
+fn register_or_replace_histogram_vec(
+    name: &str,
+    help: &str,
+    labels: &[&str],
+    buckets: Vec<f64>,
+    registry: &Registry,
+) -> HistogramVec {
+    match register_histogram_vec_with_registry!(name, help, labels, buckets, registry) {
+        Ok(metric) => metric,
+        Err(PrometheusError::AlreadyReg) => {
+            tracing::error!("Metric '{}' already registered in registry. This indicates a bug: each epoch should use a fresh Registry instance.", name);
+            panic!("Metric '{}' already registered. Ensure each epoch uses a fresh Registry::new() instance.", name);
+        }
+        Err(e) => panic!("Failed to register metric '{}': {}", name, e),
+    }
+}
+
+fn register_or_replace_int_counter_vec(
+    name: &str,
+    help: &str,
+    labels: &[&str],
+    registry: &Registry,
+) -> IntCounterVec {
+    match register_int_counter_vec_with_registry!(name, help, labels, registry) {
+        Ok(metric) => metric,
+        Err(PrometheusError::AlreadyReg) => {
+            tracing::error!("Metric '{}' already registered in registry. This indicates a bug: each epoch should use a fresh Registry instance.", name);
+            panic!("Metric '{}' already registered. Ensure each epoch uses a fresh Registry::new() instance.", name);
+        }
+        Err(e) => panic!("Failed to register metric '{}': {}", name, e),
+    }
+}
+
+fn register_or_replace_int_counter(
+    name: &str,
+    help: &str,
+    registry: &Registry,
+) -> IntCounter {
+    match register_int_counter_with_registry!(name, help, registry) {
+        Ok(metric) => metric,
+        Err(PrometheusError::AlreadyReg) => {
+            tracing::error!("Metric '{}' already registered in registry. This indicates a bug: each epoch should use a fresh Registry instance.", name);
+            panic!("Metric '{}' already registered. Ensure each epoch uses a fresh Registry::new() instance.", name);
+        }
+        Err(e) => panic!("Failed to register metric '{}': {}", name, e),
+    }
+}
 
 // starts from 1μs, 50μs, 100μs...
 const FINE_GRAINED_LATENCY_SEC_BUCKETS: &[f64] = &[
@@ -226,272 +325,272 @@ pub(crate) struct NodeMetrics {
 impl NodeMetrics {
     pub(crate) fn new(registry: &Registry) -> Self {
         Self {
-            authority_index: register_int_gauge_vec_with_registry!(
+            authority_index: register_or_replace_int_gauge_vec(
                 "authority_index",
                 "The index of the authority",
                 &["name"],
                 registry,
-            ).unwrap(),
-            protocol_version: register_int_gauge_with_registry!(
+            ),
+            protocol_version: register_or_replace_int_gauge(
                 "protocol_version",
                 "The protocol version used in this epoch",
                 registry,
-            ).unwrap(),
-            block_commit_latency: register_histogram_with_registry!(
+            ),
+            block_commit_latency: register_or_replace_histogram(
                 "block_commit_latency",
                 "The time taken between block creation and block commit.",
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
-            ).unwrap(),
-            proposed_blocks: register_int_counter_vec_with_registry!(
+            ),
+            proposed_blocks: register_or_replace_int_counter_vec(
                 "proposed_blocks",
                 "Total number of proposed blocks. If force is true then this block has been created forcefully via a leader timeout event.",
                 &["force"],
                 registry,
-            ).unwrap(),
-            proposed_block_size: register_histogram_with_registry!(
+            ),
+            proposed_block_size: register_or_replace_histogram(
                 "proposed_block_size",
                 "The size (in bytes) of proposed blocks",
                 SIZE_BUCKETS.to_vec(),
-                registry
-            ).unwrap(),
-            proposed_block_transactions: register_histogram_with_registry!(
+                registry,
+            ),
+            proposed_block_transactions: register_or_replace_histogram(
                 "proposed_block_transactions",
                 "# of transactions contained in proposed blocks",
                 NUM_BUCKETS.to_vec(),
-                registry
-            ).unwrap(),
-            proposed_block_ancestors: register_histogram_with_registry!(
+                registry,
+            ),
+            proposed_block_ancestors: register_or_replace_histogram(
                 "proposed_block_ancestors",
                 "Number of ancestors in proposed blocks",
                 exponential_buckets(1.0, 1.4, 20).unwrap(),
                 registry,
-            ).unwrap(),
-            proposed_block_ancestors_timestamp_drift_ms: register_int_counter_vec_with_registry!(
+            ),
+            proposed_block_ancestors_timestamp_drift_ms: register_or_replace_int_counter_vec(
                 "proposed_block_ancestors_timestamp_drift_ms",
                 "The drift in ms of ancestors' timestamps included in newly proposed blocks",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            proposed_block_ancestors_depth: register_histogram_vec_with_registry!(
+            ),
+            proposed_block_ancestors_depth: register_or_replace_histogram_vec(
                 "proposed_block_ancestors_depth",
                 "The depth in rounds of ancestors included in newly proposed blocks",
                 &["authority"],
                 exponential_buckets(1.0, 2.0, 14).unwrap(),
                 registry,
-            ).unwrap(),
-            highest_verified_authority_round: register_int_gauge_vec_with_registry!(
+            ),
+            highest_verified_authority_round: register_or_replace_int_gauge_vec(
                 "highest_verified_authority_round",
                 "The highest round of verified block for the corresponding authority",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            lowest_verified_authority_round: register_int_gauge_vec_with_registry!(
+            ),
+            lowest_verified_authority_round: register_or_replace_int_gauge_vec(
                 "lowest_verified_authority_round",
                 "The lowest round of verified block for the corresponding authority",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            block_proposal_interval: register_histogram_with_registry!(
+            ),
+            block_proposal_interval: register_or_replace_histogram(
                 "block_proposal_interval",
                 "Intervals (in secs) between block proposals.",
                 FINE_GRAINED_LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
-            ).unwrap(),
-            block_proposal_leader_wait_ms: register_int_counter_vec_with_registry!(
+            ),
+            block_proposal_leader_wait_ms: register_or_replace_int_counter_vec(
                 "block_proposal_leader_wait_ms",
                 "Total time in ms spent waiting for a leader when proposing blocks.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            block_proposal_leader_wait_count: register_int_counter_vec_with_registry!(
+            ),
+            block_proposal_leader_wait_count: register_or_replace_int_counter_vec(
                 "block_proposal_leader_wait_count",
                 "Total times waiting for a leader when proposing blocks.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            block_timestamp_drift_ms: register_int_counter_vec_with_registry!(
+            ),
+            block_timestamp_drift_ms: register_or_replace_int_counter_vec(
                 "block_timestamp_drift_ms",
                 "The clock drift time between a received block and the current node's time.",
                 &["authority", "source"],
                 registry,
-            ).unwrap(),
-            blocks_per_commit_count: register_histogram_with_registry!(
+            ),
+            blocks_per_commit_count: register_or_replace_histogram(
                 "blocks_per_commit_count",
                 "The number of blocks per commit.",
                 NUM_BUCKETS.to_vec(),
                 registry,
-            ).unwrap(),
-            blocks_pruned_on_commit: register_int_counter_vec_with_registry!(
+            ),
+            blocks_pruned_on_commit: register_or_replace_int_counter_vec(
                 "blocks_pruned_on_commit",
                 "Number of blocks that got pruned due to garbage collection during a commit. This is not an accurate metric and measures the pruned blocks on the edge of the commit.",
                 &["authority", "commit_status"],
                 registry,
-            ).unwrap(),
-            commit_observer_last_recovered_commit_index: register_int_gauge_with_registry!(
+            ),
+            commit_observer_last_recovered_commit_index: register_or_replace_int_gauge(
                 "commit_observer_last_recovered_commit_index",
                 "The last commit index recovered by the commit observer",
                 registry,
-            ).unwrap(),
-            core_add_blocks_batch_size: register_histogram_with_registry!(
+            ),
+            core_add_blocks_batch_size: register_or_replace_histogram(
                 "core_add_blocks_batch_size",
                 "The number of blocks received from Core for processing on a single batch",
                 NUM_BUCKETS.to_vec(),
                 registry,
-            ).unwrap(),
-            core_check_block_refs_batch_size: register_histogram_with_registry!(
+            ),
+            core_check_block_refs_batch_size: register_or_replace_histogram(
                 "core_check_block_refs_batch_size",
                 "The number of excluded blocks received from Core for search on a single batch",
                 NUM_BUCKETS.to_vec(),
                 registry,
-            ).unwrap(),
-            core_lock_dequeued: register_int_counter_with_registry!(
+            ),
+            core_lock_dequeued: register_or_replace_int_counter(
                 "core_lock_dequeued",
                 "Number of dequeued core requests",
                 registry,
-            ).unwrap(),
-            core_lock_enqueued: register_int_counter_with_registry!(
+            ),
+            core_lock_enqueued: register_or_replace_int_counter(
                 "core_lock_enqueued",
                 "Number of enqueued core requests",
                 registry,
-            ).unwrap(),
-            core_skipped_proposals: register_int_counter_vec_with_registry!(
+            ),
+            core_skipped_proposals: register_or_replace_int_counter_vec(
                 "core_skipped_proposals",
                 "Number of proposals skipped in the Core, per reason",
                 &["reason"],
                 registry,
-            ).unwrap(),
-            handler_received_block_missing_ancestors: register_int_counter_vec_with_registry!(
+            ),
+            handler_received_block_missing_ancestors: register_or_replace_int_counter_vec(
                 "handler_received_block_missing_ancestors",
                 "Number of missing ancestors in blocks received in the handler, separated by peer",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            highest_accepted_authority_round: register_int_gauge_vec_with_registry!(
+            ),
+            highest_accepted_authority_round: register_or_replace_int_gauge_vec(
                 "highest_accepted_authority_round",
                 "The highest round where a block has been accepted per authority. Resets on restart.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            highest_accepted_round: register_int_gauge_with_registry!(
+            ),
+            highest_accepted_round: register_or_replace_int_gauge(
                 "highest_accepted_round",
                 "The highest round where a block has been accepted. Resets on restart.",
                 registry,
-            ).unwrap(),
-            accepted_block_time_drift_ms: register_int_counter_vec_with_registry!(
+            ),
+            accepted_block_time_drift_ms: register_or_replace_int_counter_vec(
                 "accepted_block_time_drift_ms",
                 "The time drift in ms of an accepted block compared to local time",
                 &["authority"],
                 registry,
-            ).unwrap(),
+            ),
             accepted_blocks: register_int_counter_vec_with_registry!(
                 "accepted_blocks",
                 "Number of accepted blocks by source (own, others)",
                 &["source"],
                 registry,
             ).unwrap(),
-            dag_state_recent_blocks: register_int_gauge_with_registry!(
+            dag_state_recent_blocks: register_or_replace_int_gauge(
                 "dag_state_recent_blocks",
                 "Number of recent blocks cached in the DagState",
                 registry,
-            ).unwrap(),
-            dag_state_recent_refs: register_int_gauge_with_registry!(
+            ),
+            dag_state_recent_refs: register_or_replace_int_gauge(
                 "dag_state_recent_refs",
                 "Number of recent refs cached in the DagState",
                 registry,
-            ).unwrap(),
-            dag_state_store_read_count: register_int_counter_vec_with_registry!(
+            ),
+            dag_state_store_read_count: register_or_replace_int_counter_vec(
                 "dag_state_store_read_count",
                 "Number of times DagState needs to read from store per operation type",
                 &["type"],
                 registry,
-            ).unwrap(),
-            dag_state_store_write_count: register_int_counter_with_registry!(
+            ),
+            dag_state_store_write_count: register_or_replace_int_counter(
                 "dag_state_store_write_count",
                 "Number of times DagState needs to write to store",
                 registry,
-            ).unwrap(),
-            fetch_blocks_scheduler_inflight: register_int_gauge_with_registry!(
+            ),
+            fetch_blocks_scheduler_inflight: register_or_replace_int_gauge(
                 "fetch_blocks_scheduler_inflight",
                 "Designates whether the synchronizer scheduler task to fetch blocks is currently running",
                 registry,
-            ).unwrap(),
-            synchronizer_fetched_blocks_by_peer: register_int_counter_vec_with_registry!(
+            ),
+            synchronizer_fetched_blocks_by_peer: register_or_replace_int_counter_vec(
                 "synchronizer_fetched_blocks_by_peer",
                 "Number of fetched blocks per peer authority via the synchronizer and also by block authority",
                 &["peer", "type"],
                 registry,
-            ).unwrap(),
-            synchronizer_missing_blocks_by_authority: register_int_counter_vec_with_registry!(
+            ),
+            synchronizer_missing_blocks_by_authority: register_or_replace_int_counter_vec(
                 "synchronizer_missing_blocks_by_authority",
                 "Number of missing blocks per block author, as observed by the synchronizer during periodic sync.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            synchronizer_current_missing_blocks_by_authority: register_int_gauge_vec_with_registry!(
+            ),
+            synchronizer_current_missing_blocks_by_authority: register_or_replace_int_gauge_vec(
                 "synchronizer_current_missing_blocks_by_authority",
                 "Current number of missing blocks per block author, as observed by the synchronizer during periodic sync.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            synchronizer_fetched_blocks_by_authority: register_int_counter_vec_with_registry!(
+            ),
+            synchronizer_fetched_blocks_by_authority: register_or_replace_int_counter_vec(
                 "synchronizer_fetched_blocks_by_authority",
                 "Number of fetched blocks per block author via the synchronizer",
                 &["authority", "type"],
                 registry,
-            ).unwrap(),
-            synchronizer_fetch_failures: register_int_counter_vec_with_registry!(
+            ),
+            synchronizer_fetch_failures: register_or_replace_int_counter_vec(
                 "synchronizer_fetch_failures",
                 "Number of fetch failures against each peer",
                 &["peer", "type"],
                 registry,
-            ).unwrap(),
-            synchronizer_skipped_fetch_requests: register_int_counter_vec_with_registry!(
+            ),
+            synchronizer_skipped_fetch_requests: register_or_replace_int_counter_vec(
                 "synchronizer_skipped_fetch_requests",
                 "Number of fetch requests skipped against each peer, because the peer is saturated",
                 &["peer"],
                 registry,
-            ).unwrap(),
-            synchronizer_process_fetched_failures: register_int_counter_vec_with_registry!(
+            ),
+            synchronizer_process_fetched_failures: register_or_replace_int_counter_vec(
                 "synchronizer_process_fetched_failures",
                 "Number of failures for processing fetched blocks against each peer",
                 &["peer", "type"],
                 registry,
-            ).unwrap(),
-            network_received_excluded_ancestors_from_authority: register_int_counter_vec_with_registry!(
+            ),
+            network_received_excluded_ancestors_from_authority: register_or_replace_int_counter_vec(
                 "network_received_excluded_ancestors_from_authority",
                 "Number of excluded ancestors received from each authority.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            network_excluded_ancestors_count_by_authority: register_int_counter_vec_with_registry!(
+            ),
+            network_excluded_ancestors_count_by_authority: register_or_replace_int_counter_vec(
                 "network_excluded_ancestors_count_by_authority",
                 "Total number of excluded ancestors per authority.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            network_excluded_ancestors_sent_to_fetch: register_int_counter_vec_with_registry!(
+            ),
+            network_excluded_ancestors_sent_to_fetch: register_or_replace_int_counter_vec(
                 "network_excluded_ancestors_sent_to_fetch",
                 "Number of excluded ancestors sent to fetch.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            last_known_own_block_round: register_int_gauge_with_registry!(
+            ),
+            last_known_own_block_round: register_or_replace_int_gauge(
                 "last_known_own_block_round",
                 "The highest round of our own block as this has been synced from peers during an amnesia recovery",
                 registry,
-            ).unwrap(),
-            sync_last_known_own_block_retries: register_int_counter_with_registry!(
+            ),
+            sync_last_known_own_block_retries: register_or_replace_int_counter(
                 "sync_last_known_own_block_retries",
                 "Number of times this node tried to fetch the last own block from peers",
                 registry,
-            ).unwrap(),
-            invalid_blocks: register_int_counter_vec_with_registry!(
+            ),
+            invalid_blocks: register_or_replace_int_counter_vec(
                 "invalid_blocks",
                 "Number of invalid blocks per peer authority",
                 &["authority", "source", "error"],
                 registry,
-            ).unwrap(),
+            ),
             certifier_block_latency: register_histogram_vec_with_registry!(
                 "certifier_block_latency",
                 "The latency of a block being certified by the transaction certifier. The block's authority is the label",
@@ -499,64 +598,64 @@ impl NodeMetrics {
                 FINE_GRAINED_LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
             ).unwrap(),
-            certifier_rejected_transactions: register_int_counter_vec_with_registry!(
+            certifier_rejected_transactions: register_or_replace_int_counter_vec(
                 "certifier_rejected_transactions",
                 "Number of transactions rejected by authority in transaction certifier",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            certifier_accepted_transactions: register_int_counter_vec_with_registry!(
+            ),
+            certifier_accepted_transactions: register_or_replace_int_counter_vec(
                 "certifier_accepted_transactions",
                 "Number of transactions accepted by authority in transaction certifier",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            certifier_missing_ancestor_during_certification: register_int_counter_vec_with_registry!(
+            ),
+            certifier_missing_ancestor_during_certification: register_or_replace_int_counter_vec(
                 "certifier_missing_ancestor_during_certification",
                 "Number of missing ancestors during certification",
                 &["reason"],
                 registry,
-            ).unwrap(),
-            rejected_blocks: register_int_counter_vec_with_registry!(
+            ),
+            rejected_blocks: register_or_replace_int_counter_vec(
                 "rejected_blocks",
                 "Number of blocks rejected before verifications",
                 &["reason"],
                 registry,
-            ).unwrap(),
-            subscribed_blocks: register_int_counter_vec_with_registry!(
+            ),
+            subscribed_blocks: register_or_replace_int_counter_vec(
                 "subscribed_blocks",
                 "Number of blocks received from each peer before verification",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            verified_blocks: register_int_counter_vec_with_registry!(
+            ),
+            verified_blocks: register_or_replace_int_counter_vec(
                 "verified_blocks",
                 "Number of blocks received from each peer that are verified",
                 &["authority"],
                 registry,
-            ).unwrap(),
+            ),
             committed_leaders_total: register_int_counter_vec_with_registry!(
                 "committed_leaders_total",
                 "Total number of (direct or indirect) committed leaders per authority",
                 &["authority", "commit_type"],
                 registry,
             ).unwrap(),
-            last_committed_authority_round: register_int_gauge_vec_with_registry!(
+            last_committed_authority_round: register_or_replace_int_gauge_vec(
                 "last_committed_authority_round",
                 "The last round committed by authority.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            last_committed_leader_round: register_int_gauge_with_registry!(
+            ),
+            last_committed_leader_round: register_or_replace_int_gauge(
                 "last_committed_leader_round",
                 "The last round where a leader was committed to store and sent to commit consumer.",
                 registry,
-            ).unwrap(),
-            last_commit_index: register_int_gauge_with_registry!(
+            ),
+            last_commit_index: register_or_replace_int_gauge(
                 "last_commit_index",
                 "Index of the last commit.",
                 registry,
-            ).unwrap(),
+            ),
             last_commit_time_diff: register_histogram_with_registry!(
                 "last_commit_time_diff",
                 "The time diff between the last commit and previous one.",
@@ -569,72 +668,73 @@ impl NodeMetrics {
                 FINE_GRAINED_LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
             ).unwrap(),
-            last_decided_leader_round: register_int_gauge_with_registry!(
+            last_decided_leader_round: register_or_replace_int_gauge(
                 "last_decided_leader_round",
                 "The last round where a commit decision was made.",
                 registry,
-            ).unwrap(),
-            leader_timeout_total: register_int_counter_vec_with_registry!(
+            ),
+            leader_timeout_total: register_or_replace_int_counter_vec(
                 "leader_timeout_total",
                 "Total number of leader timeouts, either when the min round time has passed, or max leader timeout",
                 &["timeout_type"],
                 registry,
-            ).unwrap(),
-            smart_selection_wait: register_int_counter_with_registry!(
+            ),
+            smart_selection_wait: register_or_replace_int_counter(
                 "smart_selection_wait",
                 "Number of times we waited for smart ancestor selection.",
                 registry,
-            ).unwrap(),
-            ancestor_state_change_by_authority: register_int_counter_vec_with_registry!(
+            ),
+            ancestor_state_change_by_authority: register_or_replace_int_counter_vec(
                 "ancestor_state_change_by_authority",
                 "The total number of times an ancestor state changed to EXCLUDE or INCLUDE.",
                 &["authority", "state"],
                 registry,
-            ).unwrap(),
-            excluded_proposal_ancestors_count_by_authority: register_int_counter_vec_with_registry!(
+            ),
+            excluded_proposal_ancestors_count_by_authority: register_or_replace_int_counter_vec(
                 "excluded_proposal_ancestors_count_by_authority",
                 "Total number of excluded ancestors per authority during proposal.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            included_excluded_proposal_ancestors_count_by_authority: register_int_counter_vec_with_registry!(
+            ),
+            included_excluded_proposal_ancestors_count_by_authority: register_or_replace_int_counter_vec(
                 "included_excluded_proposal_ancestors_count_by_authority",
                 "Total number of ancestors per authority with 'excluded' status that got included in proposal. Either weak or strong type.",
                 &["authority", "type"],
                 registry,
-            ).unwrap(),
-            missing_blocks_total: register_int_counter_with_registry!(
+            ),
+            missing_blocks_total: register_or_replace_int_counter(
                 "missing_blocks_total",
                 "Total cumulative number of missing blocks",
                 registry,
-            ).unwrap(),
-            missing_blocks_after_fetch_total: register_int_counter_with_registry!(
+            ),
+            missing_blocks_after_fetch_total: register_or_replace_int_counter(
                 "missing_blocks_after_fetch_total",
                 "Total number of missing blocks after fetching blocks from peer",
                 registry,
-            ).unwrap(),
-            num_of_bad_nodes: register_int_gauge_with_registry!(
+            ),
+            num_of_bad_nodes: register_or_replace_int_gauge(
                 "num_of_bad_nodes",
                 "The number of bad nodes in the new leader schedule",
                 registry
-            ).unwrap(),
-            quorum_receive_latency: register_histogram_with_registry!(
+            ),
+            quorum_receive_latency: register_or_replace_histogram(
                 "quorum_receive_latency",
                 "The time it took to receive a new round quorum of blocks",
-                registry
-            ).unwrap(),
-            block_receive_delay: register_int_counter_vec_with_registry!(
+                FINE_GRAINED_LATENCY_SEC_BUCKETS.to_vec(),
+                registry,
+            ),
+            block_receive_delay: register_or_replace_int_counter_vec(
                 "block_receive_delay",
                 "Total delay from the start of the round to receiving the block, in milliseconds per authority",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            reputation_scores: register_int_gauge_vec_with_registry!(
+            ),
+            reputation_scores: register_or_replace_int_gauge_vec(
                 "reputation_scores",
                 "Reputation scores for each authority",
                 &["authority"],
                 registry,
-            ).unwrap(),
+            ),
             scope_processing_time: register_histogram_vec_with_registry!(
                 "scope_processing_time",
                 "The processing time of a specific code scope",
@@ -642,147 +742,149 @@ impl NodeMetrics {
                 FINE_GRAINED_LATENCY_SEC_BUCKETS.to_vec(),
                 registry
             ).unwrap(),
-            sub_dags_per_commit_count: register_histogram_with_registry!(
+            sub_dags_per_commit_count: register_or_replace_histogram(
                 "sub_dags_per_commit_count",
                 "The number of subdags per commit.",
+                NUM_BUCKETS.to_vec(),
                 registry,
-            ).unwrap(),
-            block_suspensions: register_int_counter_vec_with_registry!(
+            ),
+            block_suspensions: register_or_replace_int_counter_vec(
                 "block_suspensions",
                 "The number block suspensions. The counter is reported uniquely, so if a block is sent for reprocessing while already suspended then is not double counted",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            block_unsuspensions: register_int_counter_vec_with_registry!(
+            ),
+            block_unsuspensions: register_or_replace_int_counter_vec(
                 "block_unsuspensions",
                 "The number of block unsuspensions.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            suspended_block_time: register_histogram_vec_with_registry!(
+            ),
+            suspended_block_time: register_or_replace_histogram_vec(
                 "suspended_block_time",
                 "The time for which a block remains suspended",
                 &["authority"],
+                FINE_GRAINED_LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
-            ).unwrap(),
-            block_manager_suspended_blocks: register_int_gauge_with_registry!(
+            ),
+            block_manager_suspended_blocks: register_or_replace_int_gauge(
                 "block_manager_suspended_blocks",
                 "The number of blocks currently suspended in the block manager",
                 registry,
-            ).unwrap(),
-            block_manager_missing_ancestors: register_int_gauge_with_registry!(
+            ),
+            block_manager_missing_ancestors: register_or_replace_int_gauge(
                 "block_manager_missing_ancestors",
                 "The number of missing ancestors tracked in the block manager",
                 registry,
-            ).unwrap(),
-            block_manager_missing_blocks: register_int_gauge_with_registry!(
+            ),
+            block_manager_missing_blocks: register_or_replace_int_gauge(
                 "block_manager_missing_blocks",
                 "The number of blocks missing content tracked in the block manager",
                 registry,
-            ).unwrap(),
-            block_manager_missing_blocks_by_authority: register_int_counter_vec_with_registry!(
+            ),
+            block_manager_missing_blocks_by_authority: register_or_replace_int_counter_vec(
                 "block_manager_missing_blocks_by_authority",
                 "The number of new missing blocks by block authority",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            block_manager_missing_ancestors_by_authority: register_int_counter_vec_with_registry!(
+            ),
+            block_manager_missing_ancestors_by_authority: register_or_replace_int_counter_vec(
                 "block_manager_missing_ancestors_by_authority",
                 "The number of missing ancestors by ancestor authority across received blocks",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            block_manager_gced_blocks: register_int_counter_vec_with_registry!(
+            ),
+            block_manager_gced_blocks: register_or_replace_int_counter_vec(
                 "block_manager_gced_blocks",
                 "The number of blocks that garbage collected and did not get accepted, counted by block's source authority",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            block_manager_gc_unsuspended_blocks: register_int_counter_vec_with_registry!(
+            ),
+            block_manager_gc_unsuspended_blocks: register_or_replace_int_counter_vec(
                 "block_manager_gc_unsuspended_blocks",
                 "The number of blocks unsuspended because their missing ancestors are garbage collected by the block manager, counted by block's source authority",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            block_manager_skipped_blocks: register_int_counter_vec_with_registry!(
+            ),
+            block_manager_skipped_blocks: register_or_replace_int_counter_vec(
                 "block_manager_skipped_blocks",
                 "The number of blocks skipped by the block manager due to block round being <= gc_round",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            threshold_clock_round: register_int_gauge_with_registry!(
+            ),
+            threshold_clock_round: register_or_replace_int_gauge(
                 "threshold_clock_round",
                 "The current threshold clock round. We only advance to a new round when a quorum of parents have been synced.",
                 registry,
-            ).unwrap(),
-            subscriber_connection_attempts: register_int_counter_vec_with_registry!(
+            ),
+            subscriber_connection_attempts: register_or_replace_int_counter_vec(
                 "subscriber_connection_attempts",
                 "The number of connection attempts per peer",
                 &["authority", "status"],
                 registry,
-            ).unwrap(),
-            subscribed_to: register_int_gauge_vec_with_registry!(
+            ),
+            subscribed_to: register_or_replace_int_gauge_vec(
                 "subscribed_to",
                 "Peers that this authority subscribed to for block streams.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            subscribed_by: register_int_gauge_vec_with_registry!(
+            ),
+            subscribed_by: register_or_replace_int_gauge_vec(
                 "subscribed_by",
                 "Peers subscribing for block streams from this authority.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            commit_sync_inflight_fetches: register_int_gauge_with_registry!(
+            ),
+            commit_sync_inflight_fetches: register_or_replace_int_gauge(
                 "commit_sync_inflight_fetches",
                 "The number of inflight fetches in commit syncer",
                 registry,
-            ).unwrap(),
-            commit_sync_pending_fetches: register_int_gauge_with_registry!(
+            ),
+            commit_sync_pending_fetches: register_or_replace_int_gauge(
                 "commit_sync_pending_fetches",
                 "The number of pending fetches in commit syncer",
                 registry,
-            ).unwrap(),
-            commit_sync_fetched_commits: register_int_counter_with_registry!(
+            ),
+            commit_sync_fetched_commits: register_or_replace_int_counter(
                 "commit_sync_fetched_commits",
                 "The number of commits fetched via commit syncer",
                 registry,
-            ).unwrap(),
-            commit_sync_fetched_blocks: register_int_counter_with_registry!(
+            ),
+            commit_sync_fetched_blocks: register_or_replace_int_counter(
                 "commit_sync_fetched_blocks",
                 "The number of blocks fetched via commit syncer",
                 registry,
-            ).unwrap(),
-            commit_sync_total_fetched_blocks_size: register_int_counter_with_registry!(
+            ),
+            commit_sync_total_fetched_blocks_size: register_or_replace_int_counter(
                 "commit_sync_total_fetched_blocks_size",
                 "The total size in bytes of blocks fetched via commit syncer",
                 registry,
-            ).unwrap(),
-            commit_sync_quorum_index: register_int_gauge_with_registry!(
+            ),
+            commit_sync_quorum_index: register_or_replace_int_gauge(
                 "commit_sync_quorum_index",
                 "The maximum commit index voted by a quorum of authorities",
                 registry,
-            ).unwrap(),
-            commit_sync_highest_synced_index: register_int_gauge_with_registry!(
+            ),
+            commit_sync_highest_synced_index: register_or_replace_int_gauge(
                 "commit_sync_fetched_index",
                 "The max commit index among local and fetched commits",
                 registry,
-            ).unwrap(),
-            commit_sync_highest_fetched_index: register_int_gauge_with_registry!(
+            ),
+            commit_sync_highest_fetched_index: register_or_replace_int_gauge(
                 "commit_sync_highest_fetched_index",
                 "The max commit index that has been fetched via network",
                 registry,
-            ).unwrap(),
-            commit_sync_local_index: register_int_gauge_with_registry!(
+            ),
+            commit_sync_local_index: register_or_replace_int_gauge(
                 "commit_sync_local_index",
                 "The local commit index",
                 registry,
-            ).unwrap(),
-            commit_sync_gap_on_processing: register_int_counter_with_registry!(
+            ),
+            commit_sync_gap_on_processing: register_or_replace_int_counter(
                 "commit_sync_gap_on_processing",
                 "Number of instances where a gap was found in fetched commit processing",
                 registry,
-            ).unwrap(),
+            ),
             commit_sync_fetch_loop_latency: register_histogram_with_registry!(
                 "commit_sync_fetch_loop_latency",
                 "The time taken to finish fetching commits and blocks from a given range",
@@ -795,128 +897,128 @@ impl NodeMetrics {
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
             ).unwrap(),
-            commit_sync_fetch_once_errors: register_int_counter_vec_with_registry!(
+            commit_sync_fetch_once_errors: register_or_replace_int_counter_vec(
                 "commit_sync_fetch_once_errors",
                 "Number of errors when attempting to fetch commits and blocks from single authority during commit sync.",
                 &["authority", "error"],
                 registry
-            ).unwrap(),
-            commit_sync_fetch_missing_blocks: register_int_counter_vec_with_registry!(
+            ),
+            commit_sync_fetch_missing_blocks: register_or_replace_int_counter_vec(
                 "commit_sync_fetch_missing_blocks",
                 "Number of ancestor blocks that are missing when processing blocks via commit sync.",
                 &["authority"],
                 registry,
-            ).unwrap(),
-            commit_sync_fetch_commits_handler_uncertified_skipped: register_int_counter_with_registry!(
+            ),
+            commit_sync_fetch_commits_handler_uncertified_skipped: register_or_replace_int_counter(
                 "commit_sync_fetch_commits_handler_uncertified_skipped",
                 "Number of uncertified commits that got skipped when fetching commits due to lack of votes",
                 registry,
-            ).unwrap(),
-            round_tracker_received_quorum_round_gaps: register_int_gauge_vec_with_registry!(
+            ),
+            round_tracker_received_quorum_round_gaps: register_or_replace_int_gauge_vec(
                 "round_tracker_received_quorum_round_gaps",
                 "Received round gaps among peers for blocks proposed from each authority",
                 &["authority"],
                 registry
-            ).unwrap(),
-            round_tracker_accepted_quorum_round_gaps: register_int_gauge_vec_with_registry!(
+            ),
+            round_tracker_accepted_quorum_round_gaps: register_or_replace_int_gauge_vec(
                 "round_tracker_accepted_quorum_round_gaps",
                 "Accepted round gaps among peers for blocks proposed & accepted from each authority",
                 &["authority"],
                 registry
-            ).unwrap(),
-            round_tracker_low_received_quorum_round: register_int_gauge_vec_with_registry!(
+            ),
+            round_tracker_low_received_quorum_round: register_or_replace_int_gauge_vec(
                 "round_tracker_low_received_quorum_round",
                 "Low quorum round among peers for blocks proposed from each authority",
                 &["authority"],
                 registry
-            ).unwrap(),
-            round_tracker_low_accepted_quorum_round: register_int_gauge_vec_with_registry!(
+            ),
+            round_tracker_low_accepted_quorum_round: register_or_replace_int_gauge_vec(
                 "round_tracker_low_accepted_quorum_round",
                 "Low quorum round among peers for blocks proposed & accepted from each authority",
                 &["authority"],
                 registry
-            ).unwrap(),
-            round_tracker_current_received_round_gaps: register_int_gauge_vec_with_registry!(
+            ),
+            round_tracker_current_received_round_gaps: register_or_replace_int_gauge_vec(
                 "round_tracker_current_received_round_gaps",
                 "Received round gaps from local last proposed round to the low received quorum round of each peer. Can be negative.",
                 &["authority"],
                 registry
-            ).unwrap(),
-            round_tracker_current_accepted_round_gaps: register_int_gauge_vec_with_registry!(
+            ),
+            round_tracker_current_accepted_round_gaps: register_or_replace_int_gauge_vec(
                 "round_tracker_current_accepted_round_gaps",
                 "Accepted round gaps from local last proposed & accepted round to the low accepted quorum round of each peer. Can be negative.",
                 &["authority"],
                 registry
-            ).unwrap(),
+            ),
             round_tracker_propagation_delays: register_histogram_with_registry!(
                 "round_tracker_propagation_delays",
                 "Round gaps between the last proposed block round and the lower bound of own quorum round",
                 NUM_BUCKETS.to_vec(),
                 registry
             ).unwrap(),
-            round_tracker_last_propagation_delay: register_int_gauge_with_registry!(
+            round_tracker_last_propagation_delay: register_or_replace_int_gauge(
                 "round_tracker_last_propagation_delay",
                 "Most recent propagation delay observed by RoundTracker",
                 registry
-            ).unwrap(),
-            round_prober_request_errors: register_int_counter_vec_with_registry!(
+            ),
+            round_prober_request_errors: register_or_replace_int_counter_vec(
                 "round_prober_request_errors",
                 "Number of errors when probing against peers per error type",
                 &["error_type"],
                 registry
-            ).unwrap(),
-            certifier_gc_round: register_int_gauge_with_registry!(
+            ),
+            certifier_gc_round: register_or_replace_int_gauge(
                 "certifier_gc_round",
                 "The current GC round of the certifier",
                 registry
-            ).unwrap(),
-            certifier_own_reject_votes: register_int_counter_vec_with_registry!(
+            ),
+            certifier_own_reject_votes: register_or_replace_int_counter_vec(
                 "certifier_own_reject_votes",
                 "Number of own reject votes against each peer authority",
                 &["authority"],
                 registry
-            ).unwrap(),
-            certifier_output_blocks: register_int_counter_vec_with_registry!(
+            ),
+            certifier_output_blocks: register_or_replace_int_counter_vec(
                 "certifier_output_blocks",
                 "Number of output blocks certified by the certifier, grouped by type.",
                 &["type"],
                 registry
-            ).unwrap(),
-            finalizer_buffered_commits: register_int_gauge_with_registry!(
+            ),
+            finalizer_buffered_commits: register_or_replace_int_gauge(
                 "finalizer_buffered_commits",
                 "The number of commits buffered in the finalizer",
                 registry,
-            ).unwrap(),
+            ),
             finalizer_round_delay: register_histogram_with_registry!(
                 "finalizer_round_delay",
                 "The delay between the round of the last committed block and the round of the finalized commit.",
                 ROUND_DELAY_BUCKETS.to_vec(),
                 registry,
             ).unwrap(),
-            finalizer_transaction_status: register_int_counter_vec_with_registry!(
+            finalizer_transaction_status: register_or_replace_int_counter_vec(
                 "finalizer_transaction_status",
                 "Number of transactions finalized by the finalizer, grouped by status.",
                 &["status"],
                 registry
-            ).unwrap(),
-            finalizer_reject_votes: register_int_counter_vec_with_registry!(
+            ),
+            finalizer_reject_votes: register_or_replace_int_counter_vec(
                 "finalizer_reject_votes",
                 "Number of reject votes casted by each authority observed by the finalizer.",
                 &["authority"],
                 registry
-            ).unwrap(),
-            finalizer_output_commits: register_int_counter_vec_with_registry!(
+            ),
+            finalizer_output_commits: register_or_replace_int_counter_vec(
                 "finalizer_output_commits",
                 "Number of output commits finalized by the finalizer, grouped by type.",
                 &["type"],
                 registry
-            ).unwrap(),
-            finalizer_skipped_voting_blocks: register_int_counter_vec_with_registry!(
+            ),
+            finalizer_skipped_voting_blocks: register_or_replace_int_counter_vec(
                 "finalizer_skipped_voting_blocks",
                 "Number of blocks skipped from voting due to potentially not being an immediate descendant.",
                 &["authority"],
                 registry
-            ).unwrap(),
+            ),
             uptime: register_histogram_with_registry!(
                 "uptime",
                 "Total node uptime",

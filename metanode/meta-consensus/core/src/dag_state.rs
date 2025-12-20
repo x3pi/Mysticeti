@@ -894,6 +894,13 @@ impl DagState {
 
         self.last_commit = Some(commit.clone());
 
+        // Update last_commit_index metric
+        self.context
+            .metrics
+            .node_metrics
+            .last_commit_index
+            .set(commit.index() as i64);
+
         if commit_round_advanced {
             let now = std::time::Instant::now();
             if let Some(previous_time) = self.last_commit_round_advancement_time {

@@ -93,7 +93,16 @@ async fn main() -> Result<()> {
                 prometheus::Registry::new()
             };
 
-            let node = Arc::new(Mutex::new(ConsensusNode::new_with_registry(node_config.clone(), registry).await?));
+            // Pass registry_service to ConsensusNode so it can add new registries on epoch transition
+            // RegistryService uses Arc internally, so we can clone it safely
+            let registry_service_arc = registry_service.as_ref().map(|rs| Arc::new(rs.clone()));
+            let node = Arc::new(Mutex::new(
+                ConsensusNode::new_with_registry_and_service(
+                    node_config.clone(),
+                    registry,
+                    registry_service_arc,
+                ).await?
+            ));
             
             // Start RPC server for client submissions
             let rpc_port = node_config.metrics_port + 1000; // RPC port = metrics_port + 1000

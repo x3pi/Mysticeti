@@ -11,6 +11,7 @@ use crate::transaction::NoopTransactionVerifier;
 use crate::epoch_change::EpochChangeManager;
 use crate::clock_sync::ClockSyncManager;
 use prometheus::Registry;
+use mysten_metrics::RegistryService;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,6 +56,10 @@ pub struct ConsensusNode {
     boot_counter: u64,
     /// Ensure we only run transition once per proposal hash.
     last_transition_hash: Option<Vec<u8>>,
+    /// Metrics registry service - used to add new registries on epoch transition
+    registry_service: Option<Arc<RegistryService>>,
+    /// Current epoch registry ID (for cleanup if needed)
+    current_registry_id: Option<mysten_metrics::RegistryID>,
 }
 
 impl ConsensusNode {
@@ -66,6 +71,14 @@ impl ConsensusNode {
     }
 
     pub async fn new_with_registry(config: NodeConfig, registry: Registry) -> Result<Self> {
+        Self::new_with_registry_and_service(config, registry, None).await
+    }
+
+    pub async fn new_with_registry_and_service(
+        config: NodeConfig,
+        registry: Registry,
+        registry_service: Option<Arc<RegistryService>>,
+    ) -> Result<Self> {
         info!("Initializing consensus node {}...", config.node_id);
 
         // Load committee
@@ -295,7 +308,7 @@ impl ConsensusNode {
             clock.clone(),
             transaction_verifier.clone(),
             commit_consumer,
-            registry,
+            registry.clone(),  // Clone registry for authority (original will be stored in struct)
             0, // boot_counter
         )
         .await;
@@ -615,6 +628,8 @@ impl ConsensusNode {
             own_index,
             boot_counter: 0,
             last_transition_hash: None,
+            registry_service,
+            current_registry_id: None,
         })
     }
 
@@ -833,6 +848,15 @@ impl ConsensusNode {
             parameters.db_path
         );
 
+        // Create a new registry for the new epoch to avoid AlreadyReg errors
+        // CRITICAL: Prometheus Registry::new() creates a completely empty registry
+        // Each epoch needs its own registry because metrics cannot be re-registered to the same registry
+        // PRODUCTION-READY: Create a fresh registry for each epoch to ensure clean state management
+        let new_registry = Registry::new();
+        
+        // Start authority with the NEW registry (metrics will be registered to this new registry)
+        // IMPORTANT: We move the registry (not clone) to avoid sharing internal state
+        // Prometheus Registry clone() shares internal state, which can cause AlreadyReg errors
         let authority = ConsensusAuthority::start(
             NetworkType::Tonic,
             proposal.new_epoch_timestamp_ms,
@@ -845,10 +869,33 @@ impl ConsensusNode {
             self.clock.clone(),
             self.transaction_verifier.clone(),
             commit_consumer,
-            Registry::new(),
+            new_registry.clone(),  // Clone ONLY for passing to authority - this is safe because
+                                   // metrics will be registered to the original registry instance
             self.boot_counter,
         )
         .await;
+
+        // Add the registry to RegistryService AFTER metrics have been registered
+        // The registry now contains all metrics from the new epoch
+        // RegistryService.gather_all() will expose metrics from all registries
+        let registry_id = if let Some(ref rs) = self.registry_service {
+            // Add the registry that contains the new epoch's metrics
+            // The metrics server will expose metrics from all registries via gather_all()
+            Some(rs.add(new_registry))
+        } else {
+            None
+        };
+
+        // Optionally remove old registry to avoid accumulating too many registries
+        // For now, we keep old registries to preserve metrics history
+        // if let Some(ref rs) = self.registry_service {
+        //     if let Some(old_id) = self.current_registry_id {
+        //         rs.remove(old_id);
+        //     }
+        // }
+
+        // Update current registry ID
+        self.current_registry_id = registry_id;
 
         let new_client = authority.transaction_client();
         self.transaction_client_proxy.set_client(new_client).await;

@@ -7,6 +7,8 @@
 #   ./spam_submit.sh --endpoint http://127.0.0.1:10100 --interval-ms 50
 #   ./spam_submit.sh --bytes 128 --count 1000
 #   ./spam_submit.sh --tps 20
+#   ./spam_submit.sh --quiet                    # Chạy không hiển thị log (chỉ hiển thị lỗi)
+#   ./spam_submit.sh --tps 20 --quiet           # Chạy với TPS 20 và không hiển thị log
 #
 set -euo pipefail
 
