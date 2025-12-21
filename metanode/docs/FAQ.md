@@ -164,25 +164,25 @@ INFO: Consensus authority started, took 42.6s
 **Cách 1: Xóa storage directory**
 ```bash
 # Stop node
-./stop_nodes.sh
+./scripts/node/stop_nodes.sh
 
 # Xóa storage
 rm -rf config/storage/node_0/consensus_db/*
 
 # Start lại (sẽ tạo database mới)
-./run_nodes.sh
+./scripts/node/run_nodes.sh
 ```
 
 **Cách 2: Xóa toàn bộ storage**
 ```bash
 # Stop all nodes
-./stop_nodes.sh
+./scripts/node/stop_nodes.sh
 
 # Xóa toàn bộ storage
 rm -rf config/storage/
 
 # Start lại
-./run_nodes.sh
+./scripts/node/run_nodes.sh
 ```
 
 **Lưu ý:**
@@ -386,11 +386,11 @@ nc -zv 127.0.0.1 9000
 **2. Compact Database**
 ```bash
 # Stop node
-./stop_nodes.sh
+./scripts/node/stop_nodes.sh
 
 # Compact (RocksDB tự động compact, nhưng có thể force)
 # Restart node
-./run_nodes.sh
+./scripts/node/run_nodes.sh
 ```
 
 **3. Cleanup Old Data**
@@ -404,25 +404,25 @@ nc -zv 127.0.0.1 9000
 **Backup:**
 ```bash
 # Stop nodes
-./stop_nodes.sh
+./scripts/node/stop_nodes.sh
 
 # Backup storage
 tar -czf backup-$(date +%Y%m%d).tar.gz config/storage/
 
 # Start nodes
-./run_nodes.sh
+./scripts/node/run_nodes.sh
 ```
 
 **Restore:**
 ```bash
 # Stop nodes
-./stop_nodes.sh
+./scripts/node/stop_nodes.sh
 
 # Restore storage
 tar -xzf backup-20231217.tar.gz
 
 # Start nodes
-./run_nodes.sh
+./scripts/node/run_nodes.sh
 ```
 
 ## Troubleshooting
@@ -478,8 +478,8 @@ speed_multiplier = 1.0
 
 Sau đó restart nodes:
 ```bash
-./stop_nodes.sh
-./run_nodes.sh
+./scripts/node/stop_nodes.sh
+./scripts/node/run_nodes.sh
 ```
 
 ### Q: Có thể override specific delays không?

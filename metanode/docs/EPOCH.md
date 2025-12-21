@@ -23,14 +23,27 @@ Nếu `time_based_epoch_change = true` và đủ `epoch_duration_seconds` thì n
 
 ### 2) Đồng thuận (vote/quorum)
 
-Proposal/vote được lan truyền qua blocks, node auto-vote idempotent, và proposal chỉ “approved” khi đạt:
+Proposal/vote được lan truyền qua blocks, node auto-vote idempotent, và proposal chỉ "approved" khi đạt:
 - **quorum = 2f+1 stake**
 
-### 3) Fork-safety (commit-index barrier)
+**Vote Propagation:**
+- Votes được include trong blocks và propagate đến tất cả nodes
+- **CRITICAL**: Votes tiếp tục được broadcast ngay cả sau khi đạt quorum để đảm bảo tất cả nodes đều thấy quorum
+- Nếu một node đạt quorum và dừng broadcast votes, các nodes khác sẽ không thấy quorum → không transition → fork
+
+### 3) Fork-safety (commit-index barrier + deterministic values)
 
 Dù quorum đã đạt, node vẫn **chờ commit-index barrier** rồi mới transition để đảm bảo:
 - proposal/votes đã được lan truyền đủ rộng
-- nodes chuyển epoch ở cùng “điểm logic” theo commit index ⇒ giảm rủi ro fork
+- nodes chuyển epoch ở cùng "điểm logic" theo commit index ⇒ giảm rủi ro fork
+
+**Fork-Safety Validations:**
+1. **Commit Index Barrier**: Tất cả nodes phải đạt barrier (`proposal_commit_index + 10`) trước khi transition
+2. **Quorum Check**: Phải đạt quorum (2f+1 votes) trước khi transition
+3. **Deterministic last_commit_index**: Tất cả nodes dùng `transition_commit_index` (barrier) làm `last_commit_index`, không dùng `current_commit_index`
+4. **Deterministic global_exec_index**: Tất cả nodes tính cùng `global_exec_index` từ cùng `last_commit_index`
+5. **Proposal Hash Consistency**: Verify proposal hash được tính giống nhau ở tất cả nodes
+6. **Timestamp Consistency**: Verify `epoch_timestamp_ms` giống nhau ở tất cả nodes
 
 ### 4) Transition (in-process authority restart + per-epoch DB)
 

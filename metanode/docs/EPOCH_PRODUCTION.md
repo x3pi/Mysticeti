@@ -86,8 +86,9 @@ pub struct EpochChangeVote {
 2. Vote Phase:
    - Nodes nhận proposal
    - Validate proposal (committee, epoch, timestamp)
-   - Vote approve/reject
+   - Vote approve/reject (auto-vote on valid proposal)
    - Broadcast vote trong blocks
+   - **CRITICAL**: Votes tiếp tục được broadcast ngay cả sau khi đạt quorum để đảm bảo tất cả nodes đều thấy quorum
 
 3. Decision Phase:
    - Collect votes từ quorum (2f+1)
@@ -95,10 +96,11 @@ pub struct EpochChangeVote {
    - Nếu đạt quorum reject → discard
 
 4. Transition Phase:
-   - Tất cả nodes transition cùng lúc
-   - Stop consensus authority cũ
+   - Tất cả nodes transition cùng lúc tại commit index barrier
+   - Stop consensus authority cũ (graceful shutdown)
    - Start consensus authority mới với committee mới
-   - Continue từ commit index cuối cùng
+   - **Fork-Safety**: Tất cả nodes dùng cùng `last_commit_index` (barrier) để tính `global_exec_index`
+   - **Deterministic**: Tất cả nodes có cùng `last_global_exec_index` sau transition
 ```
 
 ### 3. Implementation

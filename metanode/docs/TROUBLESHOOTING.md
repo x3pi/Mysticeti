@@ -28,6 +28,8 @@ netstat -tlnp | grep 10100
 kill -9 <pid>
 
 # Hoặc stop nodes cũ
+./scripts/node/stop_nodes.sh
+# hoặc (với symlink)
 ./stop_nodes.sh
 ```
 
@@ -198,6 +200,8 @@ Error: Database corruption detected
 **Giải pháp:**
 ```bash
 # Stop node
+./scripts/node/stop_nodes.sh
+# hoặc (với symlink)
 ./stop_nodes.sh
 
 # Backup corrupted storage
@@ -207,6 +211,8 @@ mv config/storage/node_0 config/storage/node_0.corrupted
 tar -xzf metanode-storage-backup.tar.gz
 
 # Start node
+./scripts/node/run_nodes.sh
+# hoặc (với symlink)
 ./run_nodes.sh
 
 # Node sẽ sync từ peers
@@ -290,6 +296,92 @@ WARN: Received out-of-order commit: index=5, expected=3
 - Đây là hành vi bình thường
 - CommitProcessor sẽ xử lý out-of-order commits
 - Commits sẽ được execute theo thứ tự
+
+## Vấn đề Epoch Transition
+
+### Epoch không chuyển đổi được
+
+**Triệu chứng:**
+- Một số nodes transition, một số không
+- Log hiển thị "quorum not reached"
+- Nodes ở các epoch khác nhau
+
+**Nguyên nhân:**
+1. **Quorum không đủ**: Với 3 nodes online, cần 100% nodes phải vote (3/3)
+2. **Votes không propagate**: Votes không được broadcast đúng cách
+3. **Proposal hash mismatch**: Proposal hash không match giữa các nodes
+4. **Node offline**: Một node offline không vote
+
+**Giải pháp:**
+```bash
+# 1. Kiểm tra quorum status
+./check_epoch_status.sh
+
+# 2. Kiểm tra vote propagation
+./scripts/analysis/analyze_vote_propagation.sh
+
+# 3. Kiểm tra nodes online
+ps aux | grep metanode
+
+# 4. Nếu cần, restart node offline
+./scripts/node/start_node.sh <node_id>
+# hoặc (với symlink)
+./start_node.sh <node_id>
+
+# 5. Verify fork-safety sau transition
+./scripts/analysis/verify_epoch_transition.sh
+# hoặc (với symlink)
+./verify_epoch_transition.sh
+```
+
+### Fork sau epoch transition
+
+**Triệu chứng:**
+- Nodes ở cùng epoch nhưng có `last_global_exec_index` khác nhau
+- Nodes không thể validate blocks từ nhau
+- Log hiển thị "Ancestor block not found"
+
+**Nguyên nhân:**
+- Nodes transition với `last_commit_index` khác nhau
+- Nodes có `epoch_timestamp_ms` khác nhau
+- Committee.json không đồng bộ
+
+**Giải pháp:**
+```bash
+# 1. Verify fork-safety
+./verify_epoch_transition.sh
+
+# 2. Kiểm tra deterministic values trong logs
+grep "Deterministic Values.*ALL NODES MUST MATCH" logs/latest/node_*.log
+
+# 3. Nếu phát hiện fork, sync committee.json từ node đúng
+cp config/committee_node_0.json config/committee_node_1.json
+cp config/committee_node_0.json config/committee_node_2.json
+cp config/committee_node_0.json config/committee_node_3.json
+
+# 4. Restart các nodes
+./scripts/node/restart_node.sh 1
+# hoặc (với symlink)
+./restart_node.sh 1
+./scripts/node/restart_node.sh 2
+./scripts/node/restart_node.sh 3
+```
+
+### Votes không được propagate
+
+**Triệu chứng:**
+- Node thấy quorum nhưng các nodes khác không thấy
+- Log hiển thị "quorum not reached" mặc dù đã có đủ votes
+
+**Nguyên nhân:**
+- Votes không được include trong blocks
+- Votes không được broadcast đúng cách
+- Node đạt quorum và dừng broadcast votes (bug đã fix)
+
+**Giải pháp:**
+- Đảm bảo code đã được update với fix vote propagation
+- Kiểm tra logs để xem votes có được broadcast không
+- Sử dụng `analyze_vote_propagation.sh` để debug
 
 ## Debugging
 
@@ -386,9 +478,13 @@ curl http://127.0.0.1:9100/metrics
 curl http://127.0.0.1:10100/ready
 
 # Stop all nodes
+./scripts/node/stop_nodes.sh
+# hoặc (với symlink)
 ./stop_nodes.sh
 
 # Start all nodes
+./scripts/node/run_nodes.sh
+# hoặc (với symlink)
 ./run_nodes.sh
 
 # Check disk space

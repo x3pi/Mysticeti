@@ -290,10 +290,16 @@ Xem chi tiết trong [docs/CONFIGURATION.md](./docs/CONFIGURATION.md).
 ```bash
 # Chạy tất cả nodes
 ./run_nodes.sh
+# hoặc
+./scripts/node/run_nodes.sh
 
 # Dừng tất cả nodes
 ./stop_nodes.sh
+# hoặc
+./scripts/node/stop_nodes.sh
 ```
+
+**Lưu ý:** Các script thường dùng có symlinks ở root để backward compatibility. Xem [scripts/README.md](./scripts/README.md) để biết cấu trúc đầy đủ.
 
 Script `run_nodes.sh` sẽ:
 - Tạo per-run log directory (`logs/run-YYYYMMDDTHHMMSSZ/`)
@@ -391,27 +397,55 @@ max_clock_drift_seconds = 5
 
 1. **Proposal**: Node nào đó propose epoch change khi thời gian đã hết
 2. **Voting**: Các nodes vote cho proposal (auto-vote nếu hợp lệ)
+   - **CRITICAL**: Votes tiếp tục được broadcast ngay cả sau khi đạt quorum để đảm bảo tất cả nodes đều thấy quorum
 3. **Quorum**: Khi đạt 2f+1 votes, proposal được approve
 4. **Commit Index Barrier**: Đợi commit index vượt qua barrier (proposal_commit_index + 10)
-5. **Transition**: Tất cả nodes transition cùng lúc (fork-safe)
-6. **Restart**: Authority restart với epoch mới và consensus DB mới
+5. **Fork-Safety Validations**: 
+   - Verify quorum đạt
+   - Verify đạt commit index barrier
+   - Verify proposal hash consistency
+   - Verify timestamp consistency
+   - Sử dụng barrier làm `last_commit_index` (deterministic)
+6. **Transition**: Tất cả nodes transition cùng lúc với cùng `last_commit_index` và `global_exec_index` (fork-safe)
+7. **Restart**: Authority restart với epoch mới và consensus DB mới
 
 ### Monitoring Epoch
 
 ```bash
+# Xem epoch status của tất cả nodes
+./check_epoch_status.sh
+# hoặc
+./scripts/analysis/check_epoch_status.sh
+
+# Verify fork-safety sau transition
+./verify_epoch_transition.sh
+# hoặc
+./scripts/analysis/verify_epoch_transition.sh
+
+# Analyze vote propagation
+./scripts/analysis/analyze_vote_propagation.sh
+
+# Phân tích epoch transition chi tiết
+./scripts/analysis/analyze_epoch_transition.sh
+
+# Phân tích tại sao hệ thống bị stuck
+./scripts/analysis/analyze_stuck_system.sh
+
 # Xem epoch status trong logs
-tail -f logs/latest/node_0.epoch.log
+tail -f logs/latest/node_0.log | grep -E "epoch|EPOCH"
 
 # Tìm epoch proposals
-grep "EPOCH CHANGE PROPOSAL" logs/latest/node_0.epoch.log
+grep "EPOCH CHANGE PROPOSAL" logs/latest/node_0.log
 
-# Tìm epoch transitions
-grep "EPOCH TRANSITION" logs/latest/node_0.epoch.log
+# Tìm epoch transitions và fork-safety values
+grep "EPOCH TRANSITION\|Deterministic Values\|FORK-SAFETY" logs/latest/node_0.log
 ```
 
 Xem chi tiết trong:
 - [docs/EPOCH.md](./docs/EPOCH.md) - Epoch và cách triển khai
 - [docs/EPOCH_PRODUCTION.md](./docs/EPOCH_PRODUCTION.md) - Best practices cho production
+- [docs/FORK_SAFETY.md](./docs/FORK_SAFETY.md) - Fork-safety mechanisms và verification
+- [docs/QUORUM_LOGIC.md](./docs/QUORUM_LOGIC.md) - Logic quorum cho epoch transition
 
 ---
 
@@ -588,6 +622,14 @@ Xem thêm tài liệu chi tiết trong thư mục [docs/](./docs/):
 - [docs/DEPLOYMENT_CHECKLIST.md](./docs/DEPLOYMENT_CHECKLIST.md) - Checklist deploy
 - [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md) - Xử lý sự cố và debugging
 - [docs/FAQ.md](./docs/FAQ.md) - Câu hỏi thường gặp
+
+#### Fork-Safety và Quorum
+- [docs/FORK_SAFETY.md](./docs/FORK_SAFETY.md) - Fork-safety mechanisms và verification
+- [docs/QUORUM_LOGIC.md](./docs/QUORUM_LOGIC.md) - Logic quorum cho epoch transition
+
+#### Scripts và Tools
+- [scripts/README.md](./scripts/README.md) - Hướng dẫn sử dụng các script tiện ích
+- [docs/analysis/](./docs/analysis/) - Analysis reports và debugging tools
 
 ### Tài liệu Tham khảo
 

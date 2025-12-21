@@ -58,9 +58,13 @@ cargo build --release --bin metanode
 
 ```bash
 # Start tất cả nodes trong tmux sessions
+./scripts/node/run_nodes.sh
+# hoặc (với symlink)
 ./run_nodes.sh
 
 # Stop tất cả nodes
+./scripts/node/stop_nodes.sh
+# hoặc (với symlink)
 ./stop_nodes.sh
 ```
 
@@ -265,13 +269,15 @@ tar -czf metanode-config-$(date +%Y%m%d).tar.gz config/
 
 ```bash
 # Stop nodes first
+./scripts/node/stop_nodes.sh
+# hoặc (với symlink)
 ./stop_nodes.sh
 
 # Backup storage
 tar -czf metanode-storage-$(date +%Y%m%d).tar.gz config/storage/
 
 # Start nodes
-./run_nodes.sh
+./scripts/node/run_nodes.sh
 ```
 
 **3. Automated backup:**
@@ -306,13 +312,15 @@ tar -xzf metanode-config-20231217.tar.gz
 
 ```bash
 # Stop nodes
+./scripts/node/stop_nodes.sh
+# hoặc (với symlink)
 ./stop_nodes.sh
 
 # Restore storage
 tar -xzf metanode-storage-20231217.tar.gz
 
 # Start nodes
-./run_nodes.sh
+./scripts/node/run_nodes.sh
 ```
 
 ## Maintenance

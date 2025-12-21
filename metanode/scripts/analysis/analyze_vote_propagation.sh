@@ -5,8 +5,10 @@
 
 set -e
 
+# Get script directory and change to project root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$PROJECT_ROOT"
 
 PROPOSAL_HASH="${1:-eae7aee9d03632dd}"  # Default to epoch 5->6 proposal
 EPOCH_FROM="${2:-5}"

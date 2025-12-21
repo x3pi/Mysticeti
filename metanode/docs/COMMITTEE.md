@@ -353,6 +353,8 @@ f = (n - 1) / 3
 
 1. **Stop tất cả nodes:**
    ```bash
+   ./scripts/node/stop_nodes.sh
+   # hoặc (với symlink)
    ./stop_nodes.sh
    ```
 
@@ -367,6 +369,8 @@ f = (n - 1) / 3
 
 4. **Restart tất cả nodes:**
    ```bash
+   ./scripts/node/run_nodes.sh
+   # hoặc (với symlink)
    ./run_nodes.sh
    ```
 

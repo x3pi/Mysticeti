@@ -14,8 +14,10 @@ Tài liệu chi tiết về hệ thống MetaNode Consensus Engine.
 - [RPC_API.md](./RPC_API.md) - RPC API documentation
 - [COMMITTEE.md](./COMMITTEE.md) - Giải thích về committee.json và cấu hình authorities
 - [RECOVERY.md](./RECOVERY.md) - Recovery process và commit replay khi khởi động
-       - [EPOCH.md](./EPOCH.md) - Epoch và cách triển khai epoch transition (bao gồm dữ liệu reset/preserved)
+- [EPOCH.md](./EPOCH.md) - Epoch và cách triển khai epoch transition (bao gồm dữ liệu reset/preserved)
 - [EPOCH_PRODUCTION.md](./EPOCH_PRODUCTION.md) - Best practices cho epoch transition trong production
+- [FORK_SAFETY.md](./FORK_SAFETY.md) - Fork-safety mechanisms và verification
+- [QUORUM_LOGIC.md](./QUORUM_LOGIC.md) - Logic quorum cho epoch transition
 - [BCS_BACKWARD_COMPATIBILITY.md](./BCS_BACKWARD_COMPATIBILITY.md) - BCS backward compatibility và migration strategy
 
 ### Hướng dẫn sử dụng
@@ -24,6 +26,10 @@ Tài liệu chi tiết về hệ thống MetaNode Consensus Engine.
 - [DEPLOYMENT_CHECKLIST.md](./DEPLOYMENT_CHECKLIST.md) - Checklist deploy (đã cập nhật theo hệ thống hiện tại)
 - [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) - Xử lý sự cố và debugging
 - [FAQ.md](./FAQ.md) - Câu hỏi thường gặp về khởi động, recovery, và các vấn đề khác
+
+### Scripts và Tools
+- [../scripts/README.md](../scripts/README.md) - Hướng dẫn sử dụng các script tiện ích
+- [analysis/](./analysis/) - Các analysis reports và debugging tools
 
 ## 🚀 Bắt đầu nhanh
 

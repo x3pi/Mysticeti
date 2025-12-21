@@ -9,6 +9,11 @@
 
 set -euo pipefail
 
+# Get script directory and change to project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$PROJECT_ROOT"
+
 NODES=4
 METRICS_BASE_PORT=9100
 WATCH_MODE=false
