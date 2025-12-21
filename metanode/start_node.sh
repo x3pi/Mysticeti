@@ -50,6 +50,46 @@
 #    - Catch up với current round
 #    - Đuổi kịp consensus state của epoch hiện tại
 #
+# NẾU NODE CÙNG EPOCH NHƯNG MUỘN COMMITS:
+# ----------------------------------------
+# **Node sẽ ĐUỔI KỊP bằng cách sync commits từ peers:**
+#
+# ✅ **Cách hoạt động:**
+#    - Node detect lag: commit index của node < commit index của network
+#    - CommitSyncer tự động sync missing commits từ peers
+#    - Node process các commits từ index hiện tại → index của network
+#    - Node sẽ catch up hoàn toàn với network
+#
+# 📝 **Ví dụ cụ thể:**
+#    - Node ở epoch 7, commit index 5
+#    - Network ở epoch 7, commit index 1000
+#    - Khi restart, node sẽ:
+#       1. Load epoch 7 từ committee.json (đúng epoch)
+#       2. Recover từ DB: storage/node_X/epochs/epoch_7/consensus_db
+#       3. Detect lag: commit 5 < 1000
+#       4. CommitSyncer sync commits từ peers (commit 6 → 1000)
+#       5. Process các commits theo thứ tự: 6, 7, 8, ..., 1000
+#       6. Catch up hoàn toàn với network
+#
+# ⚡ **Cơ chế Sync:**
+#    - CommitSyncer tự động chạy mỗi 2 giây để check lag
+#    - Parallel fetching: sync nhiều commits cùng lúc
+#    - Batch processing: sync theo batch (mặc định 100 commits/batch)
+#    - Node sẽ process commits tuần tự để đảm bảo thứ tự
+#
+# ⏱️ **Thời gian catch up:**
+#    - Phụ thuộc vào số commits cần sync (1000 - 5 = 995 commits)
+#    - Với 995 commits: ~10-30 giây (tùy network speed)
+#    - Với nhiều commits (>10K): có thể mất vài phút
+#
+# 🔍 **Logs để theo dõi:**
+#    - "Recovering committed state from C5" (commit index 5)
+#    - "CommitSyncer: scheduling fetch for commits [6..=100]"
+#    - "Executing commit #6 (ordered): ..."
+#    - "Executing commit #7 (ordered): ..."
+#    - ... (process từ 6 → 1000)
+#    - "Executing commit #1000 (ordered): ..."
+#
 # NẾU NODE MUỘN NHIỀU EPOCH:
 # ---------------------------
 # **Node sẽ NHẢY CÓC vào epoch hiện tại, KHÔNG đuổi kịp từng epoch:**
@@ -297,15 +337,21 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     echo ""
     print_info "📋 Recovery Process:"
     echo "   - Node sẽ load epoch hiện tại từ committee.json"
-    echo "   - Nếu network đã chuyển epoch, node sẽ NHẢY CÓC vào epoch hiện tại"
-    echo "   - Node KHÔNG cần đuổi kịp từng epoch, chỉ sync epoch hiện tại"
+    echo "   - Nếu cùng epoch nhưng muộn commits: node sẽ ĐUỔI KỊP bằng sync"
+    echo "   - Nếu network đã chuyển epoch: node sẽ NHẢY CÓC vào epoch hiện tại"
     echo "   - Recovery time: 40-60 giây nếu có nhiều commits (>1M)"
     echo ""
     print_info "🔍 Watch for recovery messages:"
-    echo "   - 'Recovering committed state from C...'"
+    echo "   - 'Recovering committed state from C...' (commit index hiện tại)"
     echo "   - 'Recovering commit observer in the range [1..=N]'"
-    echo "   - 'Executing commit #N (ordered): ...'"
+    echo "   - 'CommitSyncer: scheduling fetch...' (nếu node muộn commits)"
+    echo "   - 'Executing commit #N (ordered): ...' (process commits)"
     echo "   - 'Consensus authority started, took X.Xs'"
+    echo ""
+    print_info "💡 Nếu node muộn commits trong cùng epoch:"
+    echo "   - CommitSyncer sẽ tự động sync missing commits từ peers"
+    echo "   - Node sẽ process commits tuần tự để catch up"
+    echo "   - Thời gian catch up phụ thuộc vào số commits cần sync"
     echo ""
     
     if [ "$FOLLOW_LOGS" = true ]; then

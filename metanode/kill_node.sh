@@ -40,6 +40,38 @@
 #    - Catch up với current round của epoch hiện tại
 #    - Đuổi kịp consensus state
 #
+# NẾU NODE CÙNG EPOCH NHƯNG MUỘN COMMITS:
+# ----------------------------------------
+# **Node sẽ ĐUỔI KỊP bằng cách sync commits từ peers:**
+#
+# ✅ **Cách hoạt động:**
+#    - Node detect lag: commit index của node < commit index của network
+#    - CommitSyncer tự động sync missing commits từ peers
+#    - Node process các commits từ index hiện tại → index của network
+#    - Node sẽ catch up hoàn toàn với network
+#
+# 📝 **Ví dụ cụ thể:**
+#    - Node ở epoch 7, commit index 5
+#    - Network ở epoch 7, commit index 1000
+#    - Khi restart, node sẽ:
+#       1. Load epoch 7 từ committee.json (đúng epoch)
+#       2. Recover từ DB: storage/node_X/epochs/epoch_7/consensus_db
+#       3. Detect lag: commit 5 < 1000
+#       4. CommitSyncer sync commits từ peers (commit 6 → 1000)
+#       5. Process các commits theo thứ tự: 6, 7, 8, ..., 1000
+#       6. Catch up hoàn toàn với network
+#
+# ⚡ **Cơ chế Sync:**
+#    - CommitSyncer tự động chạy mỗi 2 giây để check lag
+#    - Parallel fetching: sync nhiều commits cùng lúc
+#    - Batch processing: sync theo batch (mặc định 100 commits/batch)
+#    - Node sẽ process commits tuần tự để đảm bảo thứ tự
+#
+# ⏱️ **Thời gian catch up:**
+#    - Phụ thuộc vào số commits cần sync
+#    - Với 995 commits (1000 - 5): ~10-30 giây
+#    - Với nhiều commits (>10K): có thể mất vài phút
+#
 # NẾU NODE MUỘN NHIỀU EPOCH:
 # ---------------------------
 # **Node sẽ NHẢY CÓC vào epoch hiện tại, KHÔNG đuổi kịp từng epoch:**
