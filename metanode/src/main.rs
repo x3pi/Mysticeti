@@ -107,7 +107,8 @@ async fn main() -> Result<()> {
             // Start RPC server for client submissions
             let rpc_port = node_config.metrics_port + 1000; // RPC port = metrics_port + 1000
             let tx_client = { node.lock().await.transaction_submitter() };
-            let rpc_server = rpc::RpcServer::new(tx_client, rpc_port);
+            let node_for_rpc = node.clone();
+            let rpc_server = rpc::RpcServer::with_node(tx_client, rpc_port, node_for_rpc);
             tokio::spawn(async move {
                 if let Err(e) = rpc_server.start().await {
                     error!("RPC server error: {}", e);

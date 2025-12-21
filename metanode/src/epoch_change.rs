@@ -294,8 +294,23 @@ impl EpochChangeManager {
     }
 
     /// Hash a proposal for identification
+    /// 
+    /// CRITICAL FORK-SAFETY: Hash phải được tính GIỐNG NHAU ở tất cả nodes
+    /// Nếu hash khác nhau, nodes sẽ không thể validate proposal → fork
+    /// 
+    /// Hash được tính từ các field deterministic:
+    /// - new_epoch: Epoch number (deterministic)
+    /// - new_committee.epoch(): Committee epoch (should match new_epoch)
+    /// - new_epoch_timestamp_ms: Epoch start timestamp (phải giống nhau ở tất cả nodes)
+    /// - proposal_commit_index: Commit index khi proposal được tạo (deterministic)
+    /// - proposer().value(): Proposer authority index (deterministic)
+    /// 
+    /// Tất cả các field này đều deterministic và giống nhau ở tất cả nodes
+    /// → Hash sẽ giống nhau ở tất cả nodes → Không fork
     pub fn hash_proposal(&self, proposal: &EpochChangeProposal) -> Vec<u8> {
         // Create a serializable version without the skip field
+        // CRITICAL: Format string phải giống nhau ở tất cả nodes
+        // Không được thay đổi format này vì sẽ làm hash khác nhau → fork
         let proposal_data = format!(
             "{}-{}-{}-{}-{}",
             proposal.new_epoch,
@@ -520,6 +535,35 @@ impl EpochChangeManager {
         proposal: &EpochChangeProposal,
     ) -> Option<bool> {
         let proposal_hash = self.hash_proposal(proposal);
+        
+        // DEBUG: Log if proposal_hash not found in proposal_votes
+        if !self.proposal_votes.contains_key(&proposal_hash) {
+            let proposal_hash_hex = hex::encode(&proposal_hash[..8.min(proposal_hash.len())]);
+            tracing::warn!(
+                "⚠️  Proposal hash not found in proposal_votes: proposal_hash={}, epoch {} -> {}",
+                proposal_hash_hex,
+                proposal.new_epoch - 1,
+                proposal.new_epoch
+            );
+            
+            // DEBUG: Log all proposal hashes in proposal_votes
+            if !self.proposal_votes.is_empty() {
+                let existing_hashes: Vec<String> = self.proposal_votes.keys()
+                    .map(|h| hex::encode(&h[..8.min(h.len())]))
+                    .collect();
+                tracing::debug!(
+                    "   Available proposal hashes in proposal_votes: {:?}",
+                    existing_hashes
+                );
+            } else {
+                tracing::debug!(
+                    "   proposal_votes is empty - no votes stored yet"
+                );
+            }
+            
+            return None;
+        }
+        
         let votes_map = self.proposal_votes.get(&proposal_hash)?;
         let votes: Vec<&EpochChangeVote> = votes_map.values().collect();
 
@@ -567,8 +611,9 @@ impl EpochChangeManager {
     }
 
     /// Validate proposal
+    /// If node is catching up (old timestamp), sync timestamp from proposal before validating
     #[allow(dead_code)] // Used internally by process_proposal
-    pub fn validate_proposal(&self, proposal: &EpochChangeProposal) -> Result<()> {
+    pub fn validate_proposal(&mut self, proposal: &EpochChangeProposal) -> Result<()> {
         // 1. Validate epoch increment
         ensure!(
             proposal.new_epoch == self.current_epoch + 1,
@@ -578,23 +623,54 @@ impl EpochChangeManager {
         // 2. Validate committee
         self.validate_new_committee(&proposal.new_committee)?;
 
-        // 3. Validate timestamp (allow recent past to account for network delay)
-        // For time-based epoch change, timestamp can be in the past (within 5 minutes)
-        // to account for network propagation and processing delays
+        // 3. Check if this is a catch-up scenario and sync timestamp if needed
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64;
         let timestamp_diff_ms = now_ms as i64 - proposal.new_epoch_timestamp_ms as i64;
-        const MAX_PAST_MS: i64 = 5 * 60 * 1000; // 5 minutes in milliseconds
+        const MAX_PAST_MS_NORMAL: i64 = 5 * 60 * 1000; // 5 minutes in milliseconds (normal case)
         const MAX_FUTURE_MS: i64 = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
         
-        ensure!(
-            timestamp_diff_ms <= MAX_PAST_MS && timestamp_diff_ms >= -MAX_FUTURE_MS,
-            "Epoch timestamp must be within reasonable range (past: {}ms, future: {}ms, diff: {}ms)",
-            MAX_PAST_MS,
-            MAX_FUTURE_MS,
-            timestamp_diff_ms
-        );
+        // Determine if this is a catch-up scenario:
+        // - Proposal is for next epoch (proposal.new_epoch == current_epoch + 1) ✓
+        // - Timestamp is older than normal limit (more than 5 minutes old)
+        // This means the network already transitioned, and this node is catching up
+        let is_catchup = timestamp_diff_ms > MAX_PAST_MS_NORMAL;
+        
+        if is_catchup {
+            // CATCH-UP SCENARIO: Sync timestamp from network (proposal) before validating
+            // The proposal contains the timestamp that the network is using for the new epoch
+            // We must sync this timestamp first, then validate with the synced timestamp
+            let old_timestamp = self.epoch_start_timestamp_ms;
+            self.epoch_start_timestamp_ms = proposal.new_epoch_timestamp_ms;
+            
+            tracing::info!(
+                "🔄 Catch-up scenario detected: syncing timestamp from network (old: {}, new: {}, diff: {}ms) - validating with synced timestamp",
+                old_timestamp,
+                proposal.new_epoch_timestamp_ms,
+                timestamp_diff_ms
+            );
+            
+            // After syncing, recalculate diff with synced timestamp
+            // Now the timestamp should be valid (it's the timestamp the network is using)
+            // We still check it's not too far in the future
+            let synced_timestamp_diff_ms = now_ms as i64 - self.epoch_start_timestamp_ms as i64;
+            ensure!(
+                synced_timestamp_diff_ms >= -MAX_FUTURE_MS,
+                "Synced epoch timestamp must not be too far in the future (max: {}ms, diff: {}ms)",
+                MAX_FUTURE_MS,
+                synced_timestamp_diff_ms
+            );
+        } else {
+            // NORMAL CASE: Validate timestamp is within normal range (5 minutes past, 24 hours future)
+            ensure!(
+                timestamp_diff_ms <= MAX_PAST_MS_NORMAL && timestamp_diff_ms >= -MAX_FUTURE_MS,
+                "Epoch timestamp must be within reasonable range (past: {}ms, future: {}ms, diff: {}ms)",
+                MAX_PAST_MS_NORMAL,
+                MAX_FUTURE_MS,
+                timestamp_diff_ms
+            );
+        }
 
         // 4. Validate proposer
         ensure!(
@@ -724,16 +800,21 @@ impl EpochChangeManager {
     #[allow(dead_code)] // Will be used when implementing block integration
     pub fn get_pending_votes_to_broadcast(&self) -> Vec<EpochChangeVote> {
         // Broadcast at most 1 vote per (proposal, voter).
-        // Also, if a proposal already reached a terminal quorum, we stop broadcasting its votes.
+        // 
+        // CRITICAL FIX: Continue broadcasting votes even after quorum is reached!
+        // This ensures all nodes see quorum and can transition together.
+        // 
+        // Previous bug: When one node reached quorum, it stopped broadcasting votes,
+        // causing other nodes to not see quorum and not transition.
+        // 
+        // Solution: Always broadcast votes until transition actually happens.
+        // The transition itself will clear pending_proposals, which naturally stops broadcasting.
         let mut out = Vec::new();
         for proposal in self.pending_proposals.values() {
-            if let Some(decision) = self.check_proposal_quorum(proposal) {
-                // Terminal state reached, no need to spam network with votes.
-                let _ = decision;
-                continue;
-            }
             let proposal_hash = self.hash_proposal(proposal);
             if let Some(votes_by_voter) = self.proposal_votes.get(&proposal_hash) {
+                // Always broadcast votes, even if quorum is reached
+                // This ensures all nodes can see quorum and transition together
                 out.extend(votes_by_voter.values().cloned());
             }
         }
@@ -781,6 +862,32 @@ impl EpochChangeManager {
     pub fn process_vote(&mut self, vote: EpochChangeVote) -> Result<()> {
         // Validate vote
         self.validate_vote(&vote)?;
+
+        // DEBUG: Verify proposal_hash matches if proposal exists
+        if let Some(proposal) = self.pending_proposals.get(&vote.proposal_hash) {
+            let computed_hash = self.hash_proposal(proposal);
+            if computed_hash != vote.proposal_hash {
+                tracing::error!(
+                    "❌ PROPOSAL HASH MISMATCH! Vote proposal_hash={}, computed_hash={}, epoch {} -> {}",
+                    hex::encode(&vote.proposal_hash[..8.min(vote.proposal_hash.len())]),
+                    hex::encode(&computed_hash[..8.min(computed_hash.len())]),
+                    proposal.new_epoch - 1,
+                    proposal.new_epoch
+                );
+            } else {
+                tracing::debug!(
+                    "✅ Proposal hash verified: proposal_hash={}, epoch {} -> {}",
+                    hex::encode(&vote.proposal_hash[..8.min(vote.proposal_hash.len())]),
+                    proposal.new_epoch - 1,
+                    proposal.new_epoch
+                );
+            }
+        } else {
+            tracing::warn!(
+                "⚠️  Vote received for unknown proposal: proposal_hash={}",
+                hex::encode(&vote.proposal_hash[..8.min(vote.proposal_hash.len())])
+            );
+        }
 
         // Store vote de-duplicated by voter.
         let prev = self.proposal_votes
@@ -901,11 +1008,27 @@ impl EpochChangeManager {
         current_commit_index: u32,
     ) -> bool {
         // ✅ Điều kiện 1: Quorum đã đạt
-        let quorum_reached = self.check_proposal_quorum(proposal)
+        let quorum_status = self.check_proposal_quorum(proposal);
+        let quorum_reached = quorum_status
             .map(|approved| approved)
             .unwrap_or(false);
         
         if !quorum_reached {
+            // Log why transition is not ready (throttled to avoid spam)
+            let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
+            let barrier_passed = current_commit_index >= transition_commit_index;
+            
+            if barrier_passed {
+                // Barrier passed but quorum not reached - this is important to log
+                tracing::warn!(
+                    "⏸️  Transition NOT ready: epoch {} -> {}, barrier passed ({} >= {}), but quorum not reached (status: {:?})",
+                    proposal.new_epoch - 1,
+                    proposal.new_epoch,
+                    current_commit_index,
+                    transition_commit_index,
+                    quorum_status
+                );
+            }
             return false;
         }
         
@@ -926,11 +1049,23 @@ impl EpochChangeManager {
         
         if ready {
             // Log for monitoring - ensure all nodes transition at similar commit index
-            tracing::debug!(
-                "✅ Transition ready: current_commit={}, barrier={}, diff={}",
+            tracing::info!(
+                "✅ Transition ready: epoch {} -> {}, current_commit={}, barrier={}, diff={}, quorum=APPROVED",
+                proposal.new_epoch - 1,
+                proposal.new_epoch,
                 current_commit_index,
                 transition_commit_index,
                 current_commit_index.saturating_sub(transition_commit_index)
+            );
+        } else {
+            // Log when quorum reached but barrier not passed yet
+            tracing::debug!(
+                "⏳ Transition waiting for barrier: epoch {} -> {}, current_commit={}, barrier={}, need {} more commits",
+                proposal.new_epoch - 1,
+                proposal.new_epoch,
+                current_commit_index,
+                transition_commit_index,
+                transition_commit_index.saturating_sub(current_commit_index)
             );
         }
         
@@ -938,15 +1073,68 @@ impl EpochChangeManager {
     }
 
     /// Get proposal ready for transition (quorum reached + commit index barrier passed)
+    /// IMPORTANT: Prioritize proposals for the NEXT epoch (current_epoch + 1)
+    /// This ensures we transition to the correct epoch even if old proposals are still pending
     pub fn get_transition_ready_proposal(
         &self,
         current_commit_index: u32,
     ) -> Option<EpochChangeProposal> {
+        // First, try to find proposal for the NEXT epoch (current_epoch + 1)
+        // This is the most relevant proposal for transition
+        let target_epoch = self.current_epoch + 1;
+        
+        // Log all pending proposals for debugging
+        if !self.pending_proposals.is_empty() {
+            tracing::debug!(
+                "🔍 Checking transition readiness: current_epoch={}, target_epoch={}, current_commit={}, pending_proposals={}",
+                self.current_epoch,
+                target_epoch,
+                current_commit_index,
+                self.pending_proposals.len()
+            );
+        }
+        
+        for proposal in self.pending_proposals.values() {
+            // Prioritize proposal for next epoch
+            if proposal.new_epoch == target_epoch {
+                let should = self.should_transition(proposal, current_commit_index);
+                if should {
+                    tracing::info!(
+                        "✅ Found ready proposal for transition: epoch {} -> {}, proposal_hash={:?}",
+                        proposal.new_epoch - 1,
+                        proposal.new_epoch,
+                        hex::encode(&self.hash_proposal(proposal)[..8])
+                    );
+                    return Some(proposal.clone());
+                } else {
+                    // Log why this proposal is not ready
+                    let quorum_status = self.check_proposal_quorum(proposal);
+                    let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
+                    tracing::debug!(
+                        "⏸️  Proposal not ready: epoch {} -> {}, quorum={:?}, barrier={}, current_commit={}",
+                        proposal.new_epoch - 1,
+                        proposal.new_epoch,
+                        quorum_status,
+                        transition_commit_index,
+                        current_commit_index
+                    );
+                }
+            }
+        }
+        
+        // Fallback: if no proposal for next epoch is ready, check other proposals
+        // This handles edge cases where we might have skipped an epoch
         for proposal in self.pending_proposals.values() {
             if self.should_transition(proposal, current_commit_index) {
+                tracing::info!(
+                    "✅ Found ready proposal (fallback): epoch {} -> {}",
+                    proposal.new_epoch - 1,
+                    proposal.new_epoch
+                );
                 return Some(proposal.clone());
             }
         }
+        
         None
     }
 

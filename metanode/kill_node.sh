@@ -150,9 +150,19 @@ print_info "Killing node $NODE_ID..."
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     print_info "Found tmux session: $TMUX_SESSION"
     
-    # Kill tmux session
+    # Kill ONLY this specific tmux session
+    # CRITICAL: Use -t to target specific session only
+    # This should NOT affect other tmux sessions or the tmux server
     if tmux kill-session -t "$TMUX_SESSION" 2>/dev/null; then
         print_success "Killed tmux session: $TMUX_SESSION"
+        
+        # Verify other sessions are still alive (safety check)
+        sleep 0.2
+        if ! tmux ls >/dev/null 2>&1; then
+            print_warn "⚠️  WARNING: All tmux sessions were killed (tmux server may have been killed)"
+            print_warn "   This is unexpected - tmux kill-session should only kill one session"
+            print_warn "   Other nodes may have been affected"
+        fi
     else
         print_error "Failed to kill tmux session: $TMUX_SESSION"
         exit 1
@@ -161,15 +171,17 @@ else
     print_warn "Tmux session not found: $TMUX_SESSION"
 fi
 
-# Also kill any remaining metanode processes for this node
-# Look for processes with config file for this node
-CONFIG_FILE="config/node_${NODE_ID}.toml"
-if pgrep -f "metanode.*start.*${CONFIG_FILE}" > /dev/null; then
-    print_info "Killing remaining metanode processes for node $NODE_ID..."
-    pkill -f "metanode.*start.*${CONFIG_FILE}" && {
-        print_success "Killed remaining processes"
-    } || print_warn "No processes found to kill"
-fi
+# NOTE: Killing tmux session should also kill the process running in it
+# We do NOT kill processes after killing tmux session because:
+# 1. Tmux session kill already kills all processes in that session
+# 2. Killing processes afterward can accidentally kill wrong processes (e.g., tmux server)
+# 3. This was causing ALL tmux sessions to die when killing one node
+#
+# If you need to kill a process running OUTSIDE tmux (not started by run_nodes.sh),
+# you can manually kill it using:
+#   pkill -f "metanode.*start.*--config.*config/node_${NODE_ID}.toml"
+#
+# For normal operation (nodes started with run_nodes.sh), killing the tmux session is enough.
 
 # Wait a bit to ensure process is fully stopped
 sleep 1

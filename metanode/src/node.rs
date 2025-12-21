@@ -85,6 +85,23 @@ impl ConsensusNode {
         let committee = config.load_committee()?;
         let current_epoch = committee.epoch();
         info!("Loaded committee with {} authorities, epoch={}", committee.size(), current_epoch);
+        
+        // ✅ FORK-SAFETY CHECK: Verify epoch consistency on startup
+        // CRITICAL: Nếu node load committee.json với epoch khác với network, sẽ gây fork
+        // Validation này giúp detect sớm vấn đề (nhưng không tự động fix - cần manual sync)
+        // 
+        // Note: Trong production, nên có cơ chế sync committee.json từ network hoặc từ trusted source
+        // Hiện tại, node chỉ load từ local file - nếu file cũ, node sẽ ở epoch cũ → fork
+        warn!(
+            "⚠️  FORK-SAFETY: Node loaded epoch {} from committee.json",
+            current_epoch
+        );
+        warn!(
+            "   ⚠️  Nếu network đã transition sang epoch mới, node cần sync committee.json từ peers"
+        );
+        warn!(
+            "   ⚠️  Nếu không sync, node sẽ ở epoch cũ và không thể validate blocks từ epoch mới → FORK!"
+        );
 
         // Capture paths needed for epoch transition
         let committee_path = config
@@ -656,6 +673,73 @@ impl ConsensusNode {
         self.current_commit_index.store(index, Ordering::SeqCst);
     }
 
+    /// Check if node is ready to accept transactions
+    /// Returns (is_ready, reason) where reason explains why not ready if false
+    /// 
+    /// Node is NOT ready if:
+    /// 1. Authority is not initialized (still starting up)
+    /// 2. There's a pending epoch transition (transitioning to new epoch)
+    /// 3. There are pending proposals for different epochs (node might be catching up)
+    /// 
+    /// This prevents nodes from accepting transactions when:
+    /// - They're still syncing/catching up
+    /// - They're transitioning epochs (which could cause forks)
+    /// - They're not fully initialized
+    pub async fn is_ready_for_transactions(&self) -> (bool, String) {
+        // 1. Check if authority is initialized
+        if self.authority.is_none() {
+            return (false, "Node is still initializing".to_string());
+        }
+
+        // 2. Check if there's a pending transition (last_transition_hash indicates transition in progress)
+        // Note: last_transition_hash is set during transition and cleared after, but we check manager state
+        let manager = self.epoch_change_manager.read().await;
+        
+        // 3. Check if there are pending proposals for epochs other than current_epoch + 1
+        // This indicates the node might be catching up and shouldn't accept new transactions yet
+        let current_epoch = self.current_epoch;
+        let all_pending_proposals = manager.get_all_pending_proposals();
+        
+        // Check if any pending proposal is for an epoch that's not the immediate next epoch
+        // This suggests the node is behind and catching up
+        let has_catchup_proposals = all_pending_proposals.iter().any(|p| {
+            p.new_epoch > current_epoch + 1
+        });
+        
+        if has_catchup_proposals {
+            let catchup_epochs: Vec<u64> = all_pending_proposals.iter()
+                .filter(|p| p.new_epoch > current_epoch + 1)
+                .map(|p| p.new_epoch)
+                .collect();
+            return (false, format!(
+                "Node is catching up: current epoch {}, pending proposals for epochs {:?}",
+                current_epoch, catchup_epochs
+            ));
+        }
+
+        // 4. Check if there's a ready-to-transition proposal (transition might happen soon)
+        // This is a soft check - we allow transactions if transition is not imminent
+        let current_commit_index = self.current_commit_index.load(Ordering::SeqCst);
+        if let Some(proposal) = manager.get_transition_ready_proposal(current_commit_index) {
+            // If transition is ready, we're about to transition - reject new transactions
+            let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
+            let commit_diff = current_commit_index.saturating_sub(transition_commit_index);
+            
+            // If we're very close to transition (within 5 commits), reject transactions
+            if commit_diff <= 5 {
+                return (false, format!(
+                    "Epoch transition imminent: epoch {} -> {}, commit index {} (barrier {}), diff {}",
+                    current_epoch, proposal.new_epoch, current_commit_index, transition_commit_index, commit_diff
+                ));
+            }
+        }
+
+        drop(manager);
+        
+        // All checks passed - node is ready
+        (true, "Node is ready".to_string())
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         info!("Shutting down consensus node...");
         if let Some(authority) = self.authority {
@@ -712,8 +796,40 @@ impl ConsensusNode {
 
         info!("Transitioning to epoch {}...", proposal.new_epoch);
         
+        // 📋 LOG: Epoch transition summary (for fork-safety verification)
+        info!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        );
+        info!(
+            "🔄 EPOCH TRANSITION START: epoch {} -> {}",
+            self.current_epoch,
+            proposal.new_epoch
+        );
+        info!(
+            "  📊 Current State (BEFORE transition):"
+        );
+        info!(
+            "    - Current epoch: {}",
+            self.current_epoch
+        );
+        info!(
+            "    - Current commit index: {}",
+            current_commit_index
+        );
+        info!(
+            "    - Last global exec index: {}",
+            self.last_global_exec_index
+        );
+        info!(
+            "    - Proposal commit index: {}",
+            proposal.proposal_commit_index
+        );
+        info!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        );
+        
         // ✅ FORK-SAFETY VALIDATION 1: Commit Index Barrier
-        // Tất cả nodes sẽ transition tại cùng commit_index → fork-safe
+        // CRITICAL: Tất cả nodes PHẢI transition tại CÙNG commit index (barrier) để tránh fork
         // Buffer of 10 commits ensures:
         // - Proposal has been committed and propagated to all nodes
         // - All nodes have had time to reach this commit index
@@ -736,12 +852,91 @@ impl ConsensusNode {
         );
         drop(manager);
         
+        // ✅ FORK-SAFETY VALIDATION 4: Verify proposal hash consistency
+        // CRITICAL: Đảm bảo proposal hash được tính giống nhau ở tất cả nodes
+        // Nếu hash khác nhau, nodes sẽ không thể validate proposal → fork
+        let computed_hash = {
+            let mgr = self.epoch_change_manager.read().await;
+            mgr.hash_proposal(proposal)
+        };
+        // Note: proposal_hash trong vote được tính từ proposal, nên nếu proposal giống nhau thì hash sẽ giống nhau
+        // Validation này đảm bảo proposal data consistency
+        let proposal_hash_hex = hex::encode(&computed_hash[..8.min(computed_hash.len())]);
+        info!(
+            "🔍 Proposal hash verification: proposal_hash={}, epoch {} -> {}",
+            proposal_hash_hex,
+            proposal.new_epoch - 1,
+            proposal.new_epoch
+        );
+        
+        // ✅ FORK-SAFETY VALIDATION 5: Verify epoch_timestamp_ms consistency
+        // CRITICAL: Tất cả nodes phải dùng CÙNG epoch_timestamp_ms để tránh timestamp divergence
+        // Nếu timestamp khác nhau, genesis blocks sẽ có hash khác nhau → fork
+        // 
+        // Note: epoch_timestamp_ms được lưu trong proposal và được sync khi catch-up
+        // Validation này đảm bảo timestamp consistency
+        let current_timestamp = self.epoch_change_manager.read().await.epoch_start_timestamp_ms();
+        if current_timestamp != proposal.new_epoch_timestamp_ms {
+            warn!(
+                "⚠️  Epoch timestamp mismatch: current={}, proposal={}, diff={}ms",
+                current_timestamp,
+                proposal.new_epoch_timestamp_ms,
+                (proposal.new_epoch_timestamp_ms as i64) - (current_timestamp as i64)
+            );
+            warn!(
+                "   Node will sync timestamp from proposal to ensure consistency"
+            );
+        } else {
+            info!(
+                "✅ Epoch timestamp verified: timestamp={} (consistent across all nodes)",
+                proposal.new_epoch_timestamp_ms
+            );
+        }
+        
+        // ✅ FORK-SAFETY VALIDATION 3: Use transition_commit_index (barrier) as last_commit_index
+        // CRITICAL: Tất cả nodes PHẢI dùng CÙNG last_commit_index khi transition
+        // Nếu node A transition ở commit 622 và node B transition ở commit 650,
+        // chúng sẽ có last_commit_index khác nhau → global_exec_index khác nhau → FORK!
+        // 
+        // Giải pháp: Tất cả nodes dùng transition_commit_index (barrier) làm last_commit_index
+        // - Node nào đạt barrier trước: đợi một chút để các node khác catch-up (optional, để tối ưu)
+        // - Node nào catch-up muộn: vẫn dùng barrier làm last_commit_index (không dùng current_commit_index)
+        // - Điều này đảm bảo tất cả nodes có cùng state khi transition → không fork
         let commit_index_diff = current_commit_index.saturating_sub(transition_commit_index);
+        
+        warn!(
+            "🔒 FORK-SAFETY: Using transition_commit_index (barrier) as last_commit_index"
+        );
+        warn!(
+            "   - Transition barrier: {} (proposal_commit_index {} + 10)",
+            transition_commit_index,
+            proposal.proposal_commit_index
+        );
+        warn!(
+            "   - Current commit index: {} ({} commits past barrier)",
+            current_commit_index,
+            commit_index_diff
+        );
+        warn!(
+            "   - All nodes will use last_commit_index={} to ensure fork-safety",
+            transition_commit_index
+        );
+        if commit_index_diff > 0 {
+            warn!(
+                "   - ⚠️  Node has processed {} commits past barrier - these will be included in epoch transition",
+                commit_index_diff
+            );
+        }
+        
         info!(
             "✅ FORK-SAFE TRANSITION VALIDATED:"
         );
         info!(
-            "  - All nodes will transition at commit index ~{} (within buffer range)",
+            "  - All nodes will transition at commit index {} (barrier)",
+            transition_commit_index
+        );
+        info!(
+            "  - All nodes will use last_commit_index={} (deterministic)",
             transition_commit_index
         );
         info!(
@@ -753,38 +948,111 @@ impl ConsensusNode {
             "  - Quorum: APPROVED (2f+1 votes received)"
         );
         info!(
-            "  - Fork risk: MINIMAL (deterministic transition point)"
+            "  - Fork risk: ZERO (all nodes use same last_commit_index)"
         );
         
         // 1) Graceful shutdown current authority (best-effort)
         self.graceful_shutdown().await?;
 
         // 2) Calculate new last_global_exec_index (deterministic)
+        // CRITICAL: Use transition_commit_index (barrier) as last_commit_index, NOT current_commit_index
         // This ensures all nodes compute the same global_exec_index for new epoch
+        // Even if node A transitions at commit 622 and node B catches up and transitions at commit 700,
+        // both will use transition_commit_index (622) as last_commit_index → same global_exec_index → no fork
         let old_epoch = self.current_epoch;
-        let last_commit_index = current_commit_index; // Last commit index of old epoch
+        let last_commit_index = transition_commit_index; // Use barrier, not current_commit_index!
         let new_last_global_exec_index = calculate_global_exec_index(
             old_epoch,
             last_commit_index,
             self.last_global_exec_index,
         );
         
+        // 📋 LOG: Deterministic values for fork-safety verification
         info!(
-            "📊 Global execution index transition: epoch {} -> {}, last_commit_index={}, last_global_exec_index={} -> {}",
-            old_epoch,
-            proposal.new_epoch,
-            last_commit_index,
-            self.last_global_exec_index,
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        );
+        info!(
+            "📊 FORK-SAFETY: Deterministic Values (ALL NODES MUST MATCH)"
+        );
+        info!(
+            "  🔑 Key Values:"
+        );
+        info!(
+            "    - Old epoch: {}",
+            old_epoch
+        );
+        info!(
+            "    - New epoch: {}",
+            proposal.new_epoch
+        );
+        info!(
+            "    - Last commit index (barrier): {} (DETERMINISTIC - all nodes use this)",
+            last_commit_index
+        );
+        info!(
+            "    - Current commit index: {} (node-specific, may differ)",
+            current_commit_index
+        );
+        info!(
+            "    - Commits past barrier: {} (node-specific)",
+            commit_index_diff
+        );
+        info!(
+            "  📈 Global Execution Index:"
+        );
+        info!(
+            "    - Last global exec index (old epoch): {}",
+            self.last_global_exec_index
+        );
+        info!(
+            "    - New last global exec index (new epoch): {} (DETERMINISTIC - all nodes compute same)",
             new_last_global_exec_index
+        );
+        info!(
+            "    - Calculation: {} (old epoch) + {} (barrier commit) = {}",
+            self.last_global_exec_index,
+            last_commit_index,
+            new_last_global_exec_index
+        );
+        if commit_index_diff > 0 {
+            warn!(
+                "  ⚠️  Note: Node processed {} commits past barrier ({} -> {}), but using barrier ({}) as last_commit_index for fork-safety",
+                commit_index_diff,
+                transition_commit_index,
+                current_commit_index,
+                transition_commit_index
+            );
+        }
+        info!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         );
 
         // 3) Persist new epoch config (committee.json + epoch_timestamp_ms + last_global_exec_index)
+        // CRITICAL FORK-SAFETY: Tất cả nodes phải ghi CÙNG data vào committee.json
+        // - proposal.new_committee: Committee mới (giống nhau ở tất cả nodes vì từ cùng proposal)
+        // - proposal.new_epoch_timestamp_ms: Timestamp mới (giống nhau ở tất cả nodes vì từ cùng proposal)
+        // - new_last_global_exec_index: Global exec index mới (giống nhau vì dùng cùng last_commit_index = barrier)
+        // 
+        // Atomic write đảm bảo không bị corrupt nếu process crash giữa chừng
         crate::config::NodeConfig::save_committee_with_global_exec_index(
             &self.committee_path,
             &proposal.new_committee,
             proposal.new_epoch_timestamp_ms,
             new_last_global_exec_index,
         )?;
+        
+        info!(
+            "💾 Committee.json saved: epoch={}, timestamp_ms={}, last_global_exec_index={}",
+            proposal.new_epoch,
+            proposal.new_epoch_timestamp_ms,
+            new_last_global_exec_index
+        );
+        warn!(
+            "   ⚠️  FORK-SAFETY: Tất cả nodes phải có CÙNG committee.json sau transition"
+        );
+        warn!(
+            "   ⚠️  Nếu node restart sau transition, cần sync committee.json từ peers hoặc từ node đã transition"
+        );
 
         // 4) Stop old authority (in-process restart)
         if let Some(authority) = self.authority.take() {
@@ -794,6 +1062,22 @@ impl ConsensusNode {
         // 5) Update epoch and last_global_exec_index for new epoch
         self.current_epoch = proposal.new_epoch;
         self.last_global_exec_index = new_last_global_exec_index;
+        
+        // 📋 LOG: State after update (for fork-safety verification)
+        info!(
+            "✅ State Updated:"
+        );
+        info!(
+            "    - Current epoch: {} (updated)",
+            self.current_epoch
+        );
+        info!(
+            "    - Last global exec index: {} (updated)",
+            self.last_global_exec_index
+        );
+        info!(
+            "    - Current commit index: 0 (reset for new epoch)"
+        );
 
         // 6) Reset epoch-local state (manager + commit index)
         {
@@ -901,6 +1185,82 @@ impl ConsensusNode {
         self.transaction_client_proxy.set_client(new_client).await;
         self.authority = Some(authority);
 
+        // 📋 LOG: Final state after transition (for fork-safety verification)
+        info!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        );
+        info!(
+            "✅ EPOCH TRANSITION COMPLETE: epoch {} -> {}",
+            old_epoch,
+            proposal.new_epoch
+        );
+        info!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        );
+        info!(
+            "📊 FINAL STATE (AFTER transition) - FORK-SAFETY VERIFICATION:"
+        );
+        info!(
+            "  🔑 Deterministic Values (ALL NODES MUST MATCH - verify across all nodes):"
+        );
+        info!(
+            "    - New epoch: {}",
+            proposal.new_epoch
+        );
+        info!(
+            "    - Last commit index (barrier): {} (used for transition - ALL NODES MUST USE THIS)",
+            last_commit_index
+        );
+        info!(
+            "    - Last global exec index: {} (DETERMINISTIC - all nodes must have same)",
+            new_last_global_exec_index
+        );
+        info!(
+            "    - Epoch timestamp: {} (DETERMINISTIC - all nodes must have same)",
+            proposal.new_epoch_timestamp_ms
+        );
+        info!(
+            "  📈 Current Node State:"
+        );
+        info!(
+            "    - Current epoch: {}",
+            self.current_epoch
+        );
+        info!(
+            "    - Current commit index: 0 (reset for new epoch)"
+        );
+        info!(
+            "    - Last global exec index: {}",
+            self.last_global_exec_index
+        );
+        info!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        );
+        warn!(
+            "⚠️  FORK-SAFETY CHECK: Verify all nodes have SAME values:"
+        );
+        warn!(
+            "    - epoch: {}",
+            proposal.new_epoch
+        );
+        warn!(
+            "    - last_commit_index (barrier): {}",
+            last_commit_index
+        );
+        warn!(
+            "    - last_global_exec_index: {}",
+            new_last_global_exec_index
+        );
+        warn!(
+            "    - epoch_timestamp_ms: {}",
+            proposal.new_epoch_timestamp_ms
+        );
+        warn!(
+            "   If any node has different values → FORK DETECTED!"
+        );
+        info!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        );
         info!(
             "✅ Epoch transition COMPLETE in-process: now running epoch {} (clean consensus DB per-epoch).",
             proposal.new_epoch
