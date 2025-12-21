@@ -164,9 +164,9 @@ impl CommitProcessor {
         
         if total_transactions > 0 {
             info!(
-                "🔷 Executing commit #{} (checkpoint_seq={}, epoch={}): leader={:?}, {} blocks, {} total transactions, tx_hashes=[{}]",
+                "🔷 [Global Index: {}] Executing commit #{} (epoch={}): leader={:?}, {} blocks, {} total transactions, tx_hashes=[{}]",
+                global_exec_index,  // Deterministic Checkpoint Sequence Number (Global Index) - hiển thị đầu tiên để dễ theo dõi
                 commit_index,
-                global_exec_index,  // Deterministic Checkpoint Sequence Number (like Sui)
                 epoch,
                 subdag.leader,
                 subdag.blocks.len(),
@@ -184,9 +184,9 @@ impl CommitProcessor {
             // executor.create_block(global_exec_index, subdag).await?;
         } else {
             info!(
-                "🔷 Executing commit #{} (checkpoint_seq={}, epoch={}): leader={:?}, {} blocks, 0 transactions",
+                "🔷 [Global Index: {}] Executing commit #{} (epoch={}): leader={:?}, {} blocks, 0 transactions",
+                global_exec_index,  // Deterministic Checkpoint Sequence Number (Global Index) - hiển thị đầu tiên để dễ theo dõi
                 commit_index,
-                global_exec_index,  // Deterministic Checkpoint Sequence Number
                 epoch,
                 subdag.leader,
                 subdag.blocks.len()

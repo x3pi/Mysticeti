@@ -51,6 +51,7 @@ declare -A block_commit_latency_sum
 declare -A block_commit_latency_count
 declare -A bad_nodes_count
 declare -A last_commit_index
+declare -A last_global_exec_index
 declare -A current_epoch
 declare -A highest_accepted_round
 declare -A commit_sync_quorum_index
@@ -214,10 +215,11 @@ for i in $(seq 0 $((NODES-1))); do
     fi
     last_commit_index[$i]=$commit_idx
     
-    # Current epoch - lấy từ logs vì không có metric Prometheus
-    # Tìm epoch mới nhất trong log file
+    # Current epoch và Global Index - lấy từ logs vì không có metric Prometheus
+    # Tìm epoch và global index mới nhất trong log file
     log_file="logs/latest/node_${i}.log"
     epoch="N/A"
+    global_index="N/A"
     if [ -f "$log_file" ]; then
         # Tìm epoch từ log messages (format: epoch=211)
         epoch_from_log=$(tail -100 "$log_file" | grep -oE "epoch=[0-9]+" | tail -1 | cut -d'=' -f2 || echo "")
@@ -230,8 +232,21 @@ for i in $(seq 0 $((NODES-1))); do
                 epoch=$epoch_from_log
             fi
         fi
+        
+        # Tìm Global Index từ log messages (format mới: [Global Index: 268054] hoặc format cũ: checkpoint_seq=268054)
+        global_index_from_log=$(tail -100 "$log_file" | grep -oE "\[Global Index: [0-9]+\]" | tail -1 | grep -oE "[0-9]+" || echo "")
+        if [ -n "$global_index_from_log" ]; then
+            global_index=$global_index_from_log
+        else
+            # Thử format cũ: checkpoint_seq=268054
+            global_index_from_log=$(tail -100 "$log_file" | grep -oE "checkpoint_seq=[0-9]+" | tail -1 | cut -d'=' -f2 || echo "")
+            if [ -n "$global_index_from_log" ]; then
+                global_index=$global_index_from_log
+            fi
+        fi
     fi
     current_epoch[$i]=$epoch
+    last_global_exec_index[$i]=$global_index
     
     # Highest accepted round - quan trọng để biết node có đang lag không
     highest_round=$(echo "$metrics" | grep "^highest_accepted_round " | head -1 | awk '{print $2}' | tr -d '\n\r\t ' || echo "0")
@@ -430,13 +445,14 @@ echo "📊 Epoch & Commit Index Info"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-printf "%-8s %-15s %-20s %-30s\n" "Node" "Last Commit Index" "Epoch" "Status"
-echo "────────────────────────────────────────────────────────────────────────────────────"
+printf "%-8s %-15s %-20s %-20s %-30s\n" "Node" "Last Commit Index" "Global Index" "Epoch" "Status"
+echo "────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 for i in $(seq 0 $((NODES-1))); do
     node_name="node-$i"
     commit_idx=${last_commit_index[$i]:-0}
     # Loại bỏ newline và whitespace, chỉ lấy số nguyên
     commit_idx=$(echo -n "$commit_idx" | tr -d '\n\r\t ' | grep -oE '^[0-9]+' | head -1 || echo "0")
+    global_idx=${last_global_exec_index[$i]:-N/A}
     epoch=${current_epoch[$i]:-N/A}
     
     # Phân tích status dựa trên commit index
@@ -480,11 +496,13 @@ for i in $(seq 0 $((NODES-1))); do
         status="❓ Không có epoch"
     fi
     
-    printf "%-8s %-15s %-20s %-30s\n" "$node_name" "$commit_idx" "$epoch" "$status"
+    printf "%-8s %-15s %-20s %-20s %-30s\n" "$node_name" "$commit_idx" "$global_idx" "$epoch" "$status"
 done
 echo ""
 echo "💡 Lưu ý:"
 echo "  - Commit index sẽ reset về 0 khi epoch transition"
+echo "  - Global Index (checkpoint_seq) là số tuần tự toàn cục, không reset khi epoch transition"
+echo "  - Global Index tăng liên tục qua các epoch, giúp theo dõi tổng số commits đã thực hiện"
 echo "  - Nếu commit index > 0 nhưng committed_leaders_total không thay đổi,"
 echo "    có thể metrics đang giữ nguyên từ epoch đầu tiên"
 echo ""
@@ -578,7 +596,7 @@ for i in $(seq 0 $((NODES-1))); do
     status=""
     if [ "$comm" -eq "0" ]; then
         status="⚠️  No commits"
-    elif [ "$i" -eq "$min_node" ] && [ "$min_node" -ge 0 ]; then
+    elif [ "$i" -eq "$min_committed_node" ] && [ "$min_committed_node" -ge 0 ]; then
         status="🔴 Bad Node"
     elif [ "$i" -eq "$max_node" ] && [ "$max_node" -ge 0 ]; then
         status="🟢 Best"
