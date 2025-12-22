@@ -75,6 +75,10 @@ pub struct NodeConfig {
     /// NTP sync interval in seconds (default: 300 = 5 minutes)
     #[serde(default = "default_ntp_sync_interval_seconds")]
     pub ntp_sync_interval_seconds: u64,
+    /// Enable executor client to send committed blocks to Go executor (default: false)
+    /// Only node 0 should have this enabled
+    #[serde(default)]
+    pub executor_enabled: bool,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -150,6 +154,7 @@ impl NodeConfig {
                 enable_ntp_sync: false, // Disabled by default (enable for production)
                 ntp_servers: default_ntp_servers(),
                 ntp_sync_interval_seconds: 300,
+                executor_enabled: idx == 0, // Only node 0 has executor enabled by default
             };
 
             // Save keys - use private_key_bytes and public key bytes

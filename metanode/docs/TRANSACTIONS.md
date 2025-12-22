@@ -45,17 +45,20 @@ Transactions là raw bytes, không có format cố định:
 
 ### Transaction Hash
 
-Transaction hash được tính bằng Blake2b256:
+Transaction hash được tính bằng **Keccak256 từ TransactionHashData** (hash chính thức, khớp với Go):
 ```rust
-let tx_hash = Blake2b256::digest(&tx_data);
-let tx_hash_hex = hex::encode(&tx_hash[..8]); // First 8 bytes
+use crate::tx_hash::calculate_transaction_hash_hex;
+
+let tx_hash_hex = calculate_transaction_hash_hex(&tx_data);
 ```
 
-**Ví dụ:**
-```
-Data: "Hello, Blockchain!"
-Hash: 204d69c3943745b5
-```
+**Quy trình tính hash:**
+1. Parse transaction data thành protobuf `Transaction` hoặc `Transactions`
+2. Tạo `TransactionHashData` từ các field của `Transaction`
+3. Encode `TransactionHashData` thành protobuf bytes
+4. Tính Keccak256 hash của encoded bytes
+
+**Lưu ý:** Hash này khớp hoàn toàn với Go implementation (`mtn-simple-2025/pkg/transaction/transaction.go`).
 
 ## Transaction Submission
 

@@ -3,13 +3,14 @@
 
 use anyhow::Result;
 use consensus_core::{CommittedSubDag, BlockAPI};
-use fastcrypto::hash::{HashFunction, Blake2b256};
 use mysten_metrics::monitored_mpsc::UnboundedReceiver;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::checkpoint::calculate_global_exec_index;
+use crate::executor_client::ExecutorClient;
+use crate::tx_hash::calculate_transaction_hash_hex;
 
 /// Commit processor that ensures commits are executed in order
 pub struct CommitProcessor {
@@ -22,6 +23,8 @@ pub struct CommitProcessor {
     current_epoch: u64,
     /// Last global execution index from previous epoch (for deterministic calculation)
     last_global_exec_index: u64,
+    /// Optional executor client to send blocks to Go executor
+    executor_client: Option<Arc<ExecutorClient>>,
 }
 
 impl CommitProcessor {
@@ -33,6 +36,7 @@ impl CommitProcessor {
             commit_index_callback: None,
             current_epoch: 0,
             last_global_exec_index: 0,
+            executor_client: None,
         }
     }
 
@@ -52,6 +56,12 @@ impl CommitProcessor {
         self
     }
 
+    /// Set executor client to send blocks to Go executor
+    pub fn with_executor_client(mut self, executor_client: Arc<ExecutorClient>) -> Self {
+        self.executor_client = Some(executor_client);
+        self
+    }
+
     /// Process commits in order
     pub async fn run(self) -> Result<()> {
         let mut receiver = self.receiver;
@@ -60,6 +70,7 @@ impl CommitProcessor {
         let commit_index_callback = self.commit_index_callback;
         let current_epoch = self.current_epoch;
         let last_global_exec_index = self.last_global_exec_index;
+        let executor_client = self.executor_client;
         
         loop {
             match receiver.recv().await {
@@ -75,7 +86,7 @@ impl CommitProcessor {
                             last_global_exec_index,
                         );
                         
-                        Self::process_commit(&subdag, global_exec_index, current_epoch).await?;
+                        Self::process_commit(&subdag, global_exec_index, current_epoch, executor_client.clone()).await?;
                         
                         // Notify commit index update (for epoch transition)
                         if let Some(ref callback) = commit_index_callback {
@@ -93,7 +104,7 @@ impl CommitProcessor {
                                 last_global_exec_index,
                             );
                             
-                            Self::process_commit(&pending, global_exec_index, current_epoch).await?;
+                            Self::process_commit(&pending, global_exec_index, current_epoch, executor_client.clone()).await?;
                             
                             // Notify commit index update
                             if let Some(ref callback) = commit_index_callback {
@@ -131,6 +142,7 @@ impl CommitProcessor {
         subdag: &CommittedSubDag,
         global_exec_index: u64,
         epoch: u64,
+        executor_client: Option<Arc<ExecutorClient>>,
     ) -> Result<()> {
         let commit_index = subdag.commit_ref.index;
         let mut total_transactions = 0;
@@ -143,12 +155,11 @@ impl CommitProcessor {
             let block_tx_count = transactions.len();
             total_transactions += block_tx_count;
             
-            // Calculate hashes for each transaction
+            // Calculate official transaction hashes (Keccak256 from TransactionHashData)
             let mut block_tx_hashes = Vec::new();
             for tx in transactions {
                 let tx_data = tx.data();
-                let tx_hash = Blake2b256::digest(tx_data).to_vec();
-                let tx_hash_hex = hex::encode(&tx_hash[..8]);
+                let tx_hash_hex = calculate_transaction_hash_hex(tx_data);
                 transaction_hashes.push(tx_hash_hex.clone());
                 block_tx_hashes.push(tx_hash_hex);
             }
@@ -179,9 +190,20 @@ impl CommitProcessor {
                 block_details.join(", ")
             );
             
-            // TODO: Here you can execute transactions in order with global_exec_index
-            // For example:
-            // executor.create_block(global_exec_index, subdag).await?;
+            // Send committed subdag to Go executor if enabled
+            if let Some(ref client) = executor_client {
+                info!("📤 [TX FLOW] Sending committed subdag to Go executor: commit_index={}, blocks={}, total_tx={}", 
+                    commit_index, subdag.blocks.len(), total_transactions);
+                if let Err(e) = client.send_committed_subdag(subdag, epoch).await {
+                    warn!("⚠️  [TX FLOW] Failed to send committed subdag to executor: {}", e);
+                    // Don't fail commit if executor is unavailable
+                } else {
+                    info!("✅ [TX FLOW] Successfully sent committed subdag to Go executor: commit_index={}, blocks={}", 
+                        commit_index, subdag.blocks.len());
+                }
+            } else {
+                info!("ℹ️  [TX FLOW] Executor client not enabled, skipping send to Go executor");
+            }
         } else {
             info!(
                 "🔷 [Global Index: {}] Executing commit #{} (epoch={}): leader={:?}, {} blocks, 0 transactions",
@@ -197,6 +219,14 @@ impl CommitProcessor {
                     commit_index,
                     block_details.join(", ")
                 );
+            }
+            
+            // Send committed subdag to Go executor if enabled (even for empty commits)
+            if let Some(ref client) = executor_client {
+                if let Err(e) = client.send_committed_subdag(subdag, epoch).await {
+                    warn!("⚠️  Failed to send committed subdag to executor: {}", e);
+                    // Don't fail commit if executor is unavailable
+                }
             }
         }
         

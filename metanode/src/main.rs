@@ -10,6 +10,8 @@ mod config;
 mod node;
 mod transaction;
 mod rpc;
+mod tx_socket_server;
+mod executor_client;
 mod commit_processor;
 mod epoch_change;
 mod epoch_change_bridge;
@@ -17,6 +19,7 @@ mod epoch_change_hook;
 mod clock_sync;
 mod tx_submitter;
 mod checkpoint;
+mod tx_hash;
 
 use config::NodeConfig;
 use node::ConsensusNode;
@@ -104,16 +107,32 @@ async fn main() -> Result<()> {
                 ).await?
             ));
             
-            // Start RPC server for client submissions
+            // Start RPC server for client submissions (HTTP)
             let rpc_port = node_config.metrics_port + 1000; // RPC port = metrics_port + 1000
             let tx_client = { node.lock().await.transaction_submitter() };
             let node_for_rpc = node.clone();
-            let rpc_server = rpc::RpcServer::with_node(tx_client, rpc_port, node_for_rpc);
+            let rpc_server = rpc::RpcServer::with_node(tx_client.clone(), rpc_port, node_for_rpc.clone());
             tokio::spawn(async move {
                 if let Err(e) = rpc_server.start().await {
                     error!("RPC server error: {}", e);
                 }
             });
+
+            // Start Unix Domain Socket server for local IPC (faster than HTTP)
+            let socket_path = format!("/tmp/metanode-tx-{}.sock", node_config.node_id);
+            let tx_client_uds = tx_client.clone();
+            let node_for_uds = node.clone();
+            let uds_server = tx_socket_server::TxSocketServer::with_node(
+                socket_path.clone(),
+                tx_client_uds,
+                node_for_uds,
+            );
+            tokio::spawn(async move {
+                if let Err(e) = uds_server.start().await {
+                    error!("UDS server error: {}", e);
+                }
+            });
+            info!("Unix Domain Socket server available at {}", socket_path);
 
             // Epoch transition coordinator:
             // If a proposal is quorum-approved AND commit-index barrier is passed,

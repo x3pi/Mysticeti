@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "/proto";
+
+
+message TransactionExe {
+    bytes digest = 1;
+    uint32 worker_id = 2;
+}
+
+message CommittedBlock {
+    uint64 epoch = 1; // Ta có thể dùng trường 'round' của Certificate
+    uint64 height = 2; // Tương tự, có thể dùng 'round'
+    repeated TransactionExe transactions = 3;
+}
+
+message CommittedEpochData {
+    repeated CommittedBlock blocks = 1;
+}
+

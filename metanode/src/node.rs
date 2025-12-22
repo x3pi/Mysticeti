@@ -22,6 +22,7 @@ use tokio::sync::RwLock;
 use crate::config::NodeConfig;
 use crate::tx_submitter::{TransactionClientProxy, TransactionSubmitter};
 use crate::checkpoint::calculate_global_exec_index;
+use crate::executor_client::ExecutorClient;
 
 pub struct ConsensusNode {
     authority: Option<ConsensusAuthority>,
@@ -60,6 +61,8 @@ pub struct ConsensusNode {
     registry_service: Option<Arc<RegistryService>>,
     /// Current epoch registry ID (for cleanup if needed)
     current_registry_id: Option<mysten_metrics::RegistryID>,
+    /// Executor enabled flag (from config)
+    executor_enabled: bool,
 }
 
 impl ConsensusNode {
@@ -144,11 +147,23 @@ impl ConsensusNode {
         let commit_index_for_callback = current_commit_index.clone();
         
         // Create ordered commit processor with commit index tracking and epoch info
-        let commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
+        let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
             .with_commit_index_callback(move |index| {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
             })
             .with_epoch_info(current_epoch, last_global_exec_index);
+        
+        // Add executor client if enabled (for initial startup, not just epoch transition)
+        if config.executor_enabled {
+            let node_id = config.node_id;
+            let executor_client = Arc::new(ExecutorClient::new(true, node_id));
+            info!("✅ Executor client enabled for initial startup (node_id={}, socket=/tmp/executor{}.sock)", 
+                node_id, node_id);
+            commit_processor = commit_processor.with_executor_client(executor_client);
+        } else {
+            info!("ℹ️  Executor client disabled for initial startup (node_id={}, consensus only - executor_enabled=false in config)", config.node_id);
+        }
+        
         tokio::spawn(async move {
             if let Err(e) = commit_processor.run().await {
                 tracing::error!("Commit processor error: {}", e);
@@ -647,6 +662,7 @@ impl ConsensusNode {
             last_transition_hash: None,
             registry_service,
             current_registry_id: None,
+            executor_enabled: config.executor_enabled,
         })
     }
 
@@ -718,21 +734,24 @@ impl ConsensusNode {
         }
 
         // 4. Check if there's a ready-to-transition proposal (transition might happen soon)
-        // This is a soft check - we allow transactions if transition is not imminent
+        // IMPORTANT: We should NOT reject transactions during epoch transition
+        // Transactions that are already submitted to DAG will continue processing
+        // Only reject if we're actively transitioning (last_transition_hash is set)
+        // This ensures transactions are not lost during epoch transition
         let current_commit_index = self.current_commit_index.load(Ordering::SeqCst);
-        if let Some(proposal) = manager.get_transition_ready_proposal(current_commit_index) {
-            // If transition is ready, we're about to transition - reject new transactions
-            let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
-            let commit_diff = current_commit_index.saturating_sub(transition_commit_index);
-            
-            // If we're very close to transition (within 5 commits), reject transactions
-            if commit_diff <= 5 {
-                return (false, format!(
-                    "Epoch transition imminent: epoch {} -> {}, commit index {} (barrier {}), diff {}",
-                    current_epoch, proposal.new_epoch, current_commit_index, transition_commit_index, commit_diff
-                ));
-            }
+        
+        // Check if transition is in progress (last_transition_hash indicates active transition)
+        // This is set at the start of transition_to_epoch and cleared after new authority starts
+        if self.last_transition_hash.is_some() {
+            return (false, format!(
+                "Epoch transition in progress: epoch {} -> {} (waiting for new authority to start)",
+                current_epoch, current_epoch + 1
+            ));
         }
+        
+        // Allow transactions even if transition is ready - they will be processed in new epoch
+        // The DAG will continue processing transactions that are already submitted
+        // Only reject if we're actively transitioning (checked above)
 
         drop(manager);
         
@@ -1104,11 +1123,38 @@ impl ConsensusNode {
         let commit_index_for_callback = self.current_commit_index.clone();
         let new_epoch = proposal.new_epoch;
         let new_last_global_exec_index = new_last_global_exec_index;
-        let commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
+        // Recreate executor client for new epoch (if enabled)
+        // Get node_id from committee_path filename (e.g., "committee_node_0.json" -> 0)
+        let node_id = self.committee_path.file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("committee_node_"))
+            .and_then(|s| s.strip_suffix(".json"))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        // Check if executor is enabled via config (executor_enabled field in node_X.toml)
+        // Only node 0 should have executor_enabled = true by default
+        // Can be changed by editing node_X.toml files
+        let executor_enabled = self.executor_enabled;
+        let executor_client = if executor_enabled {
+            let client = Arc::new(ExecutorClient::new(true, node_id));
+            info!("✅ Executor client enabled for epoch transition (node_id={}, socket=/tmp/executor{}.sock)", 
+                node_id, node_id);
+            Some(client)
+        } else {
+            info!("ℹ️  Executor client disabled (node_id={}, consensus only - executor_enabled=false in config)", node_id);
+            None
+        };
+        
+        let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
             .with_commit_index_callback(move |index| {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
             })
             .with_epoch_info(new_epoch, new_last_global_exec_index);
+        
+        // Add executor client if enabled
+        if let Some(ref client) = executor_client {
+            commit_processor = commit_processor.with_executor_client(client.clone());
+        }
         tokio::spawn(async move {
             if let Err(e) = commit_processor.run().await {
                 tracing::error!("Commit processor error: {}", e);
@@ -1184,6 +1230,11 @@ impl ConsensusNode {
         let new_client = authority.transaction_client();
         self.transaction_client_proxy.set_client(new_client).await;
         self.authority = Some(authority);
+        
+        // Clear last_transition_hash to allow new transactions after transition completes
+        // This ensures transactions can be accepted again after new authority is ready
+        self.last_transition_hash = None;
+        info!("✅ New authority started and ready to accept transactions");
 
         // 📋 LOG: Final state after transition (for fork-safety verification)
         info!(

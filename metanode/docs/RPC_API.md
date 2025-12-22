@@ -115,17 +115,14 @@ Ví dụ:
 
 ### Transaction Hash
 
-Transaction hash được tính bằng Blake2b256:
-- Hash toàn bộ transaction data
-- Lấy 8 bytes đầu
-- Encode thành hex string
+Transaction hash được tính bằng **Keccak256 từ TransactionHashData** (hash chính thức):
+- Parse transaction data thành protobuf `Transaction`
+- Tạo `TransactionHashData` từ các field của `Transaction`
+- Encode `TransactionHashData` thành protobuf bytes
+- Tính Keccak256 hash của encoded bytes
+- Lấy 8 bytes đầu và encode thành hex string
 
-**Ví dụ:**
-```
-Data: "Hello, Blockchain!"
-Hash (full): 204d69c3943745b5e8f2a3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3
-Hash (short): 204d69c3943745b5
-```
+**Lưu ý:** Hash này khớp hoàn toàn với Go implementation.
 
 ### Transaction Submission Flow
 
