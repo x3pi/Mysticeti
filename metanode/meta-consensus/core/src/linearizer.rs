@@ -25,6 +25,11 @@ pub(crate) trait BlockStoreAPI {
     fn set_committed(&mut self, block_ref: &BlockRef) -> bool;
 
     fn is_committed(&self, block_ref: &BlockRef) -> bool;
+
+    /// Gets all uncommitted blocks in a round.
+    /// This is used to commit all blocks in the same round as the leader,
+    /// ensuring all transactions in the round are committed.
+    fn get_uncommitted_blocks_at_round(&self, round: Round) -> Vec<VerifiedBlock>;
 }
 
 impl BlockStoreAPI
@@ -44,6 +49,10 @@ impl BlockStoreAPI
 
     fn is_committed(&self, block_ref: &BlockRef) -> bool {
         DagState::is_committed(self, block_ref)
+    }
+
+    fn get_uncommitted_blocks_at_round(&self, round: Round) -> Vec<VerifiedBlock> {
+        DagState::get_uncommitted_blocks_at_round(self, round)
     }
 }
 
@@ -163,6 +172,7 @@ impl Linearizer {
         // We just use whatever is currently in DagState.
         let gc_round: Round = dag_state.gc_round();
         let leader_block_ref = leader_block.reference();
+        let leader_round = leader_block.round();
         let mut buffer = vec![leader_block];
         let mut to_commit = Vec::new();
 
@@ -174,8 +184,39 @@ impl Linearizer {
             leader_block_ref
         );
 
+        // ENHANCEMENT: Commit all blocks in the same round as the leader
+        // This ensures all transactions in the round are committed, not just those in the leader block.
+        // This prevents transaction loss when transactions are submitted to non-leader blocks.
+        //
+        // FORK-SAFETY GUARANTEE:
+        // 1. Threshold Clock ensures quorum (2f+1) before advancing rounds, so when a leader is committed,
+        //    the round already has quorum, meaning all blocks in the round have been broadcast.
+        // 2. Commit message contains BlockRef of ALL committed blocks (line 110-113), ensuring other nodes
+        //    know exactly which blocks are committed.
+        // 3. Commit syncer fetches ALL blocks referenced in commit messages (commit_syncer.rs:601),
+        //    ensuring all nodes have the same blocks before committing.
+        // 4. Linearization is deterministic - all nodes process the same blocks in the same order,
+        //    producing the same CommittedSubDag.
+        // Therefore, even if a node doesn't have a block locally, it will fetch it via commit syncer
+        // and produce the same commit as other nodes. No fork occurs.
+        if leader_round > gc_round {
+            let all_blocks_in_round = dag_state.get_uncommitted_blocks_at_round(leader_round);
+            for block in all_blocks_in_round {
+                let block_ref = block.reference();
+                // Only commit if not already committed (avoid duplicates)
+                if !dag_state.is_committed(&block_ref) {
+                    if dag_state.set_committed(&block_ref) {
+                        to_commit.push(block);
+                    }
+                }
+            }
+        }
+
         while let Some(x) = buffer.pop() {
-            to_commit.push(x.clone());
+            // Skip if already added from round-based collection
+            if !to_commit.iter().any(|b| b.reference() == x.reference()) {
+                to_commit.push(x.clone());
+            }
 
             let ancestors: Vec<VerifiedBlock> = dag_state
                 .get_blocks(

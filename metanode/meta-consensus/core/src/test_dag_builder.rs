@@ -185,6 +185,19 @@ impl DagBuilder {
                     .map(|(_, committed)| *committed)
                     .expect("Block should be found in store")
             }
+
+            fn get_uncommitted_blocks_at_round(&self, round: Round) -> Vec<VerifiedBlock> {
+                self.blocks
+                    .iter()
+                    .filter_map(|(block_ref, (block, committed))| {
+                        if block_ref.round == round && !*committed {
+                            Some(block.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
         }
 
         let mut storage = BlockStorage {

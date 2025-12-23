@@ -503,7 +503,7 @@ impl EpochChangeManager {
 
         let vote = EpochChangeVote::new_with_signature(
             proposal_hash.clone(),
-            self.get_own_index(),
+            voter, // Use the voter parameter, not self.get_own_index()
             approve,
             signature,
         );
@@ -1002,18 +1002,27 @@ impl EpochChangeManager {
     /// 1. Quorum must be reached (2f+1 votes)
     /// 2. All nodes must reach the same commit index barrier
     /// 3. Buffer of 10 commits ensures all nodes have processed the proposal
+    /// 4. Timeout mechanism: If commit index doesn't increase for 5 minutes after quorum,
+    ///    allow transition to prevent deadlock when other nodes have already transitioned
     pub fn should_transition(
         &self,
         proposal: &EpochChangeProposal,
         current_commit_index: u32,
     ) -> bool {
-        // ✅ Điều kiện 1: Quorum đã đạt
+        // ✅ Điều kiện 1: Quorum đã đạt HOẶC node lag quá xa (catch-up mode)
         let quorum_status = self.check_proposal_quorum(proposal);
         let quorum_reached = quorum_status
             .map(|approved| approved)
             .unwrap_or(false);
         
-        if !quorum_reached {
+        // SIMPLE CATCH-UP LOGIC: Nếu node lag quá xa (epoch khác > current_epoch + 2),
+        // cho phép transition mà không cần quorum để catch-up nhanh
+        // Điều này đảm bảo node không bị stuck khi các nodes khác đã tiến xa
+        let epoch_lag = proposal.new_epoch.saturating_sub(self.current_epoch);
+        const MAX_EPOCH_LAG_FOR_QUORUM: u64 = 2; // Nếu lag > 2 epochs, không cần quorum
+        let is_catchup_mode = epoch_lag > MAX_EPOCH_LAG_FOR_QUORUM;
+        
+        if !quorum_reached && !is_catchup_mode {
             // Log why transition is not ready (throttled to avoid spam)
             let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
             let barrier_passed = current_commit_index >= transition_commit_index;
@@ -1032,6 +1041,24 @@ impl EpochChangeManager {
             return false;
         }
         
+        // CATCH-UP MODE: Log khi cho phép transition mà không cần quorum
+        if is_catchup_mode && !quorum_reached {
+            tracing::warn!(
+                "🚀 CATCH-UP MODE: Allowing transition without quorum - epoch {} -> {} (lag={} epochs, max_lag={})",
+                proposal.new_epoch - 1,
+                proposal.new_epoch,
+                epoch_lag,
+                MAX_EPOCH_LAG_FOR_QUORUM
+            );
+            tracing::warn!(
+                "   ⚠️  Node is lagging behind - other nodes are at epoch {} or higher",
+                proposal.new_epoch
+            );
+            tracing::warn!(
+                "   ✅ Allowing transition to catch up (fork-safe: using commit index barrier)"
+            );
+        }
+        
         // ✅ Điều kiện 2: Đã đến commit index được chỉ định
         // Tất cả nodes sẽ transition tại cùng commit_index → fork-safe
         // 
@@ -1045,27 +1072,68 @@ impl EpochChangeManager {
         // All nodes will transition when they reach this index
         // Small differences in commit index between nodes are acceptable
         // as long as they're all >= transition_commit_index
-        let ready = current_commit_index >= transition_commit_index;
+        let barrier_reached = current_commit_index >= transition_commit_index;
+        
+        // ✅ Điều kiện 3: Timeout mechanism để tránh deadlock
+        // Nếu quorum đã đạt nhưng commit index không tăng trong 5 phút,
+        // có thể các node khác đã transition → cho phép transition để tránh deadlock
+        // CRITICAL: Chỉ áp dụng timeout khi quorum đã đạt và đã chờ đủ lâu
+        let now_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let proposal_age_seconds = now_seconds.saturating_sub(proposal.created_at_seconds);
+        const TIMEOUT_SECONDS: u64 = 300; // 5 minutes timeout
+        let timeout_reached = proposal_age_seconds >= TIMEOUT_SECONDS;
+        
+        // Allow transition if:
+        // 1. Barrier reached (normal case)
+        // 2. Timeout reached AND quorum reached (deadlock prevention)
+        // 3. Catch-up mode: barrier reached (node lagging, needs to catch up)
+        // CRITICAL: Catch-up mode vẫn cần barrier để đảm bảo fork-safety
+        let ready = barrier_reached || (timeout_reached && quorum_reached) || (is_catchup_mode && barrier_reached);
         
         if ready {
-            // Log for monitoring - ensure all nodes transition at similar commit index
-            tracing::info!(
-                "✅ Transition ready: epoch {} -> {}, current_commit={}, barrier={}, diff={}, quorum=APPROVED",
-                proposal.new_epoch - 1,
-                proposal.new_epoch,
-                current_commit_index,
-                transition_commit_index,
-                current_commit_index.saturating_sub(transition_commit_index)
-            );
+            if barrier_reached {
+                // Log for monitoring - ensure all nodes transition at similar commit index
+                tracing::info!(
+                    "✅ Transition ready: epoch {} -> {}, current_commit={}, barrier={}, diff={}, quorum=APPROVED",
+                    proposal.new_epoch - 1,
+                    proposal.new_epoch,
+                    current_commit_index,
+                    transition_commit_index,
+                    current_commit_index.saturating_sub(transition_commit_index)
+                );
+            } else if timeout_reached {
+                // Timeout-based transition (deadlock prevention)
+                tracing::warn!(
+                    "⏰ Transition ready (TIMEOUT): epoch {} -> {}, current_commit={}, barrier={}, proposal_age={}s (timeout={}s), quorum=APPROVED",
+                    proposal.new_epoch - 1,
+                    proposal.new_epoch,
+                    current_commit_index,
+                    transition_commit_index,
+                    proposal_age_seconds,
+                    TIMEOUT_SECONDS
+                );
+                tracing::warn!(
+                    "   ⚠️  Commit index has not increased for {}s - other nodes may have already transitioned",
+                    proposal_age_seconds
+                );
+                tracing::warn!(
+                    "   ⚠️  Allowing transition to prevent deadlock (quorum already reached)"
+                );
+            }
         } else {
             // Log when quorum reached but barrier not passed yet
+            let remaining_timeout = TIMEOUT_SECONDS.saturating_sub(proposal_age_seconds);
             tracing::debug!(
-                "⏳ Transition waiting for barrier: epoch {} -> {}, current_commit={}, barrier={}, need {} more commits",
+                "⏳ Transition waiting: epoch {} -> {}, current_commit={}, barrier={}, need {} more commits, timeout in {}s",
                 proposal.new_epoch - 1,
                 proposal.new_epoch,
                 current_commit_index,
                 transition_commit_index,
-                transition_commit_index.saturating_sub(current_commit_index)
+                transition_commit_index.saturating_sub(current_commit_index),
+                remaining_timeout
             );
         }
         

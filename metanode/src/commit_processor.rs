@@ -191,15 +191,16 @@ impl CommitProcessor {
             );
             
             // Send committed subdag to Go executor if enabled
+            // CRITICAL FORK-SAFETY: Include global_exec_index to ensure deterministic execution order
             if let Some(ref client) = executor_client {
-                info!("📤 [TX FLOW] Sending committed subdag to Go executor: commit_index={}, blocks={}, total_tx={}", 
-                    commit_index, subdag.blocks.len(), total_transactions);
-                if let Err(e) = client.send_committed_subdag(subdag, epoch).await {
+                info!("📤 [TX FLOW] Sending committed subdag to Go executor: global_exec_index={}, commit_index={}, blocks={}, total_tx={}", 
+                    global_exec_index, commit_index, subdag.blocks.len(), total_transactions);
+                if let Err(e) = client.send_committed_subdag(subdag, epoch, global_exec_index).await {
                     warn!("⚠️  [TX FLOW] Failed to send committed subdag to executor: {}", e);
                     // Don't fail commit if executor is unavailable
                 } else {
-                    info!("✅ [TX FLOW] Successfully sent committed subdag to Go executor: commit_index={}, blocks={}", 
-                        commit_index, subdag.blocks.len());
+                    info!("✅ [TX FLOW] Successfully sent committed subdag to Go executor: global_exec_index={}, commit_index={}, blocks={}", 
+                        global_exec_index, commit_index, subdag.blocks.len());
                 }
             } else {
                 info!("ℹ️  [TX FLOW] Executor client not enabled, skipping send to Go executor");
@@ -222,8 +223,9 @@ impl CommitProcessor {
             }
             
             // Send committed subdag to Go executor if enabled (even for empty commits)
+            // CRITICAL FORK-SAFETY: Include global_exec_index to ensure deterministic execution order
             if let Some(ref client) = executor_client {
-                if let Err(e) = client.send_committed_subdag(subdag, epoch).await {
+                if let Err(e) = client.send_committed_subdag(subdag, epoch, global_exec_index).await {
                     warn!("⚠️  Failed to send committed subdag to executor: {}", e);
                     // Don't fail commit if executor is unavailable
                 }

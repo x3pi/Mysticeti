@@ -79,6 +79,21 @@ pub struct NodeConfig {
     /// Only node 0 should have this enabled
     #[serde(default)]
     pub executor_enabled: bool,
+    /// Commit sync batch size for catch-up (default: 200, higher = faster catch-up but more memory)
+    /// When node is lagging, larger batch size allows fetching more commits in parallel
+    #[serde(default = "default_commit_sync_batch_size")]
+    pub commit_sync_batch_size: u32,
+    /// Commit sync parallel fetches (default: 16, higher = faster catch-up but more network load)
+    /// Number of commit batches to fetch in parallel from different peers
+    #[serde(default = "default_commit_sync_parallel_fetches")]
+    pub commit_sync_parallel_fetches: usize,
+    /// Commit sync batches ahead (default: 64, higher = more aggressive catch-up)
+    /// Maximum number of commit batches to fetch ahead before throttling
+    #[serde(default = "default_commit_sync_batches_ahead")]
+    pub commit_sync_batches_ahead: usize,
+    /// Enable adaptive catch-up: automatically increase batch size and parallel fetches when lagging (default: true)
+    #[serde(default = "default_adaptive_catchup")]
+    pub adaptive_catchup_enabled: bool,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -94,6 +109,22 @@ fn default_ntp_servers() -> Vec<String> {
 
 fn default_ntp_sync_interval_seconds() -> u64 {
     300 // 5 minutes
+}
+
+fn default_commit_sync_batch_size() -> u32 {
+    200 // Increased from default 100 for faster catch-up
+}
+
+fn default_commit_sync_parallel_fetches() -> usize {
+    16 // Increased from default 8 for faster catch-up
+}
+
+fn default_commit_sync_batches_ahead() -> usize {
+    64 // Increased from default 32 for more aggressive catch-up
+}
+
+fn default_adaptive_catchup() -> bool {
+    true // Enable adaptive catch-up by default
 }
 
 impl NodeConfig {
@@ -155,6 +186,10 @@ impl NodeConfig {
                 ntp_servers: default_ntp_servers(),
                 ntp_sync_interval_seconds: 300,
                 executor_enabled: idx == 0, // Only node 0 has executor enabled by default
+                commit_sync_batch_size: default_commit_sync_batch_size(),
+                commit_sync_parallel_fetches: default_commit_sync_parallel_fetches(),
+                commit_sync_batches_ahead: default_commit_sync_batches_ahead(),
+                adaptive_catchup_enabled: default_adaptive_catchup(),
             };
 
             // Save keys - use private_key_bytes and public key bytes

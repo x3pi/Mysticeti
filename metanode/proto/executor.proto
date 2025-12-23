@@ -18,5 +18,13 @@ message CommittedBlock {
 
 message CommittedEpochData {
     repeated CommittedBlock blocks = 1;
+    // CRITICAL FORK-SAFETY: global_exec_index ensures deterministic execution order across all nodes
+    // This is the global execution index (Checkpoint Sequence Number) that increases continuously
+    // across epochs without resetting. All nodes must execute blocks with the same global_exec_index
+    // in the same order to prevent forks.
+    uint64 global_exec_index = 2;
+    // CRITICAL FORK-SAFETY: commit_index is the epoch-local commit index
+    // Used together with global_exec_index to ensure deterministic ordering
+    uint32 commit_index = 3;
 }
 

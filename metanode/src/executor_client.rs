@@ -97,7 +97,13 @@ impl ExecutorClient {
     }
 
     /// Send committed sub-DAG to executor
-    pub async fn send_committed_subdag(&self, subdag: &CommittedSubDag, epoch: u64) -> Result<()> {
+    /// CRITICAL FORK-SAFETY: global_exec_index and commit_index ensure deterministic execution order
+    pub async fn send_committed_subdag(
+        &self,
+        subdag: &CommittedSubDag,
+        epoch: u64,
+        global_exec_index: u64,
+    ) -> Result<()> {
         if !self.enabled {
             return Ok(()); // Silently skip if not enabled
         }
@@ -109,7 +115,8 @@ impl ExecutorClient {
         }
 
         // Convert CommittedSubDag to protobuf CommittedEpochData
-        let epoch_data_bytes = self.convert_to_protobuf(subdag, epoch)?;
+        // CRITICAL FORK-SAFETY: Include global_exec_index and commit_index for deterministic ordering
+        let epoch_data_bytes = self.convert_to_protobuf(subdag, epoch, global_exec_index)?;
 
         // Count total transactions before sending
         let total_tx: usize = subdag.blocks.iter().map(|b| b.transactions().len()).sum();
@@ -131,8 +138,8 @@ impl ExecutorClient {
             
             match send_result {
                 Ok(_) => {
-                    info!("📤 [TX FLOW] Sent committed sub-DAG to Go executor: commit_index={}, epoch={}, blocks={}, total_tx={}, data_size={} bytes", 
-                        subdag.commit_ref.index, epoch, subdag.blocks.len(), total_tx, epoch_data_bytes.len());
+                    info!("📤 [TX FLOW] Sent committed sub-DAG to Go executor: global_exec_index={}, commit_index={}, epoch={}, blocks={}, total_tx={}, data_size={} bytes", 
+                        global_exec_index, subdag.commit_ref.index, epoch, subdag.blocks.len(), total_tx, epoch_data_bytes.len());
                 }
                 Err(e) => {
                     warn!("⚠️  [EXECUTOR] Failed to send committed sub-DAG (commit_index={}, total_tx={}): {}, reconnecting...", 
@@ -177,15 +184,23 @@ impl ExecutorClient {
     /// 
     /// IMPORTANT: Transaction data is passed through unchanged from Go sub → Rust consensus → Go master
     /// We verify data integrity by checking transaction hash at each step
-    fn convert_to_protobuf(&self, subdag: &CommittedSubDag, epoch: u64) -> Result<Vec<u8>> {
-        use crate::tx_hash::calculate_transaction_hash_hex;
-        
+    /// 
+    /// CRITICAL FORK-SAFETY: global_exec_index and commit_index ensure deterministic execution order
+    /// All nodes must execute blocks with the same global_exec_index in the same order
+    fn convert_to_protobuf(
+        &self,
+        subdag: &CommittedSubDag,
+        epoch: u64,
+        global_exec_index: u64,
+    ) -> Result<Vec<u8>> {
         // Build CommittedEpochData protobuf message using generated types
         let mut blocks = Vec::new();
         
         for (block_idx, block) in subdag.blocks.iter().enumerate() {
-            // Extract transactions
-            let mut transactions = Vec::new();
+            // Extract transactions with hash for deterministic sorting
+            // CRITICAL FORK-SAFETY: Sort transactions by hash to ensure all nodes send same order
+            let mut transactions_with_hash: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (tx_data, tx_hash)
+            
             for (tx_idx, tx) in block.transactions().iter().enumerate() {
                 // Get transaction data (raw bytes) - Go needs transaction data, not digest
                 // IMPORTANT: tx.data() returns a reference to the original bytes, no modification
@@ -193,7 +208,9 @@ impl ExecutorClient {
                 
                 // 🔍 HASH INTEGRITY CHECK: Verify transaction data integrity by calculating hash
                 // This ensures data hasn't been modified during consensus
-                let tx_hash_hex = calculate_transaction_hash_hex(tx_data);
+                use crate::tx_hash::calculate_transaction_hash;
+                let tx_hash = calculate_transaction_hash(tx_data);
+                let tx_hash_hex = hex::encode(&tx_hash[..8.min(tx_hash.len())]);
                 info!("🔍 [TX HASH] Rust executor preparing to send to Go Master: hash={}, size={} bytes, block_idx={}, tx_idx={}", 
                     tx_hash_hex, tx_data.len(), block_idx, tx_idx);
                 
@@ -218,19 +235,37 @@ impl ExecutorClient {
                 trace!("🔍 [TX INTEGRITY] Verifying transaction data: hash={}, size={} bytes", 
                     tx_hash_hex, tx_data.len());
                 
+                // Store transaction data with hash for sorting
+                transactions_with_hash.push((tx_data.to_vec(), tx_hash));
+                
+                info!("✅ [TX INTEGRITY] Transaction data preserved: hash={}, size={} bytes (unchanged from submission)", 
+                    tx_hash_hex, tx_data.len());
+            }
+            
+            // CRITICAL FORK-SAFETY: Sort transactions by hash (deterministic ordering)
+            // This ensures all nodes send transactions in the same order within a block
+            // Sort by hash bytes (lexicographic order) - deterministic across all nodes
+            transactions_with_hash.sort_by(|(_, hash_a), (_, hash_b)| hash_a.cmp(hash_b));
+            
+            // Convert to TransactionExe messages after sorting
+            let mut transactions = Vec::new();
+            for (tx_data, tx_hash) in transactions_with_hash {
+                let tx_hash_hex = hex::encode(&tx_hash[..8.min(tx_hash.len())]);
+                info!("📋 [FORK-SAFETY] Sorted transaction in block[{}]: hash={}", block_idx, tx_hash_hex);
+                
                 // Create TransactionExe message using generated protobuf code
                 // NOTE: We use "digest" field to store transaction data (raw bytes)
                 // Go will unmarshal this as transaction data
                 // IMPORTANT: We create a copy here (to_vec()) but the data is unchanged
                 let tx_exe = TransactionExe {
-                    digest: tx_data.to_vec(), // Copy for protobuf encoding, but data is unchanged
+                    digest: tx_data, // Already a Vec<u8> from sorting step
                     worker_id: 0, // Optional, set to 0 for now
                 };
                 transactions.push(tx_exe);
-                
-                info!("✅ [TX INTEGRITY] Transaction data preserved: hash={}, size={} bytes (unchanged from submission)", 
-                    tx_hash_hex, tx_data.len());
             }
+            
+            info!("✅ [FORK-SAFETY] Block[{}] transactions sorted: {} transactions (deterministic order by hash)", 
+                block_idx, transactions.len());
             
             // Create CommittedBlock message using generated protobuf code
             let committed_block = CommittedBlock {
@@ -242,15 +277,20 @@ impl ExecutorClient {
         }
         
         // Create CommittedEpochData message using generated protobuf code
-        let epoch_data = CommittedEpochData { blocks };
+        // CRITICAL FORK-SAFETY: Include global_exec_index and commit_index for deterministic ordering
+        let epoch_data = CommittedEpochData {
+            blocks,
+            global_exec_index,
+            commit_index: subdag.commit_ref.index as u32,
+        };
         
         // Encode to protobuf bytes using prost::Message::encode
         // This ensures correct protobuf encoding that Go can unmarshal
         let mut buf = Vec::new();
         epoch_data.encode(&mut buf)?;
         
-        info!("📦 [TX INTEGRITY] Encoded CommittedEpochData: epoch={}, blocks={}, total_size={} bytes (using protobuf encoding)", 
-            epoch, epoch_data.blocks.len(), buf.len());
+        info!("📦 [TX INTEGRITY] Encoded CommittedEpochData: global_exec_index={}, commit_index={}, epoch={}, blocks={}, total_size={} bytes (using protobuf encoding)", 
+            global_exec_index, subdag.commit_ref.index, epoch, epoch_data.blocks.len(), buf.len());
         
         Ok(buf)
     }

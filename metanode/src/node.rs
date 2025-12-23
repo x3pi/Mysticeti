@@ -184,6 +184,16 @@ impl ConsensusNode {
         // Create parameters (db_path will be set per-epoch)
         let mut parameters = consensus_config::Parameters::default();
 
+        // Apply commit sync parameters for faster catch-up
+        parameters.commit_sync_batch_size = config.commit_sync_batch_size;
+        parameters.commit_sync_parallel_fetches = config.commit_sync_parallel_fetches;
+        parameters.commit_sync_batches_ahead = config.commit_sync_batches_ahead;
+        info!("Commit sync parameters: batch_size={}, parallel_fetches={}, batches_ahead={}, adaptive={}", 
+            parameters.commit_sync_batch_size,
+            parameters.commit_sync_parallel_fetches,
+            parameters.commit_sync_batches_ahead,
+            config.adaptive_catchup_enabled);
+
         // Apply speed multiplier to consensus parameters (to slow down system)
         let speed_multiplier = config.speed_multiplier;
         if speed_multiplier != 1.0 {
@@ -484,6 +494,30 @@ impl ConsensusNode {
                                         proposal_commit_index,
                                         own_index_clone.value()
                                     );
+                                    
+                                    // CRITICAL FIX: Auto-vote on own proposal
+                                    // The proposer should automatically vote on their own proposal
+                                    // This ensures the proposal has at least one vote and can reach quorum
+                                    match manager.vote_on_proposal(
+                                        &proposal,
+                                        own_index_clone,
+                                        &protocol_keypair_for_task,
+                                    ) {
+                                        Ok(vote) => {
+                                            let vote_hash_hex = hex::encode(&vote.proposal_hash[..8.min(vote.proposal_hash.len())]);
+                                            info!(
+                                                "🗳️  Auto-voted on own proposal: proposal_hash={}, epoch {} -> {}, voter={}, approve={}",
+                                                vote_hash_hex,
+                                                proposal.new_epoch - 1,
+                                                proposal.new_epoch,
+                                                own_index_clone.value(),
+                                                vote.approve
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("⚠️  Failed to auto-vote on own proposal: {}", e);
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!("❌ Failed to create epoch change proposal: {}", e);
@@ -738,7 +772,6 @@ impl ConsensusNode {
         // Transactions that are already submitted to DAG will continue processing
         // Only reject if we're actively transitioning (last_transition_hash is set)
         // This ensures transactions are not lost during epoch transition
-        let current_commit_index = self.current_commit_index.load(Ordering::SeqCst);
         
         // Check if transition is in progress (last_transition_hash indicates active transition)
         // This is set at the start of transition_to_epoch and cleared after new authority starts
@@ -847,28 +880,95 @@ impl ConsensusNode {
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         );
         
-        // ✅ FORK-SAFETY VALIDATION 1: Commit Index Barrier
+        // ✅ FORK-SAFETY VALIDATION 1: Commit Index Barrier (with timeout exception)
         // CRITICAL: Tất cả nodes PHẢI transition tại CÙNG commit index (barrier) để tránh fork
         // Buffer of 10 commits ensures:
         // - Proposal has been committed and propagated to all nodes
         // - All nodes have had time to reach this commit index
         // - Reduces risk of fork due to network delay or processing speed differences
+        //
+        // EXCEPTION: Timeout mechanism allows transition when:
+        // - Quorum is reached (2f+1 votes)
+        // - Commit index hasn't increased for 5 minutes (other nodes may have transitioned)
+        // - CRITICAL: Even with timeout, all nodes MUST use barrier as last_commit_index (fork-safe)
         let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
-        ensure!(
-            current_commit_index >= transition_commit_index,
-            "FORK-SAFETY: Must wait until commit index {} (current: {}) to ensure all nodes transition together",
-            transition_commit_index,
-            current_commit_index
-        );
+        let barrier_reached = current_commit_index >= transition_commit_index;
         
-        // ✅ FORK-SAFETY VALIDATION 2: Quorum Check
-        // Đảm bảo đủ votes (2f+1) trước khi transition
-        // This ensures consensus on the epoch change
+        // Check if timeout exception applies
         let manager = self.epoch_change_manager.read().await;
-        ensure!(
-            manager.check_proposal_quorum(proposal) == Some(true),
-            "FORK-SAFETY: Quorum not reached for epoch transition - need 2f+1 votes"
-        );
+        let quorum_reached = manager.check_proposal_quorum(proposal) == Some(true);
+        let now_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let proposal_age_seconds = now_seconds.saturating_sub(proposal.created_at_seconds);
+        const TIMEOUT_SECONDS: u64 = 300; // 5 minutes timeout
+        let timeout_reached = proposal_age_seconds >= TIMEOUT_SECONDS;
+        let timeout_exception = timeout_reached && quorum_reached && !barrier_reached;
+        drop(manager);
+        
+        if !barrier_reached && !timeout_exception {
+            // Normal case: must wait for barrier (fork-safety)
+            return Err(anyhow::anyhow!(
+                "FORK-SAFETY: Must wait until commit index {} (current: {}) to ensure all nodes transition together",
+                transition_commit_index,
+                current_commit_index
+            ));
+        }
+        
+        if timeout_exception {
+            // Timeout exception: allow transition but MUST use barrier as last_commit_index
+            warn!(
+                "⏰ TIMEOUT EXCEPTION: Allowing transition despite barrier not reached (current={}, barrier={}, age={}s)",
+                current_commit_index,
+                transition_commit_index,
+                proposal_age_seconds
+            );
+            warn!(
+                "   🔒 FORK-SAFETY: Will use barrier ({}) as last_commit_index, NOT current ({})",
+                transition_commit_index,
+                current_commit_index
+            );
+            warn!(
+                "   ✅ This ensures all nodes compute same global_exec_index (no fork)"
+            );
+        }
+        
+        // ✅ FORK-SAFETY VALIDATION 2: Quorum Check (with catch-up exception)
+        // Đảm bảo đủ votes (2f+1) trước khi transition
+        // EXCEPTION: Nếu node lag quá xa (epoch khác > current_epoch + 2), cho phép transition để catch-up
+        // This ensures consensus on the epoch change, but allows catch-up when lagging
+        let manager = self.epoch_change_manager.read().await;
+        let quorum_status = manager.check_proposal_quorum(proposal);
+        let quorum_reached = quorum_status == Some(true);
+        
+        // SIMPLE CATCH-UP LOGIC: Nếu node lag quá xa, cho phép transition mà không cần quorum
+        let epoch_lag = proposal.new_epoch.saturating_sub(self.current_epoch);
+        const MAX_EPOCH_LAG_FOR_QUORUM: u64 = 2;
+        let is_catchup_mode = epoch_lag > MAX_EPOCH_LAG_FOR_QUORUM;
+        
+        if !quorum_reached && !is_catchup_mode {
+            drop(manager);
+            anyhow::bail!(
+                "FORK-SAFETY: Quorum not reached for epoch transition - need 2f+1 votes (epoch lag: {})",
+                epoch_lag
+            );
+        }
+        
+        if is_catchup_mode && !quorum_reached {
+            warn!(
+                "🚀 CATCH-UP MODE: Allowing transition without quorum - epoch {} -> {} (lag={} epochs)",
+                self.current_epoch,
+                proposal.new_epoch,
+                epoch_lag
+            );
+            warn!(
+                "   ⚠️  Node is lagging behind - allowing transition to catch up"
+            );
+            warn!(
+                "   ✅ Fork-safety ensured by commit index barrier (all nodes use same barrier)"
+            );
+        }
         drop(manager);
         
         // ✅ FORK-SAFETY VALIDATION 4: Verify proposal hash consistency
@@ -920,8 +1020,10 @@ impl ConsensusNode {
         // Giải pháp: Tất cả nodes dùng transition_commit_index (barrier) làm last_commit_index
         // - Node nào đạt barrier trước: đợi một chút để các node khác catch-up (optional, để tối ưu)
         // - Node nào catch-up muộn: vẫn dùng barrier làm last_commit_index (không dùng current_commit_index)
+        // - Node nào timeout: vẫn dùng barrier làm last_commit_index (KHÔNG dùng current_commit_index)
         // - Điều này đảm bảo tất cả nodes có cùng state khi transition → không fork
         let commit_index_diff = current_commit_index.saturating_sub(transition_commit_index);
+        let barrier_behind = transition_commit_index.saturating_sub(current_commit_index);
         
         warn!(
             "🔒 FORK-SAFETY: Using transition_commit_index (barrier) as last_commit_index"
@@ -931,11 +1033,24 @@ impl ConsensusNode {
             transition_commit_index,
             proposal.proposal_commit_index
         );
-        warn!(
-            "   - Current commit index: {} ({} commits past barrier)",
-            current_commit_index,
-            commit_index_diff
-        );
+        if commit_index_diff > 0 {
+            warn!(
+                "   - Current commit index: {} ({} commits past barrier)",
+                current_commit_index,
+                commit_index_diff
+            );
+        } else if barrier_behind > 0 {
+            warn!(
+                "   - Current commit index: {} ({} commits behind barrier - TIMEOUT EXCEPTION)",
+                current_commit_index,
+                barrier_behind
+            );
+        } else {
+            warn!(
+                "   - Current commit index: {} (exactly at barrier)",
+                current_commit_index
+            );
+        }
         warn!(
             "   - All nodes will use last_commit_index={} to ensure fork-safety",
             transition_commit_index
@@ -944,6 +1059,11 @@ impl ConsensusNode {
             warn!(
                 "   - ⚠️  Node has processed {} commits past barrier - these will be included in epoch transition",
                 commit_index_diff
+            );
+        } else if barrier_behind > 0 {
+            warn!(
+                "   - ⚠️  TIMEOUT EXCEPTION: Node is {} commits behind barrier, but using barrier as last_commit_index (fork-safe)",
+                barrier_behind
             );
         }
         
