@@ -5,8 +5,13 @@
 /// This ensures all nodes compute the same value from consensus state
 /// 
 /// Formula:
-/// - Epoch 0: global_exec_index = commit_index
+/// - Epoch 0: global_exec_index = commit_index (commit_index starts from 1, so global_exec_index starts from 1)
 /// - Epoch N (N > 0): global_exec_index = last_global_exec_index + commit_index
+/// 
+/// IMPORTANT: In Mysticeti, commit_index starts from 1 in every epoch
+/// (`CommitProcessor::next_expected_index` starts at 1). Therefore, epoch N's first commit
+/// (commit_index=1) must map to global_exec_index = last_global_exec_index + 1 for continuous,
+/// strictly increasing execution order across epochs.
 /// 
 /// This is similar to Sui's Checkpoint Sequence Number which increases continuously
 /// across epochs without resetting.
@@ -16,11 +21,15 @@ pub fn calculate_global_exec_index(
     last_global_exec_index: u64,
 ) -> u64 {
     if epoch == 0 {
-        // Epoch 0: start from commit_index (which starts from 0 or 1)
+        // Epoch 0: commit_index starts from 1, so global_exec_index starts from 1
+        // commit_index=1 → global_exec_index=1 (first block is block 1)
+        // commit_index=2 → global_exec_index=2, etc.
         commit_index as u64
     } else {
-        // Epoch N: continue from last_global_exec_index
-        // last_global_exec_index is the last global_exec_index of previous epoch
+        // Epoch N: commit_index starts from 1 → first global_exec_index is last_global_exec_index + 1
+        // Example:
+        // - Epoch 0 ends at global_exec_index=1276
+        // - Epoch 1, commit_index=1 → global_exec_index = 1276 + 1 = 1277
         last_global_exec_index + commit_index as u64
     }
 }
@@ -31,17 +40,19 @@ mod tests {
 
     #[test]
     fn test_calculate_global_exec_index_epoch_0() {
-        // Epoch 0: global_exec_index = commit_index
-        assert_eq!(calculate_global_exec_index(0, 0, 0), 0);
-        assert_eq!(calculate_global_exec_index(0, 1, 0), 1);
-        assert_eq!(calculate_global_exec_index(0, 100, 0), 100);
+        // Epoch 0: global_exec_index = commit_index (commit_index starts from 1, so global_exec_index starts from 1)
+        assert_eq!(calculate_global_exec_index(0, 0, 0), 0); // commit_index=0 → global_exec_index=0 (edge case)
+        assert_eq!(calculate_global_exec_index(0, 1, 0), 1); // commit_index=1 → global_exec_index=1 (first block is block 1)
+        assert_eq!(calculate_global_exec_index(0, 2, 0), 2); // commit_index=2 → global_exec_index=2
+        assert_eq!(calculate_global_exec_index(0, 100, 0), 100); // commit_index=100 → global_exec_index=100
     }
 
     #[test]
     fn test_calculate_global_exec_index_epoch_1() {
         // Epoch 1: global_exec_index = last_global_exec_index + commit_index
         // Assume epoch 0 ended at commit_index 100, so last_global_exec_index = 100
-        assert_eq!(calculate_global_exec_index(1, 0, 100), 100);
+        // Epoch 1, commit_index=1 → global_exec_index = 100 + 1 = 101
+        assert_eq!(calculate_global_exec_index(1, 0, 100), 100); // commit_index=0 (edge case; not used by consensus)
         assert_eq!(calculate_global_exec_index(1, 1, 100), 101);
         assert_eq!(calculate_global_exec_index(1, 50, 100), 150);
     }
@@ -49,8 +60,9 @@ mod tests {
     #[test]
     fn test_calculate_global_exec_index_epoch_2() {
         // Epoch 2: continue from epoch 1
-        // Assume epoch 1 ended at commit_index 50, so last_global_exec_index = 150
-        assert_eq!(calculate_global_exec_index(2, 0, 150), 150);
+        // Assume epoch 1 ended at commit_index 50, so last_global_exec_index = 150 (100 + 50)
+        // Epoch 2, commit_index=1 → global_exec_index = 150 + 1 = 151
+        assert_eq!(calculate_global_exec_index(2, 0, 150), 150); // edge case (not used by consensus)
         assert_eq!(calculate_global_exec_index(2, 1, 150), 151);
         assert_eq!(calculate_global_exec_index(2, 25, 150), 175);
     }

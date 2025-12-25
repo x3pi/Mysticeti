@@ -17,6 +17,13 @@
 #   dẫn đến mất blocks và TxsProcessor bị stuck. Delay giúp đảm bảo Go Sub đã sẵn sàng nhận blocks.
 
 set -e
+set -o pipefail
+
+# Full clean switches (safe defaults for local dev)
+# - FULL_CLEAN_BUILD=1  : run cargo clean before cargo build --release
+# - FULL_CLEAN_GO_MODCACHE=0 : DO NOT wipe Go module cache by default (slow; set to 1 if needed)
+FULL_CLEAN_BUILD="${FULL_CLEAN_BUILD:-1}"
+FULL_CLEAN_GO_MODCACHE="${FULL_CLEAN_GO_MODCACHE:-0}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -67,6 +74,14 @@ print_step() {
 # Step 1: Clean up old data (CRITICAL: Must be done before starting any nodes)
 print_step "Bước 1: Xóa dữ liệu cũ (QUAN TRỌNG: Phải xóa trước khi khởi động nodes)..."
 
+# Clean old Unix sockets in /tmp (stale sockets can break connectivity even on localhost)
+print_info "🧹 Xóa Unix sockets cũ trong /tmp (tránh dính socket stale)..."
+rm -f /tmp/metanode-tx-*.sock 2>/dev/null || true
+rm -f /tmp/executor*.sock 2>/dev/null || true
+rm -f /tmp/rust-go.sock_* 2>/dev/null || true
+rm -f /tmp/rust-go.sock_1 /tmp/rust-go.sock_2 2>/dev/null || true
+print_info "  ✅ Đã cleanup sockets /tmp"
+
 # Clean Go sample data (bao gồm cả logs và tất cả dữ liệu)
 print_info "🧹 Xóa dữ liệu Go sample (bao gồm cả logs)..."
 if [ -d "$GO_PROJECT_ROOT/cmd/simple_chain/sample" ]; then
@@ -104,12 +119,17 @@ fi
 mkdir -p "$METANODE_ROOT/config/storage"
 print_info "  ✅ Đã tạo lại storage directory"
 
-# Clean Rust logs (optional - keep for debugging)
-# if [ -d "$METANODE_ROOT/logs" ]; then
-#     print_info "Xóa logs Rust: $METANODE_ROOT/logs"
-#     rm -rf "$METANODE_ROOT/logs"
-# fi
-# mkdir -p "$METANODE_ROOT/logs"
+# Clean Rust logs
+print_info "🧹 Xóa logs Rust..."
+if [ -d "$METANODE_ROOT/logs" ]; then
+    print_info "  - Xóa: $METANODE_ROOT/logs"
+    rm -rf "$METANODE_ROOT/logs"
+    print_info "  ✅ Đã xóa logs directory"
+else
+    print_info "  ℹ️  Logs directory không tồn tại, bỏ qua"
+fi
+mkdir -p "$METANODE_ROOT/logs"
+print_info "  ✅ Đã tạo lại logs directory"
 
 print_info "✅ Đã xóa sạch tất cả dữ liệu cũ (sample, logs, storage)"
 print_info "   Bây giờ có thể khởi động nodes an toàn"
@@ -235,6 +255,13 @@ BINARY="$METANODE_ROOT/target/release/metanode"
 print_info "Building metanode binary (this may take a few minutes)..."
 print_info "💡 Tip: Nếu muốn skip build, hãy comment phần này trong script"
 cd "$METANODE_ROOT" || exit 1
+
+# Optional: force a full rebuild to avoid using stale incremental artifacts
+if [ "$FULL_CLEAN_BUILD" = "1" ]; then
+    print_info "🧹 FULL_CLEAN_BUILD=1 → chạy cargo clean để đảm bảo rebuild 100%..."
+    cargo clean
+fi
+
 cargo build --release --bin metanode
 if [ $? -ne 0 ]; then
     print_error "Build failed! Please check the error above."
@@ -297,10 +324,14 @@ tmux kill-session -t go-master 2>/dev/null || true
 export GOTOOLCHAIN=go1.23.5
 export XAPIAN_BASE_PATH='sample/simple/data/data/xapian_node'
 
-# Clean Go cache first to ensure fresh build
-print_info "Cleaning Go cache để đảm bảo code mới được compile..."
+# Clean Go cache first to ensure fresh build (avoid stale cached packages)
+print_info "Cleaning Go cache để đảm bảo code mới được compile (go clean -cache -testcache)..."
 cd "$GO_PROJECT_ROOT" || exit 1
-go clean -cache >/dev/null 2>&1 || true
+go clean -cache -testcache >/dev/null 2>&1 || true
+if [ "$FULL_CLEAN_GO_MODCACHE" = "1" ]; then
+    print_warn "FULL_CLEAN_GO_MODCACHE=1 → xóa Go module cache (SẼ RẤT CHẬM vì phải tải lại deps)..."
+    go clean -modcache >/dev/null 2>&1 || true
+fi
 
 # Start in tmux with go run
 tmux new-session -d -s go-master -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
@@ -331,9 +362,13 @@ export GOTOOLCHAIN=go1.23.5
 export XAPIAN_BASE_PATH='sample/simple/data-write/data/xapian_node'
 
 # Start in tmux with go run (clean cache first to ensure fresh build)
-print_info "Cleaning Go cache để đảm bảo code mới được compile..."
+print_info "Cleaning Go cache để đảm bảo code mới được compile (go clean -cache -testcache)..."
 cd "$GO_PROJECT_ROOT" || exit 1
-go clean -cache >/dev/null 2>&1 || true
+go clean -cache -testcache >/dev/null 2>&1 || true
+if [ "$FULL_CLEAN_GO_MODCACHE" = "1" ]; then
+    print_warn "FULL_CLEAN_GO_MODCACHE=1 → xóa Go module cache (SẼ RẤT CHẬM vì phải tải lại deps)..."
+    go clean -modcache >/dev/null 2>&1 || true
+fi
 
 # Start in tmux with go run
 tmux new-session -d -s go-sub -c "$GO_PROJECT_ROOT/cmd/simple_chain" \

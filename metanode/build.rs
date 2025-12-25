@@ -25,14 +25,15 @@ fn main() {
     
     if !protos.is_empty() {
         let out_dir = std::env::var("OUT_DIR").unwrap();
-        println!("cargo:warning=Compiling {} protobuf files to {}", protos.len(), out_dir);
+        // Keep build output clean: avoid emitting `cargo:warning=` for normal progress logs.
+        // (Using `cargo:warning=` makes Cargo print these as "warning: <crate>: ...",
+        // which looks like a compiler warning even though it's not.)
         prost_build::Config::new()
             .out_dir(&out_dir)
             .compile_protos(&protos, &["proto"])
             .unwrap_or_else(|e| {
                 panic!("Failed to compile protobuf: {}", e);
             });
-        println!("cargo:warning=Successfully compiled protobuf files");
     } else {
         panic!("No protobuf files found to compile!");
     }

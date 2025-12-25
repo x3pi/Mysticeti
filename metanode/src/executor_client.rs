@@ -104,7 +104,7 @@ impl ExecutorClient {
         epoch: u64,
         global_exec_index: u64,
     ) -> Result<()> {
-        if !self.enabled {
+        if !self.is_enabled() {
             return Ok(()); // Silently skip if not enabled
         }
 
@@ -275,6 +275,11 @@ impl ExecutorClient {
             };
             blocks.push(committed_block);
         }
+        
+        // CRITICAL FORK-SAFETY: Sort blocks by height (commit_index) to ensure deterministic order
+        // This is especially important for merged blocks from commits past barrier
+        // All nodes must send blocks in the same order
+        blocks.sort_by(|a, b| a.height.cmp(&b.height));
         
         // Create CommittedEpochData message using generated protobuf code
         // CRITICAL FORK-SAFETY: Include global_exec_index and commit_index for deterministic ordering

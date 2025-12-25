@@ -137,30 +137,11 @@ impl TxSocketServer {
         info!("🔍 [TX HASH] Rust received from Go-sub: full_hash={}, size={} bytes", 
             tx_hash_preview, data_len);
 
-        // Check if node is ready to accept transactions
-        if let Some(ref node) = node {
-            let node_guard = node.lock().await;
-            let (is_ready, reason) = node_guard.is_ready_for_transactions().await;
-            drop(node_guard);
-            
-            if !is_ready {
-                warn!("🚫 Transaction rejected via UDS: node not ready - {}", reason);
-                let error_response = format!(
-                    r#"{{"success":false,"error":"Node not ready to accept transactions: {}"}}"#,
-                    reason.replace('"', "\\\"")
-                );
-                if let Err(e) = Self::send_response_string(&mut stream, &error_response).await {
-                    error!("❌ [TX FLOW] Failed to send error response: {}", e);
-                    return Err(e.into());
-                }
-                continue; // Tiếp tục xử lý request tiếp theo
-            }
-        }
-
         // THỐNG NHẤT: Go LUÔN gửi pb.Transactions (nhiều transactions)
         // Rust CHỈ xử lý Transactions message, không xử lý single Transaction hoặc raw data
         use prost::Message;
         
+        #[allow(dead_code)]
         mod proto {
             include!(concat!(env!("OUT_DIR"), "/transaction.rs"));
         }
@@ -223,6 +204,50 @@ impl TxSocketServer {
             }
         };
 
+        // Check if node is ready to accept transactions or should queue them
+        if let Some(ref node) = node {
+            let node_guard = node.lock().await;
+            let (should_accept, should_queue, reason) = node_guard.check_transaction_acceptance().await;
+            
+            if should_queue {
+                // Queue transactions for next epoch (barrier phase)
+                info!("📦 [TX FLOW] Queueing {} transactions for next epoch: {}", transactions_to_submit.len(), reason);
+                for tx_data in &transactions_to_submit {
+                    if let Err(e) = node_guard.queue_transaction_for_next_epoch(tx_data.clone()).await {
+                        error!("❌ [TX FLOW] Failed to queue transaction: {}", e);
+                    }
+                }
+                drop(node_guard);
+                
+                // Send success response (transaction is queued, will be processed in next epoch)
+                let success_response = format!(
+                    r#"{{"success":true,"queued":true,"message":"Transaction queued for next epoch: {}"}}"#,
+                    reason.replace('"', "\\\"")
+                );
+                if let Err(e) = Self::send_response_string(&mut stream, &success_response).await {
+                    error!("❌ [TX FLOW] Failed to send queue response: {}", e);
+                    return Err(e.into());
+                }
+                continue; // Tiếp tục xử lý request tiếp theo
+            }
+            
+            if !should_accept {
+                warn!("🚫 Transaction rejected via UDS: node not ready - {}", reason);
+                drop(node_guard);
+                let error_response = format!(
+                    r#"{{"success":false,"error":"Node not ready to accept transactions: {}"}}"#,
+                    reason.replace('"', "\\\"")
+                );
+                if let Err(e) = Self::send_response_string(&mut stream, &error_response).await {
+                    error!("❌ [TX FLOW] Failed to send error response: {}", e);
+                    return Err(e.into());
+                }
+                continue; // Tiếp tục xử lý request tiếp theo
+            }
+            
+            drop(node_guard);
+        }
+
         // 🔍 HASH INTEGRITY CHECK: Log chi tiết từng transaction trước khi submit
         info!("📤 [TX FLOW] Preparing to submit {} transaction(s) via UDS", transactions_to_submit.len());
         for (i, tx_data) in transactions_to_submit.iter().enumerate() {
@@ -256,6 +281,64 @@ impl TxSocketServer {
             "unknown".to_string()
         };
         
+        // CRITICAL: Double-check barrier RIGHT BEFORE submitting to consensus
+        // This prevents race condition where barrier is set between initial check and submission
+        // Race condition scenario:
+        // 1. Transaction received, barrier check passes (barrier not set yet)
+        // 2. Barrier gets set (epoch transition starts)
+        // 3. Transaction gets submitted to consensus
+        // 4. Commit happens with commit_index > barrier → transaction lost
+        let should_queue_final = if let Some(ref node) = node {
+            let node_guard = node.lock().await;
+            let (should_accept_final, should_queue_final, reason_final) = node_guard.check_transaction_acceptance().await;
+            
+            if should_queue_final {
+                // Barrier was set between initial check and submission - queue transaction instead
+                warn!("⚠️ [RACE CONDITION] Barrier was set between initial check and submission - queueing transaction instead: {}", reason_final);
+                // Queue all transactions (node_guard is still held)
+                for tx_data in &transactions_to_submit {
+                    if let Err(e) = node_guard.queue_transaction_for_next_epoch(tx_data.clone()).await {
+                        error!("❌ [TX FLOW] Failed to queue transaction after race condition detection: {}", e);
+                    }
+                }
+                drop(node_guard);
+                // Send success response (transaction is queued)
+                let success_response = format!(
+                    r#"{{"success":true,"queued":true,"message":"Transaction queued due to barrier race condition: {}"}}"#,
+                    reason_final.replace('"', "\\\"")
+                );
+                if let Err(e) = Self::send_response_string(&mut stream, &success_response).await {
+                    error!("❌ [TX FLOW] Failed to send queue response: {}", e);
+                    return Err(e.into());
+                }
+                return Ok(()); // Don't submit to consensus
+            }
+            
+            if !should_accept_final {
+                // Node is not ready - reject transaction
+                warn!("🚫 [RACE CONDITION] Node became not ready between initial check and submission - rejecting: {}", reason_final);
+                drop(node_guard);
+                let error_response = format!(
+                    r#"{{"success":false,"error":"Node not ready: {}"}}"#,
+                    reason_final.replace('"', "\\\"")
+                );
+                if let Err(e) = Self::send_response_string(&mut stream, &error_response).await {
+                    error!("❌ [TX FLOW] Failed to send error response: {}", e);
+                    return Err(e.into());
+                }
+                return Ok(()); // Don't submit to consensus
+            }
+            
+            drop(node_guard);
+            false // Continue with submission
+        } else {
+            false // No node reference, continue with submission
+        };
+        
+        if should_queue_final {
+            return Ok(()); // Already handled above
+        }
+
         info!("📤 [TX FLOW] Submitting {} transaction(s) via UDS: first_hash={}", 
             transactions_to_submit.len(), first_tx_hash);
 

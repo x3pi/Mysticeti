@@ -6,6 +6,7 @@ use sha3::{Digest, Keccak256};
 use tracing::warn;
 
 // Include generated protobuf code
+#[allow(dead_code)]
 mod proto {
     include!(concat!(env!("OUT_DIR"), "/transaction.rs"));
 }

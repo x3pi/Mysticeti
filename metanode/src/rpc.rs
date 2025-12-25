@@ -65,7 +65,6 @@ impl RpcServer {
                     continue;
                 }
             };
-            let peer_addr_opt = Some(peer_addr);
             info!("🔌 [TX FLOW] New connection accepted from {:?} (local={:?})", peer_addr, stream.local_addr().ok());
             
             // Tối ưu TCP connection cho localhost với thông lượng lớn
@@ -229,6 +228,7 @@ impl RpcServer {
     ) -> Result<()> {
         use prost::Message;
         
+        #[allow(dead_code)]
         mod proto {
             include!(concat!(env!("OUT_DIR"), "/transaction.rs"));
         }

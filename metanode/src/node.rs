@@ -1,7 +1,7 @@
 // Copyright (c) MetaNode Team
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use consensus_config::{AuthorityIndex, Committee};
 use consensus_core::{
     ConsensusAuthority, NetworkType, Clock,
@@ -63,6 +63,16 @@ pub struct ConsensusNode {
     current_registry_id: Option<mysten_metrics::RegistryID>,
     /// Executor enabled flag (from config)
     executor_enabled: bool,
+    /// Transition barrier for current CommitProcessor (to prevent sending commits past barrier)
+    /// This prevents duplicate global_exec_index between epochs
+    transition_barrier: Arc<AtomicU32>,
+    /// Global exec index at barrier (for commits past barrier)
+    /// Commits past barrier will be sent as one block with global_exec_index = barrier_global_exec_index + 1
+    /// Uses Arc<AtomicU64> for thread-safe access
+    global_exec_index_at_barrier: Arc<std::sync::atomic::AtomicU64>,
+    /// Queue for transactions received during barrier phase
+    /// Transactions in this queue will be submitted to consensus in the next epoch
+    pending_transactions_queue: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
 }
 
 impl ConsensusNode {
@@ -146,12 +156,27 @@ impl ConsensusNode {
         let current_commit_index = Arc::new(AtomicU32::new(0));
         let commit_index_for_callback = current_commit_index.clone();
         
+        // Create transition barrier (initialized to 0, will be set when epoch transition starts)
+        let transition_barrier = Arc::new(AtomicU32::new(0));
+        let transition_barrier_for_processor = transition_barrier.clone();
+        
+        // Create global_exec_index_at_barrier (initialized to 0, will be set when epoch transition starts)
+        // Commits past barrier will be sent as one block with global_exec_index = barrier_global_exec_index + 1
+        let global_exec_index_at_barrier = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let global_exec_index_at_barrier_for_processor = global_exec_index_at_barrier.clone();
+        
+        // Create pending transactions queue for barrier phase
+        let pending_transactions_queue = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        
         // Create ordered commit processor with commit index tracking and epoch info
         let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
             .with_commit_index_callback(move |index| {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
             })
-            .with_epoch_info(current_epoch, last_global_exec_index);
+            .with_epoch_info(current_epoch, last_global_exec_index)
+            .with_transition_barrier(transition_barrier_for_processor)
+            .with_global_exec_index_at_barrier(global_exec_index_at_barrier_for_processor)
+            .with_pending_transactions_queue(pending_transactions_queue.clone());
         
         // Add executor client if enabled (for initial startup, not just epoch transition)
         if config.executor_enabled {
@@ -697,6 +722,9 @@ impl ConsensusNode {
             registry_service,
             current_registry_id: None,
             executor_enabled: config.executor_enabled,
+            transition_barrier,
+            global_exec_index_at_barrier,
+            pending_transactions_queue,
         })
     }
 
@@ -790,6 +818,220 @@ impl ConsensusNode {
         
         // All checks passed - node is ready
         (true, "Node is ready".to_string())
+    }
+    
+    /// Check if transaction should be accepted or queued
+    /// Returns: (should_accept, should_queue, reason)
+    /// - should_accept: true if transaction should be submitted to consensus immediately
+    /// - should_queue: true if transaction should be queued for next epoch (barrier phase)
+    /// - reason: explanation string
+    pub async fn check_transaction_acceptance(&self) -> (bool, bool, String) {
+        // 1. Check if authority is initialized
+        if self.authority.is_none() {
+            return (false, false, "Node is still initializing".to_string());
+        }
+
+        // 2. Check if there's a pending transition (last_transition_hash indicates transition in progress)
+        let manager = self.epoch_change_manager.read().await;
+        
+        // 3. Check if there are pending proposals for epochs other than current_epoch + 1
+        let current_epoch = self.current_epoch;
+        let all_pending_proposals = manager.get_all_pending_proposals();
+        
+        let has_catchup_proposals = all_pending_proposals.iter().any(|p| {
+            p.new_epoch > current_epoch + 1
+        });
+        
+        if has_catchup_proposals {
+            let catchup_epochs: Vec<u64> = all_pending_proposals.iter()
+                .filter(|p| p.new_epoch > current_epoch + 1)
+                .map(|p| p.new_epoch)
+                .collect();
+            drop(manager);
+            return (false, false, format!(
+                "Node is catching up: current epoch {}, pending proposals for epochs {:?}",
+                current_epoch, catchup_epochs
+            ));
+        }
+
+        // 4. Check if transition is in progress
+        if self.last_transition_hash.is_some() {
+            drop(manager);
+            return (false, false, format!(
+                "Epoch transition in progress: epoch {} -> {} (waiting for new authority to start)",
+                current_epoch, current_epoch + 1
+            ));
+        }
+        
+        // 5. Check if we're in barrier phase (transition barrier is set)
+        // CRITICAL FIX: Once barrier is set, ALL transactions must be queued (not submitted to consensus)
+        // 
+        // PROBLEM WITH OLD LOGIC:
+        // - Old logic only queued when current_commit_index >= barrier_value
+        // - If current_commit_index < barrier_value, transactions were still submitted to consensus
+        // - But blocks might be committed at commit_index > barrier, causing transactions to be lost
+        //   (because commits past barrier send empty commits)
+        // 
+        // NEW LOGIC (FORK-SAFE):
+        // - Once barrier is set (barrier_value > 0), queue ALL transactions
+        // - This prevents transactions from being included in blocks that will be committed past barrier
+        // - Fork-safety is guaranteed because:
+        //   1. Barrier value is set from the same proposal (proposal_commit_index + 10)
+        //   2. All nodes receive the same proposal and set the same barrier value
+        //   3. All nodes will queue transactions at the same logical point (when barrier is set)
+        //   4. Queued transactions are sorted by hash and submitted deterministically in next epoch
+        // 
+        // WHY THIS IS SAFE:
+        // - Barrier is atomic (stored in AtomicU32) and set from deterministic proposal
+        // - All nodes see barrier being set at the same logical point (same proposal approval)
+        // - Even if nodes have different current_commit_index, they all queue when barrier > 0
+        // - This ensures no transactions are lost in commits past barrier
+        let barrier_value = self.transition_barrier.load(Ordering::SeqCst);
+        
+        if barrier_value > 0 {
+            // Barrier is set - we're in barrier phase
+            // CRITICAL: Queue ALL transactions to prevent loss in commits past barrier
+            // All nodes will queue transactions when barrier is set (fork-safe)
+            let current_commit_index = self.current_commit_index.load(Ordering::SeqCst);
+            drop(manager);
+            info!("🔒 [FORK-SAFETY] Queueing transaction - barrier is set (barrier={}, current_commit={}): transaction will be queued for next epoch to prevent loss in commits past barrier (all nodes use same barrier from same proposal)", 
+                barrier_value, current_commit_index);
+            return (false, true, format!(
+                "Barrier phase: barrier={} is set - transaction will be queued for next epoch (current_commit={})",
+                barrier_value, current_commit_index
+            ));
+        }
+
+        // 6. CRITICAL RACE CONDITION FIX: Check pending proposals with quorum reached
+        // If there's a pending proposal for next epoch with quorum reached and current_commit_index
+        // >= proposal.proposal_commit_index (proposal has been committed), queue transactions.
+        // This prevents race condition where:
+        // 1. Transaction is submitted to consensus
+        // 2. Proposal gets approved and barrier is set
+        // 3. Transaction gets included in block past barrier → lost
+        // 
+        // FORK-SAFETY: This is safe because:
+        // - All nodes see the same proposal with same quorum status
+        // - All nodes will queue when current_commit_index >= proposal.proposal_commit_index (deterministic)
+        // - Proposal has been committed, so this is a safe point to queue
+        // - Barrier will be set at proposal.proposal_commit_index + 10, giving us safety margin
+        // - Queued transactions are sorted by hash and submitted deterministically in next epoch
+        let current_commit_index = self.current_commit_index.load(Ordering::SeqCst);
+        let next_epoch_proposals: Vec<_> = all_pending_proposals.iter()
+            .filter(|p| p.new_epoch == current_epoch + 1)
+            .collect();
+        
+        for proposal in next_epoch_proposals {
+            // Check if proposal has quorum (2f+1 votes)
+            let quorum_status = manager.check_proposal_quorum(proposal);
+            if quorum_status == Some(true) {
+                // Quorum reached - proposal will be approved
+                // Queue transactions if proposal has been committed (current_commit_index >= proposal.proposal_commit_index)
+                // This ensures proposal is deterministic and all nodes will queue at the same point
+                if current_commit_index >= proposal.proposal_commit_index {
+                    let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
+                    
+                    // CRITICAL FIX: Set barrier EARLY when quorum reached and proposal committed
+                    // This ensures commits past barrier are skipped BEFORE they're processed
+                    // Preventing duplicate global_exec_index issues
+                    let current_barrier = self.transition_barrier.load(Ordering::SeqCst);
+                    if current_barrier == 0 {
+                        // Barrier not set yet - set it now (early)
+                        self.transition_barrier.store(transition_commit_index, Ordering::SeqCst);
+                        info!("🔒 [FORK-SAFETY] Set transition barrier EARLY to {} (quorum reached + proposal committed, current_commit={}) - commits past barrier will be skipped to prevent duplicate global_exec_index", 
+                            transition_commit_index, current_commit_index);
+                    } else if current_barrier != transition_commit_index {
+                        // Barrier already set but different - log warning
+                        warn!("⚠️ [FORK-SAFETY] Barrier already set to {} but proposal has barrier {} - using existing barrier", 
+                            current_barrier, transition_commit_index);
+                    }
+                    
+                    drop(manager);
+                    info!("🔒 [FORK-SAFETY] Queueing transaction - pending proposal with quorum reached and committed (proposal_commit_index={}, barrier={}, current_commit={}): transaction will be queued for next epoch to prevent loss in commits past barrier", 
+                        proposal.proposal_commit_index, transition_commit_index, current_commit_index);
+                    return (false, true, format!(
+                        "Barrier phase (pending): proposal with quorum reached and committed, barrier={} is set - transaction will be queued for next epoch (current_commit={})",
+                        transition_commit_index, current_commit_index
+                    ));
+                }
+            }
+        }
+
+        drop(manager);
+        
+        // All checks passed - node is ready to accept transactions
+        (true, false, "Node is ready".to_string())
+    }
+    
+    /// Queue transaction for next epoch (called during barrier phase)
+    pub async fn queue_transaction_for_next_epoch(&self, tx_data: Vec<u8>) -> Result<()> {
+        let mut queue = self.pending_transactions_queue.lock().await;
+        queue.push(tx_data);
+        info!("📦 [TX FLOW] Queued transaction for next epoch: queue_size={}", queue.len());
+        Ok(())
+    }
+    
+    /// Submit queued transactions to consensus (called after epoch transition)
+    /// CRITICAL FORK-SAFETY: Transactions are sorted by hash before submission
+    /// to ensure all nodes submit them in the same deterministic order
+    pub async fn submit_queued_transactions(&mut self) -> Result<usize> {
+        let mut queue = self.pending_transactions_queue.lock().await;
+        let original_count = queue.len();
+        if original_count == 0 {
+            return Ok(0);
+        }
+        
+        info!("📤 [TX FLOW] Submitting {} queued transactions to consensus in new epoch", original_count);
+        
+        // CRITICAL FORK-SAFETY: Sort queued transactions by hash (deterministic ordering)
+        // This ensures all nodes submit queued transactions in the same order
+        // Even if transactions were queued in different orders across nodes,
+        // sorting by hash ensures deterministic submission order
+        use crate::tx_hash::calculate_transaction_hash;
+        let mut transactions_with_hash: Vec<(Vec<u8>, Vec<u8>)> = queue
+            .iter()
+            .map(|tx_data| {
+                let tx_hash = calculate_transaction_hash(tx_data);
+                (tx_data.clone(), tx_hash)
+            })
+            .collect();
+        
+        // Sort by hash bytes (lexicographic order) - deterministic across all nodes
+        transactions_with_hash.sort_by(|(_, hash_a), (_, hash_b)| hash_a.cmp(hash_b));
+        
+        // Deduplicate by hash (deterministic after sort) to avoid submitting the same tx multiple times
+        let before_dedup = transactions_with_hash.len();
+        transactions_with_hash.dedup_by(|a, b| a.1 == b.1);
+        let unique_count = transactions_with_hash.len();
+        info!(
+            "✅ [FORK-SAFETY] Sorted queued transactions by hash and deduped: before={}, unique={}",
+            before_dedup, unique_count
+        );
+        
+        // Extract sorted transactions
+        let transactions: Vec<Vec<u8>> = transactions_with_hash
+            .into_iter()
+            .map(|(tx_data, _)| tx_data)
+            .collect();
+        
+        // Clear queue
+        queue.clear();
+        drop(queue);
+        
+        // Submit all queued transactions in deterministic order
+        for tx_data in transactions {
+            let transactions_vec = vec![tx_data];
+            if let Err(e) = self.transaction_client_proxy.submit(transactions_vec).await {
+                warn!("❌ [TX FLOW] Failed to submit queued transaction: {}", e);
+                // Continue submitting other transactions
+            }
+        }
+        
+        info!(
+            "✅ [TX FLOW] Submitted {} queued transactions to consensus in deterministic order",
+            unique_count
+        );
+        Ok(unique_count)
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -1090,21 +1332,70 @@ impl ConsensusNode {
             "  - Fork risk: ZERO (all nodes use same last_commit_index)"
         );
         
-        // 1) Graceful shutdown current authority (best-effort)
+        // 1) Set transition barrier
+        // SIMPLE APPROACH: Commits past barrier will send empty commits
+        // Transactions in these commits will be processed in the next epoch
+        // This is the simplest, most effective, fork-safe approach
+        // CRITICAL: Set barrier BEFORE graceful shutdown so CommitProcessor can check it
+        self.transition_barrier.store(transition_commit_index, Ordering::SeqCst);
+        info!(
+            "🔒 [FORK-SAFETY] Set transition barrier to {} - commits past this will send empty commits (transactions processed in next epoch)",
+            transition_commit_index
+        );
+        
+        // 3) Graceful shutdown current authority (best-effort)
         self.graceful_shutdown().await?;
 
-        // 2) Calculate new last_global_exec_index (deterministic)
-        // CRITICAL: Use transition_commit_index (barrier) as last_commit_index, NOT current_commit_index
+        // 4) Calculate new last_global_exec_index (deterministic)
+        // CRITICAL FORK-SAFETY: Use transition_commit_index (barrier) as last_commit_index, NOT current_commit_index
         // This ensures all nodes compute the same global_exec_index for new epoch
-        // Even if node A transitions at commit 622 and node B catches up and transitions at commit 700,
-        // both will use transition_commit_index (622) as last_commit_index → same global_exec_index → no fork
+        // Even if node A transitions at commit 1281 and node B catches up and transitions at commit 1283,
+        // both will use transition_commit_index (1281) as last_commit_index → same global_exec_index → no fork
+        //
+        // IMPORTANT: Commits past barrier MUST NOT be sent to Go Master (they are skipped in commit_processor)
+        // This ensures Go Master only receives commits before barrier → sequential processing → no duplicate
         let old_epoch = self.current_epoch;
-        let last_commit_index = transition_commit_index; // Use barrier, not current_commit_index!
-        let new_last_global_exec_index = calculate_global_exec_index(
+        let last_commit_index = transition_commit_index; // Use barrier, not current_commit_index! (DETERMINISTIC)
+        let new_last_global_exec_index_from_barrier = calculate_global_exec_index(
             old_epoch,
             last_commit_index,
             self.last_global_exec_index,
         );
+        
+        // CRITICAL FORK-SAFETY: All nodes MUST use the same new_last_global_exec_index (from barrier)
+        // Even if a node processed commits past barrier (e.g., 1282, 1283), we MUST use barrier value
+        // This ensures all nodes compute the same global_exec_index for the new epoch
+        let new_last_global_exec_index = new_last_global_exec_index_from_barrier;
+        
+        if commit_index_diff > 0 {
+            warn!(
+                "⚠️  FORK-SAFETY: Node processed {} commits past barrier ({} -> {})",
+                commit_index_diff,
+                transition_commit_index,
+                current_commit_index
+            );
+            warn!(
+                "   - Barrier global_exec_index: {} (USED for fork-safety - deterministic)",
+                new_last_global_exec_index_from_barrier
+            );
+            let last_sent_global_exec_index = calculate_global_exec_index(
+                old_epoch,
+                current_commit_index,
+                self.last_global_exec_index,
+            );
+            warn!(
+                "   - Last sent global_exec_index: {} (NOT USED - commits past barrier are skipped)",
+                last_sent_global_exec_index
+            );
+            warn!(
+                "   - ⚠️  Commits past barrier ({} -> {}) are skipped (NOT sent to Go Master)",
+                transition_commit_index + 1,
+                current_commit_index
+            );
+            warn!(
+                "   - ⚠️  This ensures all nodes use same new_last_global_exec_index (fork-safe)"
+            );
+        }
         
         // 📋 LOG: Deterministic values for fork-safety verification
         info!(
@@ -1147,12 +1438,31 @@ impl ConsensusNode {
             "    - New last global exec index (new epoch): {} (DETERMINISTIC - all nodes compute same)",
             new_last_global_exec_index
         );
+        // Calculate expected result using correct formula for display
+        // NOTE: commit_index starts from 1 in every epoch, so:
+        // - epoch 0: global_exec_index = commit_index
+        // - epoch N>0: global_exec_index = last_global_exec_index + commit_index
+        let expected_result = if old_epoch == 0 {
+            last_commit_index as u64
+        } else {
+            self.last_global_exec_index + last_commit_index as u64
+        };
         info!(
-            "    - Calculation: {} (old epoch) + {} (barrier commit) = {}",
+            "    - Calculation: {} (last_global_exec_index) + {} (barrier commit_index) = {}",
             self.last_global_exec_index,
             last_commit_index,
-            new_last_global_exec_index
+            expected_result
         );
+        // Verify calculation is correct (only in debug mode to avoid panic in production)
+        #[cfg(debug_assertions)]
+        {
+            if new_last_global_exec_index != expected_result {
+                warn!(
+                    "⚠️  BUG DETECTED: new_last_global_exec_index calculation mismatch! Expected {}, got {}. This may cause duplicate global_exec_index!",
+                    expected_result, new_last_global_exec_index
+                );
+            }
+        }
         if commit_index_diff > 0 {
             warn!(
                 "  ⚠️  Note: Node processed {} commits past barrier ({} -> {}), but using barrier ({}) as last_commit_index for fork-safety",
@@ -1166,7 +1476,7 @@ impl ConsensusNode {
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         );
 
-        // 3) Persist new epoch config (committee.json + epoch_timestamp_ms + last_global_exec_index)
+        // 4) Persist new epoch config (committee.json + epoch_timestamp_ms + last_global_exec_index)
         // CRITICAL FORK-SAFETY: Tất cả nodes phải ghi CÙNG data vào committee.json
         // - proposal.new_committee: Committee mới (giống nhau ở tất cả nodes vì từ cùng proposal)
         // - proposal.new_epoch_timestamp_ms: Timestamp mới (giống nhau ở tất cả nodes vì từ cùng proposal)
@@ -1193,12 +1503,12 @@ impl ConsensusNode {
             "   ⚠️  Nếu node restart sau transition, cần sync committee.json từ peers hoặc từ node đã transition"
         );
 
-        // 4) Stop old authority (in-process restart)
+        // 5) Stop old authority (in-process restart)
         if let Some(authority) = self.authority.take() {
             authority.stop().await;
         }
 
-        // 5) Update epoch and last_global_exec_index for new epoch
+        // 6) Update epoch and last_global_exec_index for new epoch
         self.current_epoch = proposal.new_epoch;
         self.last_global_exec_index = new_last_global_exec_index;
         
@@ -1218,7 +1528,7 @@ impl ConsensusNode {
             "    - Current commit index: 0 (reset for new epoch)"
         );
 
-        // 6) Reset epoch-local state (manager + commit index)
+        // 7) Reset epoch-local state (manager + commit index)
         {
             let mut mgr = self.epoch_change_manager.write().await;
             mgr.reset_for_new_epoch(
@@ -1229,7 +1539,7 @@ impl ConsensusNode {
         }
         self.current_commit_index.store(0, Ordering::SeqCst);
 
-        // 7) Create fresh per-epoch DB path (do NOT delete old epoch DB)
+        // 8) Create fresh per-epoch DB path (do NOT delete old epoch DB)
         let db_path = self
             .storage_path
             .join("epochs")
@@ -1237,7 +1547,13 @@ impl ConsensusNode {
             .join("consensus_db");
         std::fs::create_dir_all(&db_path)?;
 
-        // 8) Recreate commit consumer + commit processor for the new epoch (clean DAG/round)
+        // 9) Reset transition barrier and global_exec_index_at_barrier for new epoch
+        // (new CommitProcessor will not have barrier initially)
+        self.transition_barrier.store(0, Ordering::SeqCst);
+        self.global_exec_index_at_barrier.store(0, Ordering::SeqCst);
+        info!("🔓 [FORK-SAFETY] Reset transition barrier and global_exec_index_at_barrier to 0 for new epoch");
+        
+        // 10) Recreate commit consumer + commit processor for the new epoch (clean DAG/round)
         // NOTE: global_exec_index calculation is deterministic (all nodes compute same value)
         let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
         let commit_index_for_callback = self.current_commit_index.clone();
@@ -1265,11 +1581,19 @@ impl ConsensusNode {
             None
         };
         
+        // Create transition barrier and global_exec_index_at_barrier for new epoch
+        // (will be set when next epoch transition starts)
+        let transition_barrier_for_new_epoch = self.transition_barrier.clone();
+        let global_exec_index_at_barrier_for_new_epoch = self.global_exec_index_at_barrier.clone();
+        
         let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
             .with_commit_index_callback(move |index| {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
             })
-            .with_epoch_info(new_epoch, new_last_global_exec_index);
+            .with_epoch_info(new_epoch, new_last_global_exec_index)
+            .with_transition_barrier(transition_barrier_for_new_epoch)
+            .with_global_exec_index_at_barrier(global_exec_index_at_barrier_for_new_epoch)
+            .with_pending_transactions_queue(self.pending_transactions_queue.clone());
         
         // Add executor client if enabled
         if let Some(ref client) = executor_client {
@@ -1350,6 +1674,15 @@ impl ConsensusNode {
         let new_client = authority.transaction_client();
         self.transaction_client_proxy.set_client(new_client).await;
         self.authority = Some(authority);
+        
+        // Submit queued transactions from barrier phase to new epoch consensus
+        let queued_count = self.submit_queued_transactions().await?;
+        if queued_count > 0 {
+            info!(
+                "✅ Submitted {} queued transactions to consensus in new epoch {}",
+                queued_count, proposal.new_epoch
+            );
+        }
         
         // Clear last_transition_hash to allow new transactions after transition completes
         // This ensures transactions can be accepted again after new authority is ready
