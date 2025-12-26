@@ -37,11 +37,18 @@ Luồng giao dịch hoàn chỉnh từ sub node (Go) → consensus (Rust) → ex
 │    ↓                                                            │
 │  commit_processor.rs: process_commit()                         │
 │    ↓                                                            │
-│  executor_client.send_committed_subdag(subdag, epoch)          │
+│  Calculate global_exec_index (deterministic)                   │
+│    - Epoch 0: global_exec_index = commit_index                 │
+│    - Epoch N: global_exec_index = last_global_exec_index + commit_index │
+│    ↓                                                            │
+│  executor_client.send_committed_subdag(subdag, epoch, global_exec_index) │
 │    ↓                                                            │
 │  convert_to_protobuf():                                         │
 │    - Extract tx.data() (raw bytes) từ mỗi transaction         │
-│    - Tạo CommittedEpochData protobuf                           │
+│    - Tạo CommittedEpochData protobuf với:                      │
+│      * global_exec_index (CRITICAL FORK-SAFETY)                 │
+│      * commit_index (epoch-local)                              │
+│      * epoch                                                    │
 │    - Gửi qua UDS (/tmp/executor0.sock)                         │
 └───────────────────────┬─────────────────────────────────────────┘
                         │
@@ -195,7 +202,7 @@ fn convert_to_protobuf(&self, subdag: &CommittedSubDag, epoch: u64) -> Result<Ve
 **Protocol:**
 - Uvarint length prefix + Protobuf `CommittedEpochData` message
 
-### Bước 4: Go Master Executor nhận và thực thi
+### Bước 4: Go Master Executor nhận và thực thi (Sequential Processing)
 
 **Files:**
 - `mtn-simple-2025/executor/listener.go`
@@ -203,12 +210,25 @@ fn convert_to_protobuf(&self, subdag: &CommittedSubDag, epoch: u64) -> Result<Ve
 
 **Luồng:**
 1. `executor.Listener` lắng nghe trên `/tmp/executor0.sock`
-2. Nhận `CommittedEpochData` protobuf message
-3. Unmarshal và extract transactions:
+2. **CRITICAL FORK-SAFETY: Initialize nextExpectedGlobalExecIndex từ DB**
+   - `nextExpectedGlobalExecIndex = lastBlockNumber + 1`
+   - Đảm bảo continuous progress sau restart
+3. Nhận `CommittedEpochData` protobuf message với:
+   - `global_exec_index` (CRITICAL FORK-SAFETY)
+   - `commit_index` (epoch-local)
+   - `epoch`
+4. **CRITICAL FORK-SAFETY: Sequential processing**
+   - Chỉ xử lý khi `global_exec_index == nextExpectedGlobalExecIndex`
+   - Out-of-order blocks → buffer trong `pendingBlocks`
+   - Skipped commits → buffer trong `skippedCommitsWithTxs` (retention: 100 commits)
+5. Unmarshal và extract transactions:
    - `ms.Digest` chứa transaction data (raw bytes)
    - `transaction.UnmarshalTransactions(ms.Digest)` → `[]types.Transaction`
-4. Process transactions: `ProcessTransactions(allTransactions)`
-5. Execute và cập nhật state
+6. Process transactions: `ProcessTransactions(allTransactions)`
+7. Execute và cập nhật state
+8. **Update nextExpectedGlobalExecIndex**
+   - `nextExpectedGlobalExecIndex = globalExecIndex + 1`
+   - Process pending blocks nếu có
 
 **Code:**
 ```go
@@ -217,19 +237,36 @@ func (bp *BlockProcessor) runSocketExecutor(socketID int) {
     listener := executor.NewListener(socketID) // socketID = 0
     listener.Start() // Lắng nghe /tmp/executor0.sock
     
+    // CRITICAL FORK-SAFETY: Initialize nextExpectedGlobalExecIndex from DB
+    var nextExpectedGlobalExecIndex uint64
+    lastBlockFromDB := bp.GetLastBlock()
+    if lastBlockFromDB != nil {
+        nextExpectedGlobalExecIndex = lastBlockFromDB.Header().BlockNumber() + 1
+    }
+    
+    // Buffering for out-of-order and skipped commits
+    pendingBlocks := make(map[uint64]*pb.CommittedEpochData)
+    skippedCommitsWithTxs := make(map[uint64]*pb.CommittedEpochData)
+    
     dataChan := listener.DataChannel()
     for epochData := range dataChan {
-        for _, block := range epochData.Blocks {
-            var allTransactions []types.Transaction
-            for _, ms := range block.Transactions {
-                // ms.Digest chứa transaction data (raw bytes)
-                transactions, _ := transaction.UnmarshalTransactions(ms.Digest)
-                allTransactions = append(allTransactions, transactions...)
+        globalExecIndex := epochData.GetGlobalExecIndex()
+        commitIndex := epochData.GetCommitIndex()
+        
+        // CRITICAL FORK-SAFETY: Sequential processing
+        if globalExecIndex == nextExpectedGlobalExecIndex {
+            // Process immediately
+            // ... extract transactions and process ...
+            nextExpectedGlobalExecIndex = globalExecIndex + 1
+            // Process pending blocks if any
+        } else if globalExecIndex > nextExpectedGlobalExecIndex {
+            // Out-of-order: buffer for later
+            pendingBlocks[globalExecIndex] = epochData
+        } else {
+            // Skipped commit: buffer if within retention window
+            if globalExecIndex >= nextExpectedGlobalExecIndex - 100 {
+                skippedCommitsWithTxs[globalExecIndex] = epochData
             }
-            
-            // Process và execute transactions
-            accumulatedResults, _ := bp.transactionProcessor.ProcessTransactions(allTransactions)
-            // ... tạo block và cập nhật state ...
         }
     }
 }

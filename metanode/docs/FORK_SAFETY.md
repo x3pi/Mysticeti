@@ -1,8 +1,10 @@
-# Fork-Safety trong Epoch Transition
+# Fork-Safety và Progress Guarantee
 
 ## Tổng quan
 
-Fork-safety đảm bảo tất cả nodes transition sang epoch mới với **cùng state**, tránh fork (nodes ở cùng epoch nhưng có state khác nhau).
+Tài liệu này mô tả các cơ chế đảm bảo:
+1. **Fork-safety**: Tất cả nodes transition sang epoch mới với **cùng state**, tránh fork (nodes ở cùng epoch nhưng có state khác nhau)
+2. **Progress guarantee**: Hệ thống luôn tiến về phía trước (không bị stuck)
 
 ## Vấn đề Fork
 
@@ -30,7 +32,33 @@ Cả hai nodes đều ở epoch 3, nhưng có `last_global_exec_index` khác nha
 
 ## Fork-Safety Mechanisms
 
-### 1. Commit Index Barrier
+### 1. Global Execution Index - Deterministic Calculation
+
+**File**: `metanode/src/checkpoint.rs`
+
+```rust
+pub fn calculate_global_exec_index(
+    epoch: u64,
+    commit_index: u32,
+    last_global_exec_index: u64,
+) -> u64 {
+    if epoch == 0 {
+        commit_index as u64
+    } else {
+        last_global_exec_index + commit_index as u64
+    }
+}
+```
+
+**Đảm bảo Fork-Safety:**
+- ✅ Tất cả nodes tính cùng giá trị từ cùng inputs (`epoch`, `commit_index`, `last_global_exec_index`)
+- ✅ **Deterministic**: Không phụ thuộc vào timing hay network
+
+**Đảm bảo Progress:**
+- ✅ `global_exec_index` luôn tăng (không reset giữa các epoch)
+- ✅ Mỗi epoch tiếp tục từ `last_global_exec_index`
+
+### 2. Commit Index Barrier
 
 **Vấn đề:**
 - Node A transition ở commit 622
@@ -43,37 +71,112 @@ Cả hai nodes đều ở epoch 3, nhưng có `last_global_exec_index` khác nha
 
 **Code:**
 ```rust
-let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
-ensure!(
-    current_commit_index >= transition_commit_index,
-    "FORK-SAFETY: Must wait until commit index {} (current: {})",
-    transition_commit_index,
-    current_commit_index
-);
+// Early barrier setting: khi proposal đạt quorum và đã committed
+if quorum_status == Some(true) {
+    if current_commit_index >= proposal.proposal_commit_index {
+        let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
+        self.transition_barrier.store(transition_commit_index, Ordering::SeqCst);
+    }
+}
 
 // Use barrier as last_commit_index (deterministic)
 let last_commit_index = transition_commit_index; // NOT current_commit_index!
 ```
 
-### 2. Deterministic Global Execution Index
+**Fork-Safety:**
+- ✅ Tất cả nodes set cùng barrier: `barrier = proposal_commit_index + 10`
+- ✅ **Deterministic**: Tất cả nodes tính cùng giá trị
 
-**Vấn đề:**
-- Nếu nodes dùng `current_commit_index` khác nhau → `global_exec_index` khác nhau → Fork
+**Progress Guarantee:**
+- ✅ Barrier chỉ skip commits **past barrier**
+- ✅ Commits **before barrier** vẫn được xử lý bình thường
+- ✅ **Timeout exception**: Nếu barrier không đạt sau 5 phút, cho phép transition (vẫn dùng barrier làm last_commit_index)
 
-**Giải pháp:**
-- Tất cả nodes dùng **cùng `last_commit_index`** (barrier) để tính `global_exec_index`
-- Công thức: `global_exec_index = last_global_exec_index + last_commit_index`
+### 3. Commit Processor - Skip Commits Past Barrier
 
-**Code:**
+**File**: `metanode/src/commit_processor.rs`
+
 ```rust
+// Check barrier BEFORE calculating global_exec_index
+let (is_past_barrier, barrier_value) = if let Some(barrier) = transition_barrier.as_ref() {
+    let barrier_val = barrier.load(Ordering::Relaxed);
+    let effective_barrier = if barrier_val > 0 { barrier_val } else { barrier_snapshot };
+    (effective_barrier > 0 && commit_index > effective_barrier, effective_barrier)
+} else {
+    (false, 0)
+};
+
+if is_past_barrier {
+    // Skip commit entirely, don't calculate global_exec_index
+    // Re-queue transactions for next epoch
+    next_expected_index += 1;
+    continue; // Skip this commit
+}
+```
+
+**Fork-Safety:**
+- ✅ Tất cả nodes skip cùng commits past barrier (deterministic)
+- ✅ Transactions được re-queue deterministically
+
+**Progress Guarantee:**
+- ✅ `next_expected_index` vẫn tăng (advance để xử lý commit tiếp theo)
+- ✅ Commits before barrier vẫn được xử lý
+- ✅ **Không stuck**: Hệ thống tiếp tục xử lý commits sau barrier
+
+### 4. Epoch Transition - Deterministic Last Commit Index
+
+**File**: `metanode/src/node.rs`
+
+```rust
+// CRITICAL FORK-SAFETY: Use transition_commit_index (barrier) as last_commit_index
+// NOT current_commit_index!
+let last_commit_index = transition_commit_index; // Use barrier, not current_commit_index!
 let new_last_global_exec_index = calculate_global_exec_index(
     old_epoch,
-    last_commit_index,  // Use barrier, not current_commit_index!
-    self.last_global_exec_index,
+    last_commit_index,
+    self.last_global_exec_index
 );
 ```
 
-### 3. Quorum Validation
+**Fork-Safety:**
+- ✅ Tất cả nodes dùng cùng `last_commit_index` (barrier) → cùng `new_last_global_exec_index`
+- ✅ **Không fork**: Tất cả nodes transition với cùng state
+
+**Progress Guarantee:**
+- ✅ `last_global_exec_index` được tính từ barrier (deterministic)
+- ✅ Epoch mới tiếp tục từ `new_last_global_exec_index`
+- ✅ **Không reset**: Global_exec_index tiếp tục tăng
+
+### 5. Go Master - Sequential Processing
+
+**File**: `mtn-simple-2025/cmd/simple_chain/processor/block_processor.go`
+
+```go
+// Initialize from last block in DB
+var nextExpectedGlobalExecIndex uint64
+lastBlockFromDB := bp.GetLastBlock()
+if lastBlockFromDB != nil {
+    nextExpectedGlobalExecIndex = lastBlockFromDB.Header().BlockNumber() + 1
+}
+
+// Only process when global_exec_index == nextExpectedGlobalExecIndex
+if globalExecIndex == nextExpectedGlobalExecIndex {
+    // Process block
+    nextExpectedGlobalExecIndex = globalExecIndex + 1
+}
+```
+
+**Fork-Safety:**
+- ✅ Tất cả Go Masters xử lý cùng thứ tự (sequential)
+- ✅ Chỉ xử lý khi `global_exec_index == nextExpectedGlobalExecIndex`
+- ✅ Out-of-order blocks được buffer, xử lý khi đến lượt
+
+**Progress Guarantee:**
+- ✅ `nextExpectedGlobalExecIndex` luôn tăng sau mỗi block
+- ✅ Out-of-order blocks được buffer, xử lý khi đến lượt
+- ✅ **Retention policy**: Skipped commits được lưu tạm (100 commits) để xử lý nếu đến muộn
+
+### 6. Quorum Validation
 
 **Vấn đề:**
 - Nếu một node transition mà các nodes khác không → Fork
@@ -90,7 +193,7 @@ ensure!(
 );
 ```
 
-### 4. Vote Propagation
+### 7. Vote Propagation
 
 **Vấn đề:**
 - Node A đạt quorum và dừng broadcast votes
@@ -100,70 +203,22 @@ ensure!(
 - Votes tiếp tục được broadcast ngay cả sau khi đạt quorum
 - Đảm bảo tất cả nodes đều thấy quorum
 
-**Code:**
-```rust
-// CRITICAL FIX: Continue broadcasting votes even after quorum is reached!
-// This ensures all nodes see quorum and can transition together.
-pub fn get_pending_votes_to_broadcast(&self) -> Vec<EpochChangeVote> {
-    // Always broadcast votes, even if quorum is reached
-    // This ensures all nodes can see quorum and transition together
-    let mut out = Vec::new();
-    for proposal in self.pending_proposals.values() {
-        let proposal_hash = self.hash_proposal(proposal);
-        if let Some(votes_by_voter) = self.proposal_votes.get(&proposal_hash) {
-            out.extend(votes_by_voter.values().cloned());
-        }
-    }
-    out
-}
-```
+### 8. Adaptive Sync Mode
 
-### 5. Proposal Hash Consistency
+**File**: `metanode/meta-consensus/core/src/commit_syncer.rs`
 
-**Vấn đề:**
-- Nếu proposal hash khác nhau giữa các nodes → votes không được count → không đạt quorum
+Khi node lag quá xa (>50 commits hoặc >5%), hệ thống tự động:
+- Tăng batch size (1.5x hoặc 2x)
+- Tăng parallel fetches (1.5x)
+- Giảm check interval (1s thay vì 2s)
 
-**Giải pháp:**
-- Verify proposal hash được tính giống nhau ở tất cả nodes
-- Hash được tính từ các field deterministic
+**Fork-Safety:**
+- ✅ Sync chỉ fetch commits từ peers (verified)
+- ✅ **Deterministic**: Tất cả nodes process cùng commits
 
-**Code:**
-```rust
-pub fn hash_proposal(&self, proposal: &EpochChangeProposal) -> Vec<u8> {
-    // Hash từ các field deterministic:
-    // - new_epoch
-    // - new_committee.epoch()
-    // - new_epoch_timestamp_ms
-    // - proposal_commit_index
-    // - proposer().value()
-    let proposal_data = format!(
-        "{}-{}-{}-{}-{}",
-        proposal.new_epoch,
-        proposal.new_committee.epoch(),
-        proposal.new_epoch_timestamp_ms,
-        proposal.proposal_commit_index,
-        proposal.proposer().value()
-    );
-    Blake2b256::digest(proposal_data.as_bytes()).to_vec()
-}
-```
-
-### 6. Timestamp Consistency
-
-**Vấn đề:**
-- Nếu `epoch_timestamp_ms` khác nhau → genesis blocks có hash khác nhau → Fork
-
-**Giải pháp:**
-- Tất cả nodes dùng cùng `epoch_timestamp_ms` từ proposal
-- Sync timestamp khi catch-up
-
-**Code:**
-```rust
-// Sync timestamp from proposal if catch-up scenario
-if is_catchup {
-    self.epoch_start_timestamp_ms = proposal.new_epoch_timestamp_ms;
-}
-```
+**Progress Guarantee:**
+- ✅ Node sẽ catch-up với quorum
+- ✅ **Không stuck**: Adaptive sync đảm bảo catch-up
 
 ## Fork-Safety Validations
 
@@ -175,6 +230,17 @@ Khi transition, hệ thống thực hiện các validation sau:
 4. ✅ **Deterministic global_exec_index**: Tính từ cùng `last_commit_index`
 5. ✅ **Proposal Hash Consistency**: Verify hash giống nhau
 6. ✅ **Timestamp Consistency**: Verify timestamp giống nhau
+
+## Progress Guarantees
+
+Hệ thống đảm bảo luôn tiến về phía trước:
+
+1. ✅ **Global_exec_index luôn tăng**: Không reset giữa các epoch
+2. ✅ **nextExpectedGlobalExecIndex luôn tăng**: Sau mỗi block
+3. ✅ **Skip commits không block progress**: Advance index để xử lý commit tiếp theo
+4. ✅ **Out-of-order handling**: Blocks được buffer, xử lý khi đến lượt
+5. ✅ **Sync mode**: Đảm bảo catch-up khi lag
+6. ✅ **Timeout exception**: Cho phép epoch transition sau 5 phút nếu barrier không đạt
 
 ## Logging và Verification
 
@@ -222,13 +288,9 @@ Hệ thống log chi tiết các giá trị deterministic:
 ### Verification Script
 
 Sử dụng `./scripts/analysis/verify_epoch_transition.sh` để verify fork-safety:
-# hoặc (với symlink)
-./verify_epoch_transition.sh
 
 ```bash
 ./scripts/analysis/verify_epoch_transition.sh
-# hoặc (với symlink)
-./verify_epoch_transition.sh
 ```
 
 Script sẽ:
@@ -243,8 +305,6 @@ Script sẽ:
 ```bash
 # Sau mỗi epoch transition, chạy:
 ./scripts/analysis/verify_epoch_transition.sh
-# hoặc (với symlink)
-./verify_epoch_transition.sh
 ```
 
 ### 2. Monitor logs
@@ -271,8 +331,6 @@ Nếu một node restart sau transition, cần sync `committee.json` từ peers:
 # Copy từ node đã transition
 cp config/committee_node_0.json config/committee_node_1.json
 ./scripts/node/restart_node.sh 1
-# hoặc (với symlink)
-./restart_node.sh 1
 ```
 
 ## Troubleshooting
@@ -300,9 +358,33 @@ cp config/committee_node_0.json config/committee_node_1.json
 2. Đảm bảo tất cả nodes online vote
 3. Với 3 nodes online, cần 100% nodes vote (3/3)
 
+### Node bị stuck
+
+**Triệu chứng:**
+- Node không process commits
+- `nextExpectedGlobalExecIndex` không tăng
+
+**Giải pháp:**
+1. Kiểm tra logs để xem có out-of-order blocks không
+2. Kiểm tra sync mode có được kích hoạt không
+3. Restart node nếu cần
+
+## Tổng kết
+
+✅ **Hệ thống đảm bảo fork-safety và progress**:
+- Deterministic calculations
+- Sequential processing
+- Proper barrier handling
+- Adaptive sync mode
+- Comprehensive error handling
+
+Hệ thống được thiết kế để:
+1. **Luôn tiến về phía trước** (không bị stuck)
+2. **Không có fork** (tất cả nodes có cùng state)
+
 ## Tham khảo
 
 - [EPOCH.md](./EPOCH.md) - Epoch transition mechanism
 - [QUORUM_LOGIC.md](./QUORUM_LOGIC.md) - Quorum logic
 - [EPOCH_PRODUCTION.md](./EPOCH_PRODUCTION.md) - Production best practices
-
+- [SYNC_MODE_IMPROVEMENTS.md](./SYNC_MODE_IMPROVEMENTS.md) - Adaptive sync mode

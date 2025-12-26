@@ -11,13 +11,15 @@ Tài liệu chi tiết về hệ thống MetaNode Consensus Engine.
 - [ARCHITECTURE.md](./ARCHITECTURE.md) - Kiến trúc hệ thống và các thành phần
 - [CONSENSUS.md](./CONSENSUS.md) - Cơ chế consensus và DAG
 - [TRANSACTIONS.md](./TRANSACTIONS.md) - Xử lý transactions và commit processing
+- [TRANSACTION_FLOW.md](./TRANSACTION_FLOW.md) - Luồng transaction từ Go Sub Node → Rust Consensus → Go Master
 - [RPC_API.md](./RPC_API.md) - RPC API documentation
 - [COMMITTEE.md](./COMMITTEE.md) - Giải thích về committee.json và cấu hình authorities
 - [RECOVERY.md](./RECOVERY.md) - Recovery process và commit replay khi khởi động
 - [EPOCH.md](./EPOCH.md) - Epoch và cách triển khai epoch transition (bao gồm dữ liệu reset/preserved)
 - [EPOCH_PRODUCTION.md](./EPOCH_PRODUCTION.md) - Best practices cho epoch transition trong production
-- [FORK_SAFETY.md](./FORK_SAFETY.md) - Fork-safety mechanisms và verification
+- [FORK_SAFETY.md](./FORK_SAFETY.md) - Fork-safety mechanisms, progress guarantee và verification
 - [QUORUM_LOGIC.md](./QUORUM_LOGIC.md) - Logic quorum cho epoch transition
+- [SYNC_MODE_IMPROVEMENTS.md](./SYNC_MODE_IMPROVEMENTS.md) - Adaptive sync mode cho lagging nodes
 - [BCS_BACKWARD_COMPATIBILITY.md](./BCS_BACKWARD_COMPATIBILITY.md) - BCS backward compatibility và migration strategy
 
 ### Hướng dẫn sử dụng

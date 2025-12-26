@@ -110,6 +110,10 @@ pub(crate) struct CommitSyncer<C: NetworkClient> {
     last_schedule_log_at: tokio::time::Instant,
     last_logged_quorum_commit_index: CommitIndex,
     last_logged_local_commit_index: CommitIndex,
+    
+    // --- sync mode detection ---
+    is_sync_mode: bool, // True when node is in aggressive sync mode due to significant lag
+    last_sync_mode_log_at: tokio::time::Instant,
 }
 
 impl<C: NetworkClient> CommitSyncer<C> {
@@ -145,6 +149,8 @@ impl<C: NetworkClient> CommitSyncer<C> {
             last_schedule_log_at: tokio::time::Instant::now() - Duration::from_secs(300),
             last_logged_quorum_commit_index: 0,
             last_logged_local_commit_index: 0,
+            is_sync_mode: false,
+            last_sync_mode_log_at: tokio::time::Instant::now() - Duration::from_secs(300),
         }
     }
 
@@ -158,13 +164,44 @@ impl<C: NetworkClient> CommitSyncer<C> {
     }
 
     async fn schedule_loop(mut self, mut rx_shutdown: oneshot::Receiver<()>) {
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        // ADAPTIVE SYNC: Use shorter interval when in sync mode for faster response
+        let base_interval = Duration::from_secs(2);
+        let fast_interval = Duration::from_secs(1);
+        let mut current_interval_duration = base_interval;
+        let mut interval = tokio::time::interval(base_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut last_interval_check = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
                 // Periodically, schedule new fetches if the node is falling behind.
                 _ = interval.tick() => {
+                    // ADAPTIVE SYNC: Adjust interval based on sync mode
+                    // In sync mode, check more frequently (every 1 second instead of 2)
+                    let now = tokio::time::Instant::now();
+                    if now.duration_since(last_interval_check) >= Duration::from_secs(5) {
+                        // Check every 5 seconds if we should adjust interval
+                        let quorum_commit_index = self.inner.commit_vote_monitor.quorum_commit_index();
+                        let local_commit_index = self.inner.dag_state.read().last_commit_index();
+                        let lag = quorum_commit_index.saturating_sub(local_commit_index);
+                        let should_use_fast_interval = lag > 50 || (quorum_commit_index > 0 && 
+                            (lag as f64 / quorum_commit_index as f64) > 0.05);
+                        
+                        if should_use_fast_interval && current_interval_duration == base_interval {
+                            // Switch to faster interval (1 second)
+                            current_interval_duration = fast_interval;
+                            interval = tokio::time::interval(fast_interval);
+                            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                            info!("⚡ [SYNC-MODE] Switching to fast sync interval (1s) due to lag={}", lag);
+                        } else if !should_use_fast_interval && current_interval_duration == fast_interval {
+                            // Switch back to normal interval (2 seconds)
+                            current_interval_duration = base_interval;
+                            interval = tokio::time::interval(base_interval);
+                            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                            info!("✅ [SYNC-MODE] Switching back to normal interval (2s) - lag reduced to {}", lag);
+                        }
+                        last_interval_check = now;
+                    }
                     self.try_schedule_once();
                 }
                 // Handles results from fetch tasks.
@@ -223,6 +260,61 @@ impl<C: NetworkClient> CommitSyncer<C> {
             Duration::from_secs(30)
         };
         let lag_jump = lag > last_lag + (unhandled_commits_threshold / 2).max(1);
+        
+        // CRITICAL: Detect significant lag and enter sync mode
+        // Thresholds for sync mode:
+        // - MODERATE_LAG: 50 commits or 5% behind quorum -> enter sync mode
+        // - SEVERE_LAG: 200 commits or 10% behind quorum -> aggressive sync mode
+        const MODERATE_LAG_THRESHOLD: u32 = 50; // Enter sync mode if lag > 50 commits
+        const SEVERE_LAG_THRESHOLD: u32 = 200; // Aggressive sync mode if lag > 200 commits
+        const MODERATE_LAG_PERCENTAGE: f64 = 5.0; // Enter sync mode if lag > 5% of quorum
+        const SEVERE_LAG_PERCENTAGE: f64 = 10.0; // Aggressive sync mode if lag > 10% of quorum
+        
+        let lag_percentage = if quorum_commit_index > 0 {
+            (lag as f64 / quorum_commit_index as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        // Determine if we should be in sync mode
+        let should_be_in_sync_mode = lag > MODERATE_LAG_THRESHOLD || lag_percentage > MODERATE_LAG_PERCENTAGE;
+        let is_severe_lag = lag > SEVERE_LAG_THRESHOLD || lag_percentage > SEVERE_LAG_PERCENTAGE;
+        
+        // Log sync mode transition
+        if should_be_in_sync_mode != self.is_sync_mode {
+            self.is_sync_mode = should_be_in_sync_mode;
+            if should_be_in_sync_mode {
+                tracing::warn!(
+                    "🔄 [SYNC-MODE] Entering sync mode: lag={} commits ({}% behind quorum), local_commit={}, quorum_commit={}, synced_commit={}",
+                    lag, lag_percentage, local_commit_index, quorum_commit_index, self.synced_commit_index
+                );
+            } else {
+                info!(
+                    "✅ [SYNC-MODE] Exiting sync mode: lag={} commits ({}% behind quorum), local_commit={}, quorum_commit={}",
+                    lag, lag_percentage, local_commit_index, quorum_commit_index
+                );
+            }
+            self.last_sync_mode_log_at = now;
+        }
+        
+        // Log significant lag warnings (throttled)
+        if lag > MODERATE_LAG_THRESHOLD {
+            if now.duration_since(self.last_sync_mode_log_at) >= Duration::from_secs(10) {
+                if is_severe_lag {
+                    tracing::error!(
+                        "🚨 [LAG-DETECTION] Node is severely lagging: lag={} commits ({}% behind quorum), local_commit={}, quorum_commit={}, synced_commit={}",
+                        lag, lag_percentage, local_commit_index, quorum_commit_index, self.synced_commit_index
+                    );
+                } else {
+                    tracing::warn!(
+                        "⚠️  [LAG-DETECTION] Node is lagging significantly: lag={} commits ({}% behind quorum), local_commit={}, quorum_commit={}, synced_commit={}",
+                        lag, lag_percentage, local_commit_index, quorum_commit_index, self.synced_commit_index
+                    );
+                }
+                self.last_sync_mode_log_at = now;
+            }
+        }
+        
         if now.duration_since(self.last_schedule_log_at) >= min_interval
             || lag_jump
             || quorum_commit_index != self.last_logged_quorum_commit_index && lag > 0 && now.duration_since(self.last_schedule_log_at) >= Duration::from_secs(10)
@@ -245,13 +337,34 @@ impl<C: NetworkClient> CommitSyncer<C> {
         let fetch_after_index = self
             .synced_commit_index
             .max(self.highest_scheduled_index.unwrap_or(0));
+        
+        // ADAPTIVE SYNC: Adjust batch size and scheduling based on lag severity
+        // When in sync mode, use larger batches and more aggressive scheduling
+        let base_batch_size = self.inner.context.parameters.commit_sync_batch_size;
+        let lag_percentage_for_batch = if quorum_commit_index > 0 {
+            (lag as f64 / quorum_commit_index as f64) * 100.0
+        } else {
+            0.0
+        };
+        let effective_batch_size = if self.is_sync_mode {
+            // In sync mode: use larger batches for faster catch-up
+            // Moderate lag: 1.5x batch size, Severe lag: 2x batch size
+            if lag > 200 || lag_percentage_for_batch > 10.0 {
+                base_batch_size * 2 // Aggressive: 2x batch size
+            } else {
+                base_batch_size + base_batch_size / 2 // Moderate: 1.5x batch size
+            }
+        } else {
+            base_batch_size // Normal mode: use configured batch size
+        };
+        
         // When the node is falling behind, schedule pending fetches which will be executed on later.
         for prev_end in (fetch_after_index..=quorum_commit_index)
-            .step_by(self.inner.context.parameters.commit_sync_batch_size as usize)
+            .step_by(effective_batch_size as usize)
         {
             // Create range with inclusive start and end.
             let range_start = prev_end + 1;
-            let range_end = prev_end + self.inner.context.parameters.commit_sync_batch_size;
+            let range_end = prev_end + effective_batch_size;
             // Commit range is not fetched when [range_start, range_end] contains less number of commits
             // than the target batch size. This is to avoid the cost of processing more and smaller batches.
             // Block broadcast, subscription and synchronization will help the node catchup.
@@ -259,11 +372,19 @@ impl<C: NetworkClient> CommitSyncer<C> {
                 break;
             }
             // Pause scheduling new fetches when handling of commits is lagging.
-            if highest_handled_index + unhandled_commits_threshold < range_end {
-                warn!(
-                    "Skip scheduling new commit fetches: consensus handler is lagging. highest_handled_index={}, highest_scheduled_index={}",
-                    highest_handled_index, highest_scheduled_index
-                );
+            // In sync mode, be more lenient with the threshold to allow more aggressive fetching
+            let effective_threshold = if self.is_sync_mode {
+                unhandled_commits_threshold * 2 // Allow more unhandled commits in sync mode
+            } else {
+                unhandled_commits_threshold
+            };
+            if highest_handled_index + effective_threshold < range_end {
+                if !self.is_sync_mode {
+                    warn!(
+                        "Skip scheduling new commit fetches: consensus handler is lagging. highest_handled_index={}, highest_scheduled_index={}",
+                        highest_handled_index, highest_scheduled_index
+                    );
+                }
                 break;
             }
             self.pending_fetches
@@ -415,11 +536,17 @@ impl<C: NetworkClient> CommitSyncer<C> {
         // Cap parallel fetches based on configured limit and committee size, to avoid overloading the network.
         // Also when there are too many fetched blocks that cannot be sent to Core before an earlier fetch
         // has not finished, reduce parallelism so the earlier fetch can retry on a better host and succeed.
-        let target_parallel_fetches = self
-            .inner
-            .context
-            .parameters
-            .commit_sync_parallel_fetches
+        // ADAPTIVE SYNC: Increase parallelism when in sync mode
+        let base_parallel_fetches = self.inner.context.parameters.commit_sync_parallel_fetches;
+        let effective_parallel_fetches = if self.is_sync_mode {
+            // In sync mode: increase parallelism for faster catch-up
+            // Use up to 1.5x the configured parallel fetches, but cap at committee size
+            (base_parallel_fetches + base_parallel_fetches / 2).min(self.inner.context.committee.size())
+        } else {
+            base_parallel_fetches
+        };
+        
+        let target_parallel_fetches = effective_parallel_fetches
             .min(self.inner.context.committee.size() * 2 / 3)
             .min(
                 self.inner
