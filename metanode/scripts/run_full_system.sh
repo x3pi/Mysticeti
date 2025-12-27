@@ -83,7 +83,8 @@ rm -f /tmp/rust-go.sock_1 /tmp/rust-go.sock_2 2>/dev/null || true
 print_info "  ✅ Đã cleanup sockets /tmp"
 
 # Clean Go sample data (bao gồm cả logs và tất cả dữ liệu)
-print_info "🧹 Xóa dữ liệu Go sample (bao gồm cả logs)..."
+# CRITICAL: Phải xóa HOÀN TOÀN để đảm bảo Go init genesis block mới
+print_info "🧹 Xóa dữ liệu Go sample HOÀN TOÀN (bao gồm cả logs và database blocks)..."
 if [ -d "$GO_PROJECT_ROOT/cmd/simple_chain/sample" ]; then
     print_info "  - Xóa: $GO_PROJECT_ROOT/cmd/simple_chain/sample"
     rm -rf "$GO_PROJECT_ROOT/cmd/simple_chain/sample"
@@ -101,11 +102,62 @@ else
     print_info "  ℹ️  Logs directory không tồn tại, bỏ qua"
 fi
 
+# CRITICAL: Xóa cả database blocks nếu tồn tại (để đảm bảo Go init genesis mới)
+# Note: Blocks database có thể tồn tại ngay cả sau khi xóa sample directory
+# Phải xóa TRƯỚC khi tạo lại sample directory
+print_info "🧹 Xóa database blocks cũ (nếu có) để đảm bảo Go init genesis mới..."
+BLOCK_DB_PATHS=(
+    "$GO_PROJECT_ROOT/cmd/simple_chain/sample/simple/data/data/blocks"
+    "$GO_PROJECT_ROOT/cmd/simple_chain/sample/simple/data-write/data/blocks"
+)
+for block_db_path in "${BLOCK_DB_PATHS[@]}"; do
+    if [ -d "$block_db_path" ]; then
+        print_info "  - Xóa: $block_db_path"
+        rm -rf "$block_db_path"
+        print_info "  ✅ Đã xóa block database"
+    fi
+done
+
+# CRITICAL: Sau khi tạo lại sample directory, đảm bảo blocks directory không tồn tại
+# (có thể được tạo lại tự động, cần xóa lại)
+print_info "🧹 Đảm bảo blocks directory không tồn tại sau khi tạo lại sample..."
+for block_db_path in "${BLOCK_DB_PATHS[@]}"; do
+    if [ -d "$block_db_path" ]; then
+        print_info "  - Xóa lại: $block_db_path (đã được tạo lại tự động)"
+        rm -rf "$block_db_path"
+        print_info "  ✅ Đã xóa lại block database"
+    fi
+done
+
 # Recreate sample directory structure (cần thiết cho Go nodes)
-print_info "📁 Tạo lại cấu trúc thư mục sample..."
+# CRITICAL: Tạo lại EMPTY directory để Go init genesis block mới
+print_info "📁 Tạo lại cấu trúc thư mục sample RỖNG (để Go init genesis mới)..."
 mkdir -p "$GO_PROJECT_ROOT/cmd/simple_chain/sample/simple/data/data/xapian_node"
 mkdir -p "$GO_PROJECT_ROOT/cmd/simple_chain/sample/simple/data-write/data/xapian_node"
-print_info "  ✅ Đã tạo lại cấu trúc thư mục sample"
+print_info "  ✅ Đã tạo lại cấu trúc thư mục sample (rỗng)"
+
+# CRITICAL: Xóa lại blocks directory SAU KHI tạo lại sample (có thể được tạo lại tự động)
+print_info "🧹 Xóa lại blocks directory (nếu có) để đảm bảo Go init genesis mới..."
+for block_db_path in "${BLOCK_DB_PATHS[@]}"; do
+    if [ -d "$block_db_path" ]; then
+        print_info "  - Xóa lại: $block_db_path (có thể được tạo lại tự động)"
+        rm -rf "$block_db_path"
+        print_info "  ✅ Đã xóa lại block database"
+    fi
+done
+
+# Final verification: Đảm bảo blocks directory không tồn tại
+print_info "🔍 Kiểm tra cuối cùng: blocks directory không tồn tại..."
+for block_db_path in "${BLOCK_DB_PATHS[@]}"; do
+    if [ -d "$block_db_path" ]; then
+        print_error "  ❌ Blocks directory vẫn tồn tại: $block_db_path"
+        print_error "     Xóa thủ công và chạy lại script"
+        exit 1
+    else
+        print_info "  ✅ Blocks directory không tồn tại: $block_db_path"
+    fi
+done
+print_info "  💡 Go sẽ init genesis block mới với validators từ genesis.json"
 
 # Clean Rust storage data
 print_info "🧹 Xóa dữ liệu Rust storage..."
@@ -259,7 +311,14 @@ cd "$METANODE_ROOT" || exit 1
 # Optional: force a full rebuild to avoid using stale incremental artifacts
 if [ "$FULL_CLEAN_BUILD" = "1" ]; then
     print_info "🧹 FULL_CLEAN_BUILD=1 → chạy cargo clean để đảm bảo rebuild 100%..."
-    cargo clean
+    # Xóa thư mục target/ hoàn toàn để tránh lỗi IO error
+    if [ -d "$METANODE_ROOT/target" ]; then
+        print_info "  - Xóa thư mục target/ hoàn toàn..."
+        rm -rf "$METANODE_ROOT/target"
+        print_info "  ✅ Đã xóa target/"
+    fi
+    # Chạy cargo clean để đảm bảo clean state
+    cargo clean || true  # Ignore errors if target/ doesn't exist
 fi
 
 cargo build --release --bin metanode
@@ -297,6 +356,65 @@ fi
 
 print_info "✅ Đã tạo committee mới"
 
+# Step 3.1: Sync committee vào genesis.json
+print_step "Bước 3.1: Sync committee vào genesis.json..."
+
+# Check if sync script exists
+SYNC_SCRIPT="$(cd "$METANODE_ROOT/../.." && pwd)/sync_committee_to_genesis.py"
+if [ ! -f "$SYNC_SCRIPT" ]; then
+    print_warn "⚠️  Script sync_committee_to_genesis.py không tìm thấy tại $SYNC_SCRIPT"
+    print_warn "   Bỏ qua bước sync vào genesis.json"
+else
+    # Use committee_node_0.json as source (all nodes have same committee initially)
+    COMMITTEE_SOURCE="$METANODE_ROOT/config/committee_node_0.json"
+    GENESIS_TARGET="$GO_PROJECT_ROOT/cmd/simple_chain/genesis.json"
+    
+    if [ ! -f "$COMMITTEE_SOURCE" ]; then
+        print_error "Không tìm thấy committee file: $COMMITTEE_SOURCE"
+        exit 1
+    fi
+    
+    if [ ! -f "$GENESIS_TARGET" ]; then
+        print_error "Không tìm thấy genesis.json: $GENESIS_TARGET"
+        exit 1
+    fi
+    
+    print_info "📝 Syncing committee từ $COMMITTEE_SOURCE vào $GENESIS_TARGET..."
+    print_info "   💡 Điều này đảm bảo Go Master sẽ init genesis với validators mới từ Rust committee"
+    python3 "$SYNC_SCRIPT" "$COMMITTEE_SOURCE" "$GENESIS_TARGET"
+    
+    if [ $? -eq 0 ]; then
+        print_info "✅ Đã sync committee vào genesis.json"
+        
+        # Verify genesis.json có validators
+        VALIDATOR_COUNT=$(grep -c '"address"' "$GENESIS_TARGET" 2>/dev/null || echo "0")
+        if [ "$VALIDATOR_COUNT" -gt 0 ]; then
+            print_info "  ✅ Genesis.json có $VALIDATOR_COUNT validators"
+        else
+            print_warn "  ⚠️  Genesis.json không có validators! Go sẽ không có validators để init genesis"
+        fi
+    else
+        print_error "❌ Lỗi khi sync committee vào genesis.json"
+        exit 1
+    fi
+    
+    # CRITICAL: Xóa TẤT CẢ committee_node_*.json files vì tất cả nodes đều lấy từ Go state
+    # Không cần sync vào committee_node_X.json files nữa vì tất cả nodes đều lấy từ Go qua Unix Domain Socket
+    # Files này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index
+    print_info "🗑️  Xóa TẤT CẢ committee_node_*.json files vì tất cả nodes đều load từ Go state..."
+    for i in 0 1 2 3; do
+        COMMITTEE_NODE_FILE="$METANODE_ROOT/config/committee_node_${i}.json"
+        if [ -f "$COMMITTEE_NODE_FILE" ]; then
+            rm -f "$COMMITTEE_NODE_FILE"
+            print_info "  ✅ Đã xóa committee_node_${i}.json"
+        else
+            print_info "  ℹ️  committee_node_${i}.json không tồn tại, bỏ qua"
+        fi
+    done
+    print_info "  💡 Các file này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index"
+    print_info "  💡 Tất cả nodes (0, 1, 2, 3) đều lấy committee từ Go state qua Unix Domain Socket, không đọc từ file"
+fi
+
 # Step 4: Verify executor configuration for Node 0
 print_step "Bước 4: Kiểm tra cấu hình executor cho Node 0..."
 
@@ -310,10 +428,59 @@ fi
 
 print_info "✅ Executor được cấu hình qua executor_enabled trong node_0.toml"
 
+# Step 4.5: Regenerate Go protobuf (QUAN TRỌNG: Phải làm trước khi build Go)
+print_step "Bước 4.5: Regenerate Go protobuf..."
+
+PROTOC_SCRIPT="$GO_PROJECT_ROOT/pkg/proto/protoc.sh"
+if [ -f "$PROTOC_SCRIPT" ]; then
+    print_info "Regenerating Go protobuf từ $PROTOC_SCRIPT..."
+    cd "$GO_PROJECT_ROOT/pkg/proto" || exit 1
+    bash "$PROTOC_SCRIPT"
+    if [ $? -eq 0 ]; then
+        print_info "✅ Đã regenerate Go protobuf"
+    else
+        print_error "❌ Lỗi khi regenerate Go protobuf"
+        exit 1
+    fi
+else
+    print_warn "⚠️  Không tìm thấy protoc.sh tại $PROTOC_SCRIPT"
+    print_warn "   Bỏ qua bước regenerate protobuf (có thể gây lỗi nếu protobuf chưa được cập nhật)"
+fi
+
 # Step 5: Start Go Master Node (đầu tiên)
 print_step "Bước 5: Khởi động Go Master Node (đầu tiên)..."
 
 cd "$GO_PROJECT_ROOT/cmd/simple_chain" || exit 1
+
+# CRITICAL: Xóa blocks database NGAY TRƯỚC KHI khởi động Go Master
+# (có thể được tạo lại trong quá trình chạy script)
+print_info "🧹 Xóa blocks database NGAY TRƯỚC KHI khởi động Go Master..."
+BLOCK_DB_PATHS_FINAL=(
+    "$GO_PROJECT_ROOT/cmd/simple_chain/sample/simple/data/data/blocks"
+    "$GO_PROJECT_ROOT/cmd/simple_chain/sample/simple/data-write/data/blocks"
+)
+for block_db_path in "${BLOCK_DB_PATHS_FINAL[@]}"; do
+    if [ -d "$block_db_path" ]; then
+        print_warn "  ⚠️  Blocks directory vẫn tồn tại: $block_db_path"
+        print_info "  - Xóa: $block_db_path"
+        rm -rf "$block_db_path"
+        print_info "  ✅ Đã xóa block database"
+    fi
+done
+
+# Final verification: Đảm bảo blocks directory không tồn tại
+print_info "🔍 Final verification: Kiểm tra blocks directory không tồn tại..."
+for block_db_path in "${BLOCK_DB_PATHS_FINAL[@]}"; do
+    if [ -d "$block_db_path" ]; then
+        print_error "  ❌❌ Blocks directory VẪN tồn tại: $block_db_path"
+        print_error "     Vui lòng xóa thủ công: rm -rf $block_db_path"
+        print_error "     Sau đó chạy lại script"
+        exit 1
+    else
+        print_info "  ✅ Blocks directory không tồn tại: $block_db_path"
+    fi
+done
+print_info "  ✅ Đảm bảo Go sẽ init genesis block mới"
 
 # Start Go Master Node in tmux session using go run (like run.sh)
 print_info "Khởi động Go Master Node (config-master.json) trong tmux session 'go-master'..."
@@ -334,10 +501,11 @@ if [ "$FULL_CLEAN_GO_MODCACHE" = "1" ]; then
 fi
 
 # Start in tmux with go run
+print_info "🚀 Khởi động Go Master Node (sẽ init genesis block mới với validators từ genesis.json)..."
 tmux new-session -d -s go-master -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
     "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data/data/xapian_node' && go run . -config=config-master.json"
 
-sleep 5  # Đợi Go Master khởi động hoàn toàn
+sleep 8  # Tăng delay để Go Master có thời gian init genesis block
 
 # Verify Go Master Node is running
 if tmux has-session -t go-master 2>/dev/null; then
@@ -345,6 +513,18 @@ if tmux has-session -t go-master 2>/dev/null; then
 else
     print_error "Không thể khởi động Go Master Node!"
     exit 1
+fi
+
+# CRITICAL: Verify Go Master đã init genesis block (check log)
+print_info "🔍 Kiểm tra Go Master đã init genesis block..."
+sleep 2  # Đợi thêm để Go init genesis
+GENESIS_INIT_CHECK=$(tmux capture-pane -t go-master -p | grep -E "lastblock header 1|initGenesisBlock|Genesis" | head -1 || true)
+if [ -n "$GENESIS_INIT_CHECK" ]; then
+    print_info "  ✅ Go Master đã init genesis block (tìm thấy log: $GENESIS_INIT_CHECK)"
+else
+    print_warn "  ⚠️  Không thấy log init genesis block (có thể Go đang dùng block cũ)"
+    print_warn "     Kiểm tra log: tmux attach -t go-master"
+    print_warn "     Tìm log 'lastblock header 1' (init genesis) hoặc 'lastblock header 2' (dùng block cũ)"
 fi
 
 # Step 6: Start Go Sub Node (sau Go Master, với delay để kết nối)

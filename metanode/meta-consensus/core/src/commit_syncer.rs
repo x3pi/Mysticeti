@@ -380,10 +380,10 @@ impl<C: NetworkClient> CommitSyncer<C> {
             };
             if highest_handled_index + effective_threshold < range_end {
                 if !self.is_sync_mode {
-                    warn!(
-                        "Skip scheduling new commit fetches: consensus handler is lagging. highest_handled_index={}, highest_scheduled_index={}",
-                        highest_handled_index, highest_scheduled_index
-                    );
+                warn!(
+                    "Skip scheduling new commit fetches: consensus handler is lagging. highest_handled_index={}, highest_scheduled_index={}",
+                    highest_handled_index, highest_scheduled_index
+                );
                 }
                 break;
             }

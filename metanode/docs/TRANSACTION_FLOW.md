@@ -314,13 +314,31 @@ func (bp *BlockProcessor) runSocketExecutor(socketID int) {
    - `Mode`: `!= SINGLE`
    - Chạy `runSocketExecutor(0)` để nhận và thực thi blocks
 
-### Enable Executor
+### Transaction Queuing (Barrier Phase)
 
-Chỉ node 0 có executor enabled:
-```bash
-# Tạo file config cho node 0
-touch Mysticeti/metanode/config/enable_executor.toml
-```
+**CRITICAL:** Transactions được queue trong barrier phase để tránh mất giao dịch:
+
+1. **Barrier Detection:**
+   - Khi `transition_barrier` được set, tất cả transactions được queue
+   - Transactions được queue với reason: "Barrier phase: barrier=X is set"
+
+2. **Queue Processing:**
+   - Transactions được lưu trong `pending_transactions_queue`
+   - Sau epoch transition, transactions được submit lại
+   - Transactions được sắp xếp theo hash để đảm bảo fork-safety
+
+3. **Deterministic Ordering:**
+   - Transactions được sort theo hash (lexicographic order)
+   - Deduplicate để tránh submit trùng lặp
+   - Tất cả nodes submit transactions trong cùng thứ tự
+
+### Executor Configuration
+
+**LƯU Ý:** `executor_enabled` chỉ ảnh hưởng đến việc gửi commits đến Go Master:
+- `executor_enabled = true`: Node gửi commits đến Go Master qua Unix Domain Socket
+- `executor_enabled = false`: Node không gửi commits đến Go Master (consensus only)
+
+**Tất cả nodes đều lấy committee từ Go**, không phụ thuộc vào `executor_enabled`.
 
 ### Socket Paths
 

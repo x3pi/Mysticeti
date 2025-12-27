@@ -74,7 +74,7 @@ pub fn calculate_global_exec_index(
 // Early barrier setting: khi proposal đạt quorum và đã committed
 if quorum_status == Some(true) {
     if current_commit_index >= proposal.proposal_commit_index {
-        let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
+let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
         self.transition_barrier.store(transition_commit_index, Ordering::SeqCst);
     }
 }

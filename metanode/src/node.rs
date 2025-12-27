@@ -94,27 +94,77 @@ impl ConsensusNode {
     ) -> Result<Self> {
         info!("Initializing consensus node {}...", config.node_id);
 
-        // Load committee
-        let committee = config.load_committee()?;
+        // CRITICAL: Tất cả nodes đều lấy committee từ Go state qua Unix Domain Socket
+        // Không phụ thuộc vào executor_enabled - tất cả nodes đều cần committee từ Go
+        let executor_enabled = config.executor_enabled;
+        let node_id = config.node_id;
+        
+        // Tạo ExecutorClient cho TẤT CẢ nodes (không chỉ executor-enabled nodes)
+        // ExecutorClient dùng để lấy committee từ Go qua Unix Domain Socket
+        // enabled=true để có thể kết nối đến Go request socket
+        let executor_client = Arc::new(ExecutorClient::new(true, node_id));
+        
+        info!("🔄 [STARTUP] Loading committee from Go state at block 0 (genesis) via Unix Domain Socket (node_id={}, executor_enabled={})...", 
+            node_id, executor_enabled);
+        
+        // CRITICAL: Retry with exponential backoff to wait for Go to finish initializing genesis
+        // Go may need time to init genesis block and register validators
+        const MAX_RETRIES: u32 = 10;
+        const INITIAL_DELAY_MS: u64 = 500; // Start with 500ms delay
+        const MAX_DELAY_MS: u64 = 5000;   // Max 5 seconds between retries
+        
+        let mut last_error = None;
+        let mut committee_result = None;
+        
+        for attempt in 1..=MAX_RETRIES {
+            match Self::build_committee_from_go_validators_at_block(&executor_client, 0).await {
+                Ok(committee) => {
+                    info!("✅ [STARTUP] Successfully loaded committee from Go state: {} authorities, epoch={} (attempt {}/{})", 
+                        committee.size(), committee.epoch(), attempt, MAX_RETRIES);
+                    committee_result = Some(committee);
+                    break;
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < MAX_RETRIES {
+                        // Exponential backoff: delay = min(INITIAL_DELAY * 2^(attempt-1), MAX_DELAY)
+                        let delay_ms = std::cmp::min(
+                            INITIAL_DELAY_MS * (1u64 << (attempt - 1)),
+                            MAX_DELAY_MS
+                        );
+                        warn!("⚠️  [STARTUP] Failed to load committee from Go state (attempt {}/{}): {}. Waiting {}ms for Go to finish initializing genesis...", 
+                            attempt, MAX_RETRIES, last_error.as_ref().unwrap(), delay_ms);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    } else {
+                        warn!("⚠️  [STARTUP] Failed to load committee from Go state after {} attempts: {}", MAX_RETRIES, last_error.as_ref().unwrap());
+                    }
+                }
+            }
+        }
+        
+        let committee = match committee_result {
+            Some(committee) => committee,
+            None => {
+                // Try fallback to file if available (only if Go is not ready)
+                match config.load_committee() {
+                    Ok(committee) => {
+                        warn!("⚠️  [STARTUP] Using committee from file as fallback (Go state unavailable after {} retries). This should only happen if Go Master is not running.", MAX_RETRIES);
+                        committee
+                    }
+                    Err(file_err) => {
+                        // All nodes should load from Go - this is a critical error
+                        anyhow::bail!(
+                            "Failed to load committee from Go state after {} retries: {}. Also failed to load from file: {}. \
+                            All nodes must load committee from Go state via Unix Domain Socket. \
+                            Please ensure Go Master is running, has initialized genesis block, and protobuf is regenerated.",
+                            MAX_RETRIES, last_error.unwrap(), file_err
+                        );
+                    }
+                }
+            }
+        };
         let current_epoch = committee.epoch();
         info!("Loaded committee with {} authorities, epoch={}", committee.size(), current_epoch);
-        
-        // ✅ FORK-SAFETY CHECK: Verify epoch consistency on startup
-        // CRITICAL: Nếu node load committee.json với epoch khác với network, sẽ gây fork
-        // Validation này giúp detect sớm vấn đề (nhưng không tự động fix - cần manual sync)
-        // 
-        // Note: Trong production, nên có cơ chế sync committee.json từ network hoặc từ trusted source
-        // Hiện tại, node chỉ load từ local file - nếu file cũ, node sẽ ở epoch cũ → fork
-        warn!(
-            "⚠️  FORK-SAFETY: Node loaded epoch {} from committee.json",
-            current_epoch
-        );
-        warn!(
-            "   ⚠️  Nếu network đã transition sang epoch mới, node cần sync committee.json từ peers"
-        );
-        warn!(
-            "   ⚠️  Nếu không sync, node sẽ ở epoch cũ và không thể validate blocks từ epoch mới → FORK!"
-        );
 
         // Capture paths needed for epoch transition
         let committee_path = config
@@ -123,9 +173,10 @@ impl ConsensusNode {
             .ok_or_else(|| anyhow::anyhow!("Committee path not specified in config"))?;
         let storage_path = config.storage_path.clone();
         
-        // Load last_global_exec_index from committee.json (for deterministic global_exec_index calculation)
-        let last_global_exec_index = crate::config::NodeConfig::load_last_global_exec_index(&committee_path)
-            .unwrap_or(0); // Default to 0 if not found (new network)
+        // Load last_global_exec_index from Go state (block 0 = 0, otherwise from Go's last block)
+        // Tất cả nodes đều lấy từ Go (block 0 = 0 cho genesis)
+        // In epoch transition, it will be updated from the barrier
+        let last_global_exec_index = 0; // For startup, last_global_exec_index is 0 (genesis)
         info!("Loaded last_global_exec_index={} (deterministic checkpoint sequence)", last_global_exec_index);
 
         // Load keypairs (kept for in-process restart)
@@ -1071,6 +1122,136 @@ impl ConsensusNode {
         Ok(())
     }
 
+    /// Build Committee from Go validators at a specific block
+    /// Used for startup (block 0) and epoch transition (last_global_exec_index)
+    async fn build_committee_from_go_validators_at_block(
+        executor_client: &Arc<ExecutorClient>,
+        block_number: u64,
+    ) -> Result<Committee> {
+        // Get validators from Go at specific block
+        let validators = executor_client.get_validators_at_block(block_number).await
+            .map_err(|e| anyhow::anyhow!("Failed to get validators from Go at block {}: {}", block_number, e))?;
+        
+        if validators.is_empty() {
+            anyhow::bail!("No validators found in Go state at block {}", block_number);
+        }
+        
+        info!("📋 Building committee from {} validators in Go state at block {}", validators.len(), block_number);
+        
+        // Determine epoch from block number (block 0 = epoch 0)
+        let epoch = if block_number == 0 { 0 } else {
+            // For epoch transition, epoch will be set by caller
+            // For now, use 0 as default (will be overridden)
+            0
+        };
+        
+        Self::build_committee_from_validator_list(validators, epoch)
+    }
+
+    /// Build Committee from Go validators for epoch transition (uses current state)
+    /// Maps validators from Go state to Rust Committee format
+    /// NOTE: Currently unused, kept for backward compatibility
+    #[allow(dead_code)]
+    async fn build_committee_from_go_validators(
+        executor_client: &Arc<ExecutorClient>,
+        new_epoch: u64,
+    ) -> Result<Committee> {
+        // Get active validators from Go
+        let validators = executor_client.get_active_validators().await
+            .map_err(|e| anyhow::anyhow!("Failed to get active validators from Go: {}", e))?;
+        
+        if validators.is_empty() {
+            anyhow::bail!("No active validators found in Go state");
+        }
+        
+        info!("📋 [EPOCH-TRANSITION] Building committee from {} active validators in Go state", validators.len());
+        
+        Self::build_committee_from_validator_list(validators, new_epoch)
+    }
+
+    /// Helper function to build Committee from validator list
+    fn build_committee_from_validator_list(
+        validators: Vec<crate::executor_client::proto::ValidatorInfo>,
+        epoch: u64,
+    ) -> Result<Committee> {
+        use consensus_config::{Authority, AuthorityPublicKey, NetworkPublicKey, ProtocolPublicKey};
+        use mysten_network::Multiaddr;
+        use fastcrypto::{bls12381, ed25519};
+        use fastcrypto::traits::ToFromBytes;
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        
+        // Sort validators by address (deterministic ordering for fork-safety)
+        let mut sorted_validators: Vec<_> = validators.into_iter().collect();
+        sorted_validators.sort_by(|a, b| a.address.cmp(&b.address));
+        
+        let mut authorities = Vec::new();
+        let mut total_stake_normalized = 0u64;
+        
+        for (idx, validator) in sorted_validators.iter().enumerate() {
+            // Parse stake (đã được normalize trong Go, chỉ cần parse u64)
+            let stake = validator.stake.parse::<u64>()
+                .map_err(|e| anyhow::anyhow!("Invalid stake '{}': {}", validator.stake, e))?;
+            total_stake_normalized += stake;
+            
+            // Parse address to Multiaddr (tên khớp với committee.json)
+            let address: Multiaddr = validator.address.parse()
+                .map_err(|e| anyhow::anyhow!("Invalid address '{}': {}", validator.address, e))?;
+            
+            // Parse authority_key (BLS) from base64 (tên khớp với committee.json)
+            let authority_key_bytes = STANDARD.decode(&validator.authority_key)
+                .map_err(|e| anyhow::anyhow!("Failed to decode authority_key (BLS) base64 '{}': {}", validator.authority_key, e))?;
+            let authority_pubkey = bls12381::min_sig::BLS12381PublicKey::from_bytes(&authority_key_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to parse authority_key (BLS) from bytes: {}", e))?;
+            let authority_key = AuthorityPublicKey::new(authority_pubkey);
+            
+            // Parse protocol_key (Ed25519) from base64 (tên khớp với committee.json)
+            let protocol_key_bytes = STANDARD.decode(&validator.protocol_key)
+                .map_err(|e| anyhow::anyhow!("Failed to decode protocol_key base64 '{}': {}", validator.protocol_key, e))?;
+            let protocol_pubkey = ed25519::Ed25519PublicKey::from_bytes(&protocol_key_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to parse protocol_key (Ed25519) from bytes: {}", e))?;
+            let protocol_key = ProtocolPublicKey::new(protocol_pubkey);
+            
+            // Parse network_key (Ed25519) from base64 (tên khớp với committee.json)
+            let network_key_bytes = STANDARD.decode(&validator.network_key)
+                .map_err(|e| anyhow::anyhow!("Failed to decode network_key base64 '{}': {}", validator.network_key, e))?;
+            let network_pubkey = ed25519::Ed25519PublicKey::from_bytes(&network_key_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to parse network_key (Ed25519) from bytes: {}", e))?;
+            let network_key = NetworkPublicKey::new(network_pubkey);
+            
+            // Generate hostname từ name (nếu có) hoặc fallback về "node-{idx}"
+            let hostname = if !validator.name.is_empty() {
+                validator.name.clone()
+            } else {
+                format!("node-{}", idx)
+            };
+            
+            let address_for_log = validator.address.clone();
+            let hostname_for_log = hostname.clone();
+            let stake_for_log = stake;
+            
+            let authority = Authority {
+                stake,
+                address,
+                hostname: hostname.clone(),
+                authority_key,
+                protocol_key,
+                network_key,
+            };
+            
+            authorities.push(authority);
+            
+            info!("  ✅ Added validator {}: address={}, stake={}, hostname={}", 
+                idx, address_for_log, stake_for_log, hostname_for_log);
+        }
+        
+        info!("📊 Built committee with {} authorities, total_stake={}, epoch={}", 
+            authorities.len(), total_stake_normalized, epoch);
+        
+        // Create committee with specified epoch
+        let committee = Committee::new(epoch, authorities);
+        Ok(committee)
+    }
+
     /// Transition to a new epoch (fork-safe)
     #[allow(dead_code)] // Will be used when implementing full epoch transition
     pub async fn transition_to_epoch(
@@ -1476,16 +1657,54 @@ impl ConsensusNode {
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         );
 
+        // 4) Build new committee from Go state (TẤT CẢ nodes đều lấy từ Go)
+        // CRITICAL FORK-SAFETY: Tất cả nodes phải có CÙNG committee
+        // Tất cả nodes đều lấy validators từ Go state tại last_global_exec_index của epoch trước
+        // Không phụ thuộc vào executor_enabled - tất cả nodes đều cần committee từ Go
+        // Create executor client to get validators from Go state
+        let node_id = self.committee_path.file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("committee_node_"))
+            .and_then(|s| s.strip_suffix(".json"))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let executor_client = Arc::new(ExecutorClient::new(true, node_id));
+        
+        // CRITICAL: Get validators from Go state at the LAST block of previous epoch
+        // Block number = last_global_exec_index of previous epoch (this is the final block of epoch N-1)
+        // This ensures we get the committee state at the exact point where epoch N-1 ended
+        // NOTE: self.last_global_exec_index is still the value from previous epoch (not updated yet)
+        let block_number = self.last_global_exec_index;
+        info!("🔄 [EPOCH-TRANSITION] Loading committee from Go state at block {} (last_global_exec_index of previous epoch - this is the FINAL block of epoch {}) via Unix Domain Socket (node_id={})", 
+            block_number, self.current_epoch, node_id);
+        
+        let new_committee = match Self::build_committee_from_go_validators_at_block(&executor_client, block_number).await {
+            Ok(committee) => {
+                // Set the new epoch
+                // Note: Committee::new requires epoch, but we need to update it
+                // For now, create a new committee with the correct epoch
+                let authorities: Vec<_> = committee.authorities().map(|(_, auth)| auth.clone()).collect();
+                let new_committee = Committee::new(proposal.new_epoch, authorities);
+                info!("✅ [EPOCH-TRANSITION] Successfully built committee from Go state at block {}: {} authorities, epoch={}", 
+                    block_number, new_committee.size(), proposal.new_epoch);
+                new_committee
+            }
+            Err(e) => {
+                warn!("⚠️  [EPOCH-TRANSITION] Failed to build committee from Go state at block {}: {}. Using proposal.new_committee as fallback.", block_number, e);
+                proposal.new_committee.clone()
+            }
+        };
+
         // 4) Persist new epoch config (committee.json + epoch_timestamp_ms + last_global_exec_index)
         // CRITICAL FORK-SAFETY: Tất cả nodes phải ghi CÙNG data vào committee.json
-        // - proposal.new_committee: Committee mới (giống nhau ở tất cả nodes vì từ cùng proposal)
+        // - new_committee: Committee mới (từ Go state hoặc từ proposal)
         // - proposal.new_epoch_timestamp_ms: Timestamp mới (giống nhau ở tất cả nodes vì từ cùng proposal)
         // - new_last_global_exec_index: Global exec index mới (giống nhau vì dùng cùng last_commit_index = barrier)
         // 
         // Atomic write đảm bảo không bị corrupt nếu process crash giữa chừng
         crate::config::NodeConfig::save_committee_with_global_exec_index(
             &self.committee_path,
-            &proposal.new_committee,
+            &new_committee,
             proposal.new_epoch_timestamp_ms,
             new_last_global_exec_index,
         )?;
@@ -1591,6 +1810,7 @@ impl ConsensusNode {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
             })
             .with_epoch_info(new_epoch, new_last_global_exec_index)
+            // NOTE: Committee is not stored in CommitProcessor, it's used in authority creation
             .with_transition_barrier(transition_barrier_for_new_epoch)
             .with_global_exec_index_at_barrier(global_exec_index_at_barrier_for_new_epoch)
             .with_pending_transactions_queue(self.pending_transactions_queue.clone());

@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "/proto";
+
+// BlockRequest - khớp với Go (không dùng nhưng cần để field numbers đúng)
+message BlockRequest {
+    uint64 block_number = 1;
+}
+
+// StatusRequest - khớp với Go (không dùng nhưng cần để field numbers đúng)
+message StatusRequest {
+    // Empty message
+}
+
+// Request để lấy danh sách active validators cho epoch transition
+message GetActiveValidatorsRequest {
+    // Không cần tham số, lấy từ state hiện tại
+}
+
+// Request để lấy validators tại một block cụ thể
+// Dùng cho khởi động (block 0) và epoch transition (last_global_exec_index)
+message GetValidatorsAtBlockRequest {
+    uint64 block_number = 1;  // Block number (0 cho genesis, last_global_exec_index cho epoch transition)
+}
+
+// Validator info từ Go state - các trường cần thiết cho committee.json + metadata + phí/phần thưởng
+message ValidatorInfo {
+    // Các trường cần thiết cho committee.json (tên khớp với committee.json)
+    string address = 1;        // P2P address (Multiaddr format) - khớp với "address" trong committee.json
+    string stake = 2;          // Stake amount (string) - khớp với "stake" trong committee.json (sau khi normalize)
+    string authority_key = 3;   // BLS public key (base64) - khớp với "authority_key" trong committee.json
+    string protocol_key = 4;   // Ed25519 protocol key (base64) - khớp với "protocol_key" trong committee.json
+    string network_key = 5;    // Ed25519 network key (base64) - khớp với "network_key" trong committee.json
+    
+    // Metadata
+    string name = 6;                // Tên validator
+    string description = 7;         // Mô tả validator
+    string website = 8;            // Website của validator
+    string image = 9;              // URL ảnh đại diện
+    
+    // Các trường liên quan đến tính phí và trả phần thưởng
+    uint64 commission_rate = 10;   // Tỷ lệ hoa hồng (ví dụ: 1000 = 10%, tối đa 10000)
+    string min_self_delegation = 11; // Lượng stake tối thiểu validator phải tự ủy quyền
+    string accumulated_rewards_per_share = 12; // Tổng phần thưởng tích lũy trên mỗi đơn vị stake
+}
+
+// Danh sách validators (tương thích với Go ValidatorInfoList)
+message ValidatorInfoList {
+    repeated ValidatorInfo validators = 1;
+    // Epoch metadata để thống nhất với Rust
+    uint64 epoch_timestamp_ms = 2;        // Epoch start timestamp in milliseconds
+    uint64 last_global_exec_index = 3;    // Last global execution index from previous epoch
+}
+
+// Request message
+// CRITICAL: Field numbers MUST match Go validator.proto for compatibility
+// Go validator.proto field numbers:
+//   - BlockRequest block_request = 1
+//   - StatusRequest status_request = 2
+//   - GetActiveValidatorsRequest get_active_validators_request = 3
+//   - GetValidatorsAtBlockRequest get_validators_at_block_request = 4
+message Request {
+    oneof payload {
+        BlockRequest block_request = 1;  // Match Go
+        StatusRequest status_request = 2;  // Match Go
+        GetActiveValidatorsRequest get_active_validators_request = 3;  // Match Go
+        GetValidatorsAtBlockRequest get_validators_at_block_request = 4;  // Match Go (was 2, fixed to 4)
+    }
+}
+
+// Response message
+// NOTE: Field numbers phải khớp với Go validator.proto để đảm bảo compatibility
+message Response {
+    oneof payload {
+        ValidatorList validator_list = 1;  // Khớp với Go (không dùng nhưng cần để field numbers đúng)
+        ValidatorInfoList validator_info_list = 2; // Cho epoch transition - khớp với Go
+        ServerStatus server_status = 3;  // Khớp với Go (không dùng nhưng cần để field numbers đúng)
+        string error = 4; // Error message nếu có lỗi - khớp với Go
+    }
+}
+
+// ValidatorList - khớp với Go (không dùng nhưng cần để field numbers đúng)
+message ValidatorList {
+    repeated ValidatorInfo validators = 1;
+}
+
+// ServerStatus - khớp với Go (không dùng nhưng cần để field numbers đúng)
+message ServerStatus {
+    string status_message = 1;
+    uint64 uptime_seconds = 2;
+}
+

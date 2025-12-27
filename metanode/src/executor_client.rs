@@ -13,17 +13,24 @@ use tracing::{info, trace, warn};
 
 // Include generated protobuf code
 // Note: prost_build generates all messages from executor.proto into proto.rs
-mod proto {
+pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/proto.rs"));
 }
 
-use proto::{CommittedBlock, CommittedEpochData, TransactionExe};
+// Include validator_rpc protobuf code for Request/Response
+// Note: prost generates files based on package name, so "proto" package becomes "proto.rs"
+// All proto files with package "proto" are merged into one proto.rs file
+// So we can use the same proto module for all messages
+
+use proto::{CommittedBlock, CommittedEpochData, TransactionExe, GetActiveValidatorsRequest, GetValidatorsAtBlockRequest, Request, Response, ValidatorInfo};
 
 /// Client to send committed blocks to Go executor via Unix Domain Socket
 /// Only enabled when config file exists (typically only node 0)
 pub struct ExecutorClient {
     socket_path: String,
     connection: Arc<Mutex<Option<UnixStream>>>,
+    request_socket_path: String, // For sending requests (Rust -> Go)
+    request_connection: Arc<Mutex<Option<UnixStream>>>,
     enabled: bool,
 }
 
@@ -33,10 +40,18 @@ impl ExecutorClient {
     /// socket_id: socket ID (0 for node 0)
     pub fn new(enabled: bool, socket_id: usize) -> Self {
         let socket_path = format!("/tmp/executor{}.sock", socket_id);
+        // Go listens for requests on /tmp/rust-go.sock (or /tmp/rust-go.sock_2 for non-master)
+        let request_socket_path = if socket_id == 0 {
+            "/tmp/rust-go.sock_2".to_string() // Master node uses sock_2
+        } else {
+            "/tmp/rust-go.sock_1".to_string() // Non-master uses sock_1
+        };
         Self {
             socket_path,
             connection: Arc::new(Mutex::new(None)),
             enabled,
+            request_socket_path,
+            request_connection: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -298,6 +313,270 @@ impl ExecutorClient {
             global_exec_index, subdag.commit_ref.index, epoch, epoch_data.blocks.len(), buf.len());
         
         Ok(buf)
+    }
+
+    /// Connect to Go request socket for request/response (lazy connection with retry)
+    async fn connect_request(&self) -> Result<()> {
+        let mut conn_guard = self.request_connection.lock().await;
+        
+        // Check if already connected and still valid
+        if let Some(ref mut stream) = *conn_guard {
+            match stream.writable().await {
+                Ok(_) => {
+                    trace!("🔌 [EXECUTOR-REQ] Reusing existing request connection to {}", self.request_socket_path);
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("⚠️  [EXECUTOR-REQ] Existing request connection to {} is dead: {}, reconnecting...", 
+                        self.request_socket_path, e);
+                    *conn_guard = None;
+                }
+            }
+        }
+
+        // Connect to socket with retry logic
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+        
+        for attempt in 1..=MAX_RETRIES {
+            match UnixStream::connect(&self.request_socket_path).await {
+                Ok(stream) => {
+                    info!("🔌 [EXECUTOR-REQ] Connected to Go request socket at {} (attempt {}/{})", 
+                        self.request_socket_path, attempt, MAX_RETRIES);
+                    *conn_guard = Some(stream);
+                    return Ok(());
+                }
+                Err(e) => {
+                    if attempt < MAX_RETRIES {
+                        warn!("⚠️  [EXECUTOR-REQ] Failed to connect to Go request socket at {} (attempt {}/{}): {}, retrying...", 
+                            self.request_socket_path, attempt, MAX_RETRIES, e);
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    } else {
+                        warn!("⚠️  [EXECUTOR-REQ] Failed to connect to Go request socket at {} after {} attempts: {}", 
+                            self.request_socket_path, MAX_RETRIES, e);
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+        
+        unreachable!()
+    }
+
+    /// Get active validators from Go state for epoch transition
+    /// Returns list of validators that are not jailed and have stake > 0
+    pub async fn get_active_validators(&self) -> Result<Vec<ValidatorInfo>> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Connect to Go request socket if needed
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        // Create GetActiveValidatorsRequest
+        let request = Request {
+            payload: Some(proto::request::Payload::GetActiveValidatorsRequest(
+                GetActiveValidatorsRequest {}
+            )),
+        };
+
+        // Encode request to protobuf bytes
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        // Send request via UDS (4-byte length prefix, big-endian, like Go's WriteMessage)
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            // Write 4-byte length prefix (big-endian)
+            let len = request_buf.len() as u32;
+            let len_bytes = len.to_be_bytes();
+            stream.write_all(&len_bytes).await?;
+            
+            // Write request data
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+            
+            info!("📤 [EXECUTOR-REQ] Sent GetActiveValidatorsRequest to Go (size: {} bytes)", request_buf.len());
+
+            // Read response (4-byte length prefix + response data)
+            use tokio::io::AsyncReadExt;
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+            
+            let mut response_buf = vec![0u8; response_len];
+            stream.read_exact(&mut response_buf).await?;
+            
+            // Decode response
+            let response = Response::decode(&response_buf[..])?;
+            
+            match response.payload {
+                Some(proto::response::Payload::ValidatorInfoList(validator_info_list)) => {
+                    info!("✅ [EXECUTOR-REQ] Received ValidatorInfoList from Go with {} validators", 
+                        validator_info_list.validators.len());
+                    return Ok(validator_info_list.validators);
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unexpected response type from Go"));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Request connection is not available"));
+        }
+    }
+
+    /// Get validators at a specific block number from Go state
+    /// Used for startup (block 0) and epoch transition (last_global_exec_index)
+    pub async fn get_validators_at_block(&self, block_number: u64) -> Result<Vec<ValidatorInfo>> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Connect to Go request socket if needed
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        // Create GetValidatorsAtBlockRequest
+        let request = Request {
+            payload: Some(proto::request::Payload::GetValidatorsAtBlockRequest(
+                GetValidatorsAtBlockRequest {
+                    block_number,
+                }
+            )),
+        };
+
+        // Encode request to protobuf bytes
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        // Send request via UDS
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            // Write 4-byte length prefix (big-endian)
+            let len = request_buf.len() as u32;
+            let len_bytes = len.to_be_bytes();
+            stream.write_all(&len_bytes).await?;
+            
+            // Write request data
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+            
+            info!("📤 [EXECUTOR-REQ] Sent GetValidatorsAtBlockRequest to Go for block {} (size: {} bytes)", 
+                block_number, request_buf.len());
+
+            // Read response (4-byte length prefix + response data)
+            use tokio::io::AsyncReadExt;
+            use tokio::time::{timeout, Duration};
+            
+            // Set timeout for reading response (5 seconds)
+            let read_timeout = Duration::from_secs(5);
+            
+            let mut len_buf = [0u8; 4];
+            timeout(read_timeout, stream.read_exact(&mut len_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response length: {}", e))??;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+            
+            if response_len == 0 {
+                return Err(anyhow::anyhow!("Received zero-length response from Go"));
+            }
+            if response_len > 10_000_000 { // 10MB limit
+                return Err(anyhow::anyhow!("Response too large: {} bytes", response_len));
+            }
+            
+            let mut response_buf = vec![0u8; response_len];
+            timeout(read_timeout, stream.read_exact(&mut response_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response data: {}", e))??;
+            
+            info!("📥 [EXECUTOR-REQ] Received {} bytes from Go, decoding...", response_buf.len());
+            info!("🔍 [EXECUTOR-REQ] Raw response bytes (hex): {}", hex::encode(&response_buf));
+            info!("🔍 [EXECUTOR-REQ] Raw response bytes (first 50): {:?}", &response_buf[..response_buf.len().min(50)]);
+            
+            // Decode response
+            let response = Response::decode(&response_buf[..])
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to decode response from Go: {}. Response length: {} bytes. Response bytes (hex): {}. Response bytes (first 100): {:?}", 
+                        e, 
+                        response_buf.len(),
+                        hex::encode(&response_buf),
+                        &response_buf[..response_buf.len().min(100)]
+                    )
+                })?;
+            
+            info!("🔍 [EXECUTOR-REQ] Decoded response successfully");
+            info!("🔍 [EXECUTOR-REQ] Response payload type: {:?}", response.payload);
+            
+            // Debug: Check all possible payload types
+            match &response.payload {
+                Some(proto::response::Payload::ValidatorInfoList(v)) => {
+                    info!("🔍 [EXECUTOR-REQ] Payload is ValidatorInfoList with {} validators", v.validators.len());
+                    // CRITICAL: Log each ValidatorInfo exactly as received from Go
+                    for (idx, validator) in v.validators.iter().enumerate() {
+                        let auth_key_preview = if validator.authority_key.len() > 50 {
+                            format!("{}...", &validator.authority_key[..50])
+                        } else {
+                            validator.authority_key.clone()
+                        };
+                        info!("📥 [RUST←GO] ValidatorInfo[{}]: address={}, stake={}, name={}, authority_key={}, protocol_key={}, network_key={}",
+                            idx, validator.address, validator.stake, validator.name, 
+                            auth_key_preview, validator.protocol_key, validator.network_key);
+                    }
+                }
+                Some(proto::response::Payload::Error(e)) => {
+                    info!("🔍 [EXECUTOR-REQ] Payload is Error: {}", e);
+                }
+                Some(proto::response::Payload::ValidatorList(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is ValidatorList (not expected for this request)");
+                }
+                Some(proto::response::Payload::ServerStatus(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is ServerStatus (not expected for this request)");
+                }
+                None => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is None - response structure may be incorrect");
+                    warn!("🔍 [EXECUTOR-REQ] Full response debug: {:?}", response);
+                }
+            }
+            
+            match response.payload {
+                Some(proto::response::Payload::ValidatorInfoList(validator_info_list)) => {
+                    info!("✅ [EXECUTOR-REQ] Received ValidatorInfoList from Go at block {} with {} validators, epoch_timestamp_ms={}, last_global_exec_index={}", 
+                        block_number, validator_info_list.validators.len(), 
+                        validator_info_list.epoch_timestamp_ms, 
+                        validator_info_list.last_global_exec_index);
+                    
+                    // CRITICAL: Log each ValidatorInfo exactly as received from Go
+                    for (idx, validator) in validator_info_list.validators.iter().enumerate() {
+                        let auth_key_preview = if validator.authority_key.len() > 50 {
+                            format!("{}...", &validator.authority_key[..50])
+                        } else {
+                            validator.authority_key.clone()
+                        };
+                        info!("📥 [RUST←GO] ValidatorInfo[{}]: address={}, stake={}, name={}, authority_key={}, protocol_key={}, network_key={}",
+                            idx, validator.address, validator.stake, validator.name, 
+                            auth_key_preview, validator.protocol_key, validator.network_key);
+                    }
+                    
+                    return Ok(validator_info_list.validators);
+                }
+                Some(proto::response::Payload::Error(error_msg)) => {
+                    return Err(anyhow::anyhow!("Go returned error: {}", error_msg));
+                }
+                Some(proto::response::Payload::ValidatorList(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected ValidatorList response (expected ValidatorInfoList)"));
+                }
+                Some(proto::response::Payload::ServerStatus(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected ServerStatus response (expected ValidatorInfoList)"));
+                }
+                None => {
+                    return Err(anyhow::anyhow!("Unexpected response type from Go. Response payload: None. Response bytes (hex): {}", hex::encode(&response_buf)));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Request connection is not available"));
+        }
     }
 }
 

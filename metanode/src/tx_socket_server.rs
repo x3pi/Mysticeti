@@ -213,8 +213,10 @@ impl TxSocketServer {
                 // Queue transactions for next epoch (barrier phase)
                 info!("📦 [TX FLOW] Queueing {} transactions for next epoch: {}", transactions_to_submit.len(), reason);
                 for tx_data in &transactions_to_submit {
+                    let tx_hash = crate::tx_hash::calculate_transaction_hash_hex(tx_data);
+                    info!("📦 [TX FLOW] Queueing transaction: hash={}, reason={}", tx_hash, reason);
                     if let Err(e) = node_guard.queue_transaction_for_next_epoch(tx_data.clone()).await {
-                        error!("❌ [TX FLOW] Failed to queue transaction: {}", e);
+                        error!("❌ [TX FLOW] Failed to queue transaction: hash={}, error={}", tx_hash, e);
                     }
                 }
                 drop(node_guard);
@@ -232,6 +234,10 @@ impl TxSocketServer {
             }
             
             if !should_accept {
+                for tx_data in &transactions_to_submit {
+                    let tx_hash = crate::tx_hash::calculate_transaction_hash_hex(tx_data);
+                    warn!("🚫 [TX FLOW] Rejecting transaction: hash={}, reason={}", tx_hash, reason);
+                }
                 warn!("🚫 Transaction rejected via UDS: node not ready - {}", reason);
                 drop(node_guard);
                 let error_response = format!(
