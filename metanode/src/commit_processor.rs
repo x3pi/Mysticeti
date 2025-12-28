@@ -124,6 +124,13 @@ impl CommitProcessor {
         // resets barrier back to 0 while the old CommitProcessor is still draining its receiver.
         // Without this, the old processor could start sending old-epoch commits again.
         let mut barrier_snapshot: u32 = 0;
+        
+        // Heartbeat monitoring: Log every 1000 commits to detect if processor is stuck
+        let mut last_heartbeat_commit = 0u32;
+        let mut last_heartbeat_time = std::time::Instant::now();
+        const HEARTBEAT_INTERVAL: u32 = 1000; // Log every 1000 commits
+        const HEARTBEAT_TIMEOUT_SECS: u64 = 300; // 5 minutes timeout
+        
         loop {
             match receiver.recv().await {
                 Some(subdag) => {
@@ -216,6 +223,23 @@ impl CommitProcessor {
                         // Notify commit index update (for epoch transition)
                         if let Some(ref callback) = commit_index_callback {
                             callback(commit_index);
+                        }
+                        
+                        // Heartbeat monitoring: Log progress and detect stuck
+                        if commit_index >= last_heartbeat_commit + HEARTBEAT_INTERVAL {
+                            let elapsed = last_heartbeat_time.elapsed().as_secs();
+                            info!("💓 [COMMIT PROCESSOR HEARTBEAT] Processed {} commits (last {} commits in {}s, avg {:.2} commits/s)", 
+                                commit_index, HEARTBEAT_INTERVAL, elapsed, 
+                                HEARTBEAT_INTERVAL as f64 / elapsed.max(1) as f64);
+                            last_heartbeat_commit = commit_index;
+                            last_heartbeat_time = std::time::Instant::now();
+                        }
+                        
+                        // Detect stuck: If no progress for too long, log warning
+                        let time_since_last_heartbeat = last_heartbeat_time.elapsed().as_secs();
+                        if time_since_last_heartbeat > HEARTBEAT_TIMEOUT_SECS && commit_index == last_heartbeat_commit {
+                            warn!("⚠️  [COMMIT PROCESSOR] Possible stuck detected: No progress for {}s (last commit: {})", 
+                                time_since_last_heartbeat, commit_index);
                         }
                         
                         next_expected_index += 1;
@@ -324,7 +348,8 @@ impl CommitProcessor {
                 }
                 None => {
                     // Expected during epoch transition / authority restart (commit consumer is dropped).
-                    tracing::debug!("Commit receiver closed");
+                    warn!("⚠️  [COMMIT PROCESSOR] Commit receiver closed (commit processor will exit). This is expected during epoch transition.");
+                    info!("📊 [COMMIT PROCESSOR] Final stats: processed up to commit #{}", next_expected_index - 1);
                     break;
                 }
             }

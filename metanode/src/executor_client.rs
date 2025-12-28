@@ -144,12 +144,28 @@ impl ExecutorClient {
             write_uvarint(&mut len_buf, epoch_data_bytes.len() as u64)?;
             
             // Send with retry logic if write fails
-            let send_result = async {
+            // CRITICAL: Add timeout to prevent commit processor from getting stuck
+            use tokio::time::{timeout, Duration};
+            const SEND_TIMEOUT: Duration = Duration::from_secs(10); // 10 seconds timeout
+            
+            let send_result = timeout(SEND_TIMEOUT, async {
                 stream.write_all(&len_buf).await?;
                 stream.write_all(&epoch_data_bytes).await?;
                 stream.flush().await?;
                 Ok::<(), std::io::Error>(())
-            }.await;
+            }).await;
+            
+            let send_result = match send_result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(_) => {
+                    // Timeout occurred
+                    warn!("⏱️  [EXECUTOR] Send timeout after {}s (commit_index={}), closing connection", 
+                        SEND_TIMEOUT.as_secs(), subdag.commit_ref.index);
+                    *conn_guard = None; // Clear connection
+                    return Ok(()); // Don't fail commit, just skip send
+                }
+            };
             
             match send_result {
                 Ok(_) => {
@@ -167,22 +183,33 @@ impl ExecutorClient {
                         warn!("⚠️  [EXECUTOR] Failed to reconnect after send error: {}", reconnect_err);
                         return Ok(()); // Don't fail commit if executor is unavailable
                     }
-                    // Retry send
+                    // Retry send with timeout
                     let mut retry_guard = self.connection.lock().await;
                     if let Some(ref mut retry_stream) = *retry_guard {
                         let mut retry_len_buf = Vec::new();
                         write_uvarint(&mut retry_len_buf, epoch_data_bytes.len() as u64)?;
-                        if let Err(retry_err) = async {
+                        
+                        let retry_result = timeout(SEND_TIMEOUT, async {
                             retry_stream.write_all(&retry_len_buf).await?;
                             retry_stream.write_all(&epoch_data_bytes).await?;
                             retry_stream.flush().await?;
                             Ok::<(), std::io::Error>(())
-                        }.await {
-                            warn!("⚠️  [EXECUTOR] Retry send also failed: {}", retry_err);
-                            *retry_guard = None; // Clear connection for next attempt
-                        } else {
-                            info!("✅ [EXECUTOR] Successfully sent committed sub-DAG after reconnection: commit_index={}, total_tx={}", 
-                                subdag.commit_ref.index, total_tx);
+                        }).await;
+                        
+                        match retry_result {
+                            Ok(Ok(())) => {
+                                info!("✅ [EXECUTOR] Successfully sent committed sub-DAG after reconnection: commit_index={}, total_tx={}", 
+                                    subdag.commit_ref.index, total_tx);
+                            }
+                            Ok(Err(retry_err)) => {
+                                warn!("⚠️  [EXECUTOR] Retry send also failed: {}", retry_err);
+                                *retry_guard = None; // Clear connection for next attempt
+                            }
+                            Err(_) => {
+                                warn!("⏱️  [EXECUTOR] Retry send timeout after {}s (commit_index={})", 
+                                    SEND_TIMEOUT.as_secs(), subdag.commit_ref.index);
+                                *retry_guard = None; // Clear connection
+                            }
                         }
                     }
                 }

@@ -1819,9 +1819,21 @@ impl ConsensusNode {
         if let Some(ref client) = executor_client {
             commit_processor = commit_processor.with_executor_client(client.clone());
         }
+        
+        // Spawn commit processor with error handling and monitoring (epoch transition)
+        let node_id_for_log_epoch = node_id;
         tokio::spawn(async move {
-            if let Err(e) = commit_processor.run().await {
-                tracing::error!("Commit processor error: {}", e);
+            info!("🚀 [COMMIT PROCESSOR] Starting commit processor for new epoch {} (node {}, last_global_exec_index={})", 
+                new_epoch, node_id_for_log_epoch, new_last_global_exec_index);
+            match commit_processor.run().await {
+                Ok(()) => {
+                    info!("✅ [COMMIT PROCESSOR] Commit processor exited normally (epoch {}, node {})", 
+                        new_epoch, node_id_for_log_epoch);
+                }
+                Err(e) => {
+                    tracing::error!("❌ [COMMIT PROCESSOR] Commit processor error (epoch {}, node {}): {}", 
+                        new_epoch, node_id_for_log_epoch, e);
+                }
             }
         });
         tokio::spawn(async move {

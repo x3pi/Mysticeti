@@ -949,6 +949,75 @@ impl Core {
         let clock_round = self.dag_state.read().threshold_clock_round();
         let core_skipped_proposals = &self.context.metrics.node_metrics.core_skipped_proposals;
 
+        // CRITICAL: Check if node is lagging and prioritize sync over consensus
+        // When lag is significant, skip proposing new blocks to focus on syncing commits
+        let local_commit_index = self.dag_state.read().last_commit_index();
+        let quorum_commit_index = self.context.metrics.node_metrics.commit_sync_quorum_index.get() as u32;
+        
+        // Thresholds for skipping consensus when lagging:
+        // - MODERATE_LAG: 100 commits or 10% behind quorum -> skip consensus, prioritize sync
+        // - SEVERE_LAG: 200 commits or 15% behind quorum -> aggressively skip consensus
+        const MODERATE_LAG_THRESHOLD: u32 = 100; // Skip consensus if lag > 100 commits
+        const SEVERE_LAG_THRESHOLD: u32 = 200; // Aggressively skip consensus if lag > 200 commits
+        const MODERATE_LAG_PERCENTAGE: f64 = 10.0; // Skip consensus if lag > 10% of quorum
+        const SEVERE_LAG_PERCENTAGE: f64 = 15.0; // Aggressively skip if lag > 15% of quorum
+        
+        // HYSTERESIS: To prevent oscillation, use lower threshold when recovering from sync mode
+        // When lag was high and is now decreasing, require lag to drop below 80% of threshold
+        // before resuming consensus. This ensures smooth transition back to consensus.
+        const HYSTERESIS_FACTOR: f64 = 0.8; // Resume consensus when lag < 80% of threshold
+        
+        let lag = quorum_commit_index.saturating_sub(local_commit_index);
+        let lag_percentage = if quorum_commit_index > 0 {
+            (lag as f64 / quorum_commit_index as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        // Check if we should skip consensus
+        // Use hysteresis: if we were in sync mode, require lag to drop below 80% of threshold
+        let moderate_lag_threshold_with_hysteresis = (MODERATE_LAG_THRESHOLD as f64 * HYSTERESIS_FACTOR) as u32;
+        let moderate_lag_percentage_with_hysteresis = MODERATE_LAG_PERCENTAGE * HYSTERESIS_FACTOR;
+        
+        // Determine if we should skip consensus
+        // If lag is above threshold OR above hysteresis threshold (for smooth recovery)
+        let should_skip_consensus = lag > MODERATE_LAG_THRESHOLD || lag_percentage > MODERATE_LAG_PERCENTAGE;
+        let is_severe_lag = lag > SEVERE_LAG_THRESHOLD || lag_percentage > SEVERE_LAG_PERCENTAGE;
+        
+        // Check if we're recovering (lag was high but now decreasing)
+        let is_recovering = lag <= moderate_lag_threshold_with_hysteresis && lag_percentage <= moderate_lag_percentage_with_hysteresis;
+        
+        if should_skip_consensus {
+            if is_severe_lag {
+                // Severe lag: Skip consensus aggressively
+                debug!(
+                    "Skip proposing for round {} due to severe lag: lag={} commits ({}% behind quorum), local_commit={}, quorum_commit={}. Prioritizing sync over consensus.",
+                    clock_round, lag, lag_percentage, local_commit_index, quorum_commit_index
+                );
+                core_skipped_proposals
+                    .with_label_values(&["severe_lag_prioritize_sync"])
+                    .inc();
+            } else {
+                // Moderate lag: Skip consensus to prioritize sync
+                debug!(
+                    "Skip proposing for round {} due to moderate lag: lag={} commits ({}% behind quorum), local_commit={}, quorum_commit={}. Prioritizing sync over consensus.",
+                    clock_round, lag, lag_percentage, local_commit_index, quorum_commit_index
+                );
+                core_skipped_proposals
+                    .with_label_values(&["moderate_lag_prioritize_sync"])
+                    .inc();
+            }
+            return false;
+        }
+        
+        // If we're recovering from sync mode (lag dropped below hysteresis threshold), log transition
+        if is_recovering && lag > 0 {
+            info!(
+                "✅ [CONSENSUS-RESUME] Resuming consensus after catch-up: lag={} commits ({}% behind quorum), local_commit={}, quorum_commit={}. Node has caught up, returning to normal consensus mode.",
+                lag, lag_percentage, local_commit_index, quorum_commit_index
+            );
+        }
+
         if self.propagation_delay
             > self
                 .context

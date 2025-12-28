@@ -180,7 +180,7 @@ impl NodeConfig {
                 leader_timeout_ms: None,
                 min_round_delay_ms: None,
                 time_based_epoch_change: true, // Enabled by default
-                epoch_duration_seconds: Some(300), // Default: 5 minutes (300 seconds)
+                epoch_duration_seconds: Some(86400), // Default: 1 day (24 * 60 * 60 seconds)
                 max_clock_drift_seconds: 5,
                 enable_ntp_sync: false, // Disabled by default (enable for production)
                 ntp_servers: default_ntp_servers(),

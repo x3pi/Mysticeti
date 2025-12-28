@@ -338,7 +338,18 @@ fi
 print_info "Xóa committee cũ..."
 cd "$METANODE_ROOT" || exit 1
 rm -f "$METANODE_ROOT/config/committee.json"
-rm -f "$METANODE_ROOT/config/committee_node_*.json"
+# CRITICAL: Xóa TẤT CẢ committee_node_*.json files vì tất cả nodes đều lấy từ Go state
+# Files này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index
+print_info "🗑️  Xóa TẤT CẢ committee_node_*.json files (tất cả nodes đều load từ Go state)..."
+for i in 0 1 2 3; do
+    COMMITTEE_NODE_FILE="$METANODE_ROOT/config/committee_node_${i}.json"
+    if [ -f "$COMMITTEE_NODE_FILE" ]; then
+        rm -f "$COMMITTEE_NODE_FILE"
+        print_info "  ✅ Đã xóa committee_node_${i}.json"
+    fi
+done
+# Also remove any other committee_node_*.json files that might exist
+rm -f "$METANODE_ROOT/config/committee_node_*.json" 2>/dev/null || true
 rm -f "$METANODE_ROOT/config/node_*.toml"
 rm -f "$METANODE_ROOT/config/node_*_protocol_key.json"
 rm -f "$METANODE_ROOT/config/node_*_network_key.json"
@@ -401,16 +412,17 @@ else
     # CRITICAL: Xóa TẤT CẢ committee_node_*.json files vì tất cả nodes đều lấy từ Go state
     # Không cần sync vào committee_node_X.json files nữa vì tất cả nodes đều lấy từ Go qua Unix Domain Socket
     # Files này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index
-    print_info "🗑️  Xóa TẤT CẢ committee_node_*.json files vì tất cả nodes đều load từ Go state..."
+    print_info "🗑️  Xóa lại TẤT CẢ committee_node_*.json files sau khi sync vào genesis.json..."
+    print_info "   💡 Đảm bảo tất cả nodes (0, 1, 2, 3) đều lấy committee từ Go state qua Unix Domain Socket"
     for i in 0 1 2 3; do
         COMMITTEE_NODE_FILE="$METANODE_ROOT/config/committee_node_${i}.json"
         if [ -f "$COMMITTEE_NODE_FILE" ]; then
             rm -f "$COMMITTEE_NODE_FILE"
             print_info "  ✅ Đã xóa committee_node_${i}.json"
-        else
-            print_info "  ℹ️  committee_node_${i}.json không tồn tại, bỏ qua"
         fi
     done
+    # Also remove any other committee_node_*.json files that might exist
+    rm -f "$METANODE_ROOT/config/committee_node_*.json" 2>/dev/null || true
     print_info "  💡 Các file này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index"
     print_info "  💡 Tất cả nodes (0, 1, 2, 3) đều lấy committee từ Go state qua Unix Domain Socket, không đọc từ file"
 fi
