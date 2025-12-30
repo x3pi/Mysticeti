@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use meta_protocol_config::ProtocolConfig;
 use tracing::{info, warn};
 use tokio::sync::RwLock;
+use hex;
 
 use crate::config::NodeConfig;
 use crate::tx_submitter::{TransactionClientProxy, TransactionSubmitter};
@@ -1197,25 +1198,78 @@ impl ConsensusNode {
             let address: Multiaddr = validator.address.parse()
                 .map_err(|e| anyhow::anyhow!("Invalid address '{}': {}", validator.address, e))?;
             
-            // Parse authority_key (BLS) from base64 (tên khớp với committee.json)
-            let authority_key_bytes = STANDARD.decode(&validator.authority_key)
-                .map_err(|e| anyhow::anyhow!("Failed to decode authority_key (BLS) base64 '{}': {}", validator.authority_key, e))?;
+            // Parse authority_key (BLS) - hỗ trợ cả base64 và hex
+            // Go có thể gửi base64 (theo proto) hoặc hex (nếu lưu trong DB dưới dạng hex)
+            // Thử base64 trước (theo proto definition), nếu fail thì thử hex
+            let (authority_key_bytes, auth_key_format) = if validator.authority_key.starts_with("0x") {
+                // Rõ ràng là hex format (có prefix 0x)
+                let hex_str = &validator.authority_key[2..];
+                let bytes = hex::decode(hex_str)
+                    .map_err(|e| anyhow::anyhow!("Failed to decode authority_key (BLS) hex '{}': {}", validator.authority_key, e))?;
+                (bytes, "hex")
+            } else {
+                // Thử base64 trước (theo proto definition)
+                match STANDARD.decode(&validator.authority_key) {
+                    Ok(bytes) => (bytes, "base64"),
+                    Err(_) => {
+                        // Nếu base64 fail, thử hex (không có prefix 0x)
+                        let bytes = hex::decode(&validator.authority_key)
+                            .map_err(|e| anyhow::anyhow!("Failed to decode authority_key (BLS) as base64 or hex '{}': {}", validator.authority_key, e))?;
+                        (bytes, "hex (fallback)")
+                    }
+                }
+            };
+            info!("  🔑 [VALIDATOR-{}] authority_key format: {}, length: {} bytes", idx, auth_key_format, authority_key_bytes.len());
             let authority_pubkey = bls12381::min_sig::BLS12381PublicKey::from_bytes(&authority_key_bytes)
-                .map_err(|e| anyhow::anyhow!("Failed to parse authority_key (BLS) from bytes: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to parse authority_key (BLS) from bytes (len={}): {}", authority_key_bytes.len(), e))?;
             let authority_key = AuthorityPublicKey::new(authority_pubkey);
             
-            // Parse protocol_key (Ed25519) from base64 (tên khớp với committee.json)
-            let protocol_key_bytes = STANDARD.decode(&validator.protocol_key)
-                .map_err(|e| anyhow::anyhow!("Failed to decode protocol_key base64 '{}': {}", validator.protocol_key, e))?;
+            // Parse protocol_key (Ed25519) - hỗ trợ cả base64 và hex
+            let (protocol_key_bytes, protocol_key_format) = if validator.protocol_key.starts_with("0x") {
+                // Rõ ràng là hex format (có prefix 0x)
+                let hex_str = &validator.protocol_key[2..];
+                let bytes = hex::decode(hex_str)
+                    .map_err(|e| anyhow::anyhow!("Failed to decode protocol_key hex '{}': {}", validator.protocol_key, e))?;
+                (bytes, "hex")
+            } else {
+                // Thử base64 trước (theo proto definition)
+                match STANDARD.decode(&validator.protocol_key) {
+                    Ok(bytes) => (bytes, "base64"),
+                    Err(_) => {
+                        // Nếu base64 fail, thử hex (không có prefix 0x)
+                        let bytes = hex::decode(&validator.protocol_key)
+                            .map_err(|e| anyhow::anyhow!("Failed to decode protocol_key as base64 or hex '{}': {}", validator.protocol_key, e))?;
+                        (bytes, "hex (fallback)")
+                    }
+                }
+            };
+            info!("  🔑 [VALIDATOR-{}] protocol_key format: {}, length: {} bytes", idx, protocol_key_format, protocol_key_bytes.len());
             let protocol_pubkey = ed25519::Ed25519PublicKey::from_bytes(&protocol_key_bytes)
-                .map_err(|e| anyhow::anyhow!("Failed to parse protocol_key (Ed25519) from bytes: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to parse protocol_key (Ed25519) from bytes (len={}): {}", protocol_key_bytes.len(), e))?;
             let protocol_key = ProtocolPublicKey::new(protocol_pubkey);
             
-            // Parse network_key (Ed25519) from base64 (tên khớp với committee.json)
-            let network_key_bytes = STANDARD.decode(&validator.network_key)
-                .map_err(|e| anyhow::anyhow!("Failed to decode network_key base64 '{}': {}", validator.network_key, e))?;
+            // Parse network_key (Ed25519) - hỗ trợ cả base64 và hex
+            let (network_key_bytes, network_key_format) = if validator.network_key.starts_with("0x") {
+                // Rõ ràng là hex format (có prefix 0x)
+                let hex_str = &validator.network_key[2..];
+                let bytes = hex::decode(hex_str)
+                    .map_err(|e| anyhow::anyhow!("Failed to decode network_key hex '{}': {}", validator.network_key, e))?;
+                (bytes, "hex")
+            } else {
+                // Thử base64 trước (theo proto definition)
+                match STANDARD.decode(&validator.network_key) {
+                    Ok(bytes) => (bytes, "base64"),
+                    Err(_) => {
+                        // Nếu base64 fail, thử hex (không có prefix 0x)
+                        let bytes = hex::decode(&validator.network_key)
+                            .map_err(|e| anyhow::anyhow!("Failed to decode network_key as base64 or hex '{}': {}", validator.network_key, e))?;
+                        (bytes, "hex (fallback)")
+                    }
+                }
+            };
+            info!("  🔑 [VALIDATOR-{}] network_key format: {}, length: {} bytes", idx, network_key_format, network_key_bytes.len());
             let network_pubkey = ed25519::Ed25519PublicKey::from_bytes(&network_key_bytes)
-                .map_err(|e| anyhow::anyhow!("Failed to parse network_key (Ed25519) from bytes: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to parse network_key (Ed25519) from bytes (len={}): {}", network_key_bytes.len(), e))?;
             let network_key = NetworkPublicKey::new(network_pubkey);
             
             // Generate hostname từ name (nếu có) hoặc fallback về "node-{idx}"

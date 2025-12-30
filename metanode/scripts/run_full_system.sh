@@ -36,9 +36,12 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Script is in scripts/, so metanode root is one level up
 METANODE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Mysticeti root is one level up from metanode
+MYSTICETI_ROOT="$(cd "$METANODE_ROOT/.." && pwd)"
 # Go project is at the same level as Mysticeti directory
-# METANODE_ROOT = /home/abc/chain-new/Mysticeti/metanode
-# Go project = /home/abc/chain-new/mtn-simple-2025
+# METANODE_ROOT = /home/abc/chain-n/Mysticeti/metanode
+# MYSTICETI_ROOT = /home/abc/chain-n/Mysticeti
+# Go project = /home/abc/chain-n/mtn-simple-2025
 GO_PROJECT_ROOT="$(cd "$METANODE_ROOT/../.." && pwd)/mtn-simple-2025"
 
 # Verify paths
@@ -234,6 +237,9 @@ pkill -9 -f "simple_chain" 2>/dev/null || true
 pkill -9 -f "metanode" 2>/dev/null || true
 pkill -9 -f "go run.*simple_chain" 2>/dev/null || true
 pkill -9 -f "target/release/metanode" 2>/dev/null || true
+# Kill all metanode processes (có thể có nhiều instances)
+ps aux | grep -E "[m]etanode.*start" | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
+ps aux | grep -E "[m]etanode" | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
 sleep 2
 
 # Step 2.3: Stop tmux sessions
@@ -297,8 +303,25 @@ done
 
 print_info "✅ Đã dừng tất cả nodes cũ và giải phóng ports"
 
-# Step 3: Build Rust binary (luôn build lại để đảm bảo code mới nhất)
-print_step "Bước 3: Build Rust binary và tạo committee mới..."
+# Step 3: Setup Move dependencies (nếu cần)
+print_step "Bước 3: Kiểm tra và setup Move dependencies..."
+
+SETUP_SCRIPT="$MYSTICETI_ROOT/scripts/setup_move_dependencies.sh"
+
+if [ -f "$SETUP_SCRIPT" ]; then
+    print_info "Đang kiểm tra Move dependencies..."
+    bash "$SETUP_SCRIPT" || {
+        print_warn "⚠️  Không thể setup Move dependencies tự động"
+        print_warn "   Bạn có thể chạy thủ công: bash $SETUP_SCRIPT"
+        print_warn "   Hoặc clone Sui repository: git clone --depth=1 https://github.com/MystenLabs/sui.git $MYSTICETI_ROOT/sui"
+    }
+else
+    print_warn "⚠️  Script setup Move dependencies không tìm thấy tại $SETUP_SCRIPT"
+    print_warn "   Đảm bảo các Move crates đã được setup tại: $MYSTICETI_ROOT/sui/external-crates/move/crates/"
+fi
+
+# Step 4: Build Rust binary (luôn build lại để đảm bảo code mới nhất)
+print_step "Bước 4: Build Rust binary và tạo committee mới..."
 
 cd "$METANODE_ROOT" || exit 1
 
@@ -354,81 +377,109 @@ rm -f "$METANODE_ROOT/config/node_*.toml"
 rm -f "$METANODE_ROOT/config/node_*_protocol_key.json"
 rm -f "$METANODE_ROOT/config/node_*_network_key.json"
 
-# Generate new committee for 4 nodes
+# Generate new committee for 4 nodes (chỉ để có keys và node configs)
+# CRITICAL: committee_node_*.json sẽ bị xóa ngay sau khi sync vào genesis.json
+# Tất cả nodes sẽ lấy committee từ Go state, không đọc từ file
 print_info "Tạo committee mới cho 4 nodes (epoch 0)..."
+print_info "💡 Committee files sẽ được dùng để sync vào genesis.json, sau đó sẽ bị xóa"
+print_info "   Tất cả nodes sẽ lấy committee từ Go state qua Unix Domain Socket"
 cd "$METANODE_ROOT" || exit 1
 "$BINARY" generate --nodes 4 --output config
 
-# Verify committee files exist
+# Verify committee file exists (tạm thời để sync vào genesis.json)
 if [ ! -f "$METANODE_ROOT/config/committee_node_0.json" ]; then
     print_error "Không thể tạo committee files!"
     exit 1
 fi
 
-print_info "✅ Đã tạo committee mới"
+print_info "✅ Đã tạo committee mới (tạm thời để sync vào genesis.json)"
 
-# Step 3.1: Sync committee vào genesis.json
-print_step "Bước 3.1: Sync committee vào genesis.json..."
+# Step 4.1: Sync committee vào genesis.json
+print_step "Bước 4.1: Sync committee vào genesis.json..."
 
-# Check if sync script exists
-SYNC_SCRIPT="$(cd "$METANODE_ROOT/../.." && pwd)/sync_committee_to_genesis.py"
-if [ ! -f "$SYNC_SCRIPT" ]; then
-    print_warn "⚠️  Script sync_committee_to_genesis.py không tìm thấy tại $SYNC_SCRIPT"
-    print_warn "   Bỏ qua bước sync vào genesis.json"
-else
-    # Use committee_node_0.json as source (all nodes have same committee initially)
-    COMMITTEE_SOURCE="$METANODE_ROOT/config/committee_node_0.json"
-    GENESIS_TARGET="$GO_PROJECT_ROOT/cmd/simple_chain/genesis.json"
-    
-    if [ ! -f "$COMMITTEE_SOURCE" ]; then
-        print_error "Không tìm thấy committee file: $COMMITTEE_SOURCE"
-        exit 1
+# CRITICAL: Sync committee vào genesis.json (BẮT BUỘC)
+# Tất cả nodes sẽ lấy committee từ Go state, nên Go phải có validators trong genesis.json
+COMMITTEE_SOURCE="$METANODE_ROOT/config/committee_node_0.json"
+GENESIS_TARGET="$GO_PROJECT_ROOT/cmd/simple_chain/genesis.json"
+
+# Check if sync script exists - tìm ở nhiều vị trí có thể
+SYNC_SCRIPT=""
+POSSIBLE_PATHS=(
+    "$METANODE_ROOT/scripts/sync_committee_to_genesis.py"
+    "$GO_PROJECT_ROOT/sync_committee_to_genesis.py"
+    "$MYSTICETI_ROOT/sync_committee_to_genesis.py"
+    "$(cd "$METANODE_ROOT/../.." && pwd)/sync_committee_to_genesis.py"
+)
+
+for path in "${POSSIBLE_PATHS[@]}"; do
+    if [ -f "$path" ]; then
+        SYNC_SCRIPT="$path"
+        break
     fi
-    
-    if [ ! -f "$GENESIS_TARGET" ]; then
-        print_error "Không tìm thấy genesis.json: $GENESIS_TARGET"
-        exit 1
-    fi
-    
-    print_info "📝 Syncing committee từ $COMMITTEE_SOURCE vào $GENESIS_TARGET..."
-    print_info "   💡 Điều này đảm bảo Go Master sẽ init genesis với validators mới từ Rust committee"
-    python3 "$SYNC_SCRIPT" "$COMMITTEE_SOURCE" "$GENESIS_TARGET"
-    
-    if [ $? -eq 0 ]; then
-        print_info "✅ Đã sync committee vào genesis.json"
-        
-        # Verify genesis.json có validators
-        VALIDATOR_COUNT=$(grep -c '"address"' "$GENESIS_TARGET" 2>/dev/null || echo "0")
-        if [ "$VALIDATOR_COUNT" -gt 0 ]; then
-            print_info "  ✅ Genesis.json có $VALIDATOR_COUNT validators"
-        else
-            print_warn "  ⚠️  Genesis.json không có validators! Go sẽ không có validators để init genesis"
-        fi
-    else
-        print_error "❌ Lỗi khi sync committee vào genesis.json"
-        exit 1
-    fi
-    
-    # CRITICAL: Xóa TẤT CẢ committee_node_*.json files vì tất cả nodes đều lấy từ Go state
-    # Không cần sync vào committee_node_X.json files nữa vì tất cả nodes đều lấy từ Go qua Unix Domain Socket
-    # Files này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index
-    print_info "🗑️  Xóa lại TẤT CẢ committee_node_*.json files sau khi sync vào genesis.json..."
-    print_info "   💡 Đảm bảo tất cả nodes (0, 1, 2, 3) đều lấy committee từ Go state qua Unix Domain Socket"
-    for i in 0 1 2 3; do
-        COMMITTEE_NODE_FILE="$METANODE_ROOT/config/committee_node_${i}.json"
-        if [ -f "$COMMITTEE_NODE_FILE" ]; then
-            rm -f "$COMMITTEE_NODE_FILE"
-            print_info "  ✅ Đã xóa committee_node_${i}.json"
-        fi
+done
+
+if [ -z "$SYNC_SCRIPT" ] || [ ! -f "$SYNC_SCRIPT" ]; then
+    print_error "❌ Script sync_committee_to_genesis.py không tìm thấy (BẮT BUỘC)"
+    print_error "   Đã tìm tại:"
+    for path in "${POSSIBLE_PATHS[@]}"; do
+        print_error "     - $path"
     done
-    # Also remove any other committee_node_*.json files that might exist
-    rm -f "$METANODE_ROOT/config/committee_node_*.json" 2>/dev/null || true
-    print_info "  💡 Các file này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index"
-    print_info "  💡 Tất cả nodes (0, 1, 2, 3) đều lấy committee từ Go state qua Unix Domain Socket, không đọc từ file"
+    print_error "   Script này cần thiết để sync committee vào genesis.json"
+    print_error "   Tất cả nodes lấy committee từ Go, nên Go phải có validators trong genesis.json"
+    exit 1
 fi
 
-# Step 4: Verify executor configuration for Node 0
-print_step "Bước 4: Kiểm tra cấu hình executor cho Node 0..."
+if [ ! -f "$COMMITTEE_SOURCE" ]; then
+    print_error "❌ Không tìm thấy committee file: $COMMITTEE_SOURCE"
+    exit 1
+fi
+
+if [ ! -f "$GENESIS_TARGET" ]; then
+    print_error "❌ Không tìm thấy genesis.json: $GENESIS_TARGET"
+    exit 1
+fi
+
+print_info "📝 Syncing committee từ $COMMITTEE_SOURCE vào $GENESIS_TARGET..."
+print_info "   💡 Điều này đảm bảo Go Master sẽ init genesis với validators mới từ Rust committee"
+print_info "   💡 Tất cả Rust nodes sẽ lấy committee từ Go state qua Unix Domain Socket"
+python3 "$SYNC_SCRIPT" "$COMMITTEE_SOURCE" "$GENESIS_TARGET"
+
+if [ $? -ne 0 ]; then
+    print_error "❌ Lỗi khi sync committee vào genesis.json"
+    exit 1
+fi
+
+print_info "✅ Đã sync committee vào genesis.json"
+
+# Verify genesis.json có validators
+VALIDATOR_COUNT=$(grep -c '"address"' "$GENESIS_TARGET" 2>/dev/null || echo "0")
+if [ "$VALIDATOR_COUNT" -gt 0 ]; then
+    print_info "  ✅ Genesis.json có $VALIDATOR_COUNT validators"
+else
+    print_error "  ❌ Genesis.json không có validators! Go sẽ không có validators để init genesis"
+    exit 1
+fi
+
+# CRITICAL: Xóa TẤT CẢ committee_node_*.json files ngay sau khi sync
+# Tất cả nodes đều lấy committee từ Go state qua Unix Domain Socket, không đọc từ file
+# Files này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index
+print_info "🗑️  Xóa TẤT CẢ committee_node_*.json files sau khi sync vào genesis.json..."
+print_info "   💡 Đảm bảo tất cả nodes (0, 1, 2, 3) đều lấy committee từ Go state qua Unix Domain Socket"
+for i in 0 1 2 3; do
+    COMMITTEE_NODE_FILE="$METANODE_ROOT/config/committee_node_${i}.json"
+    if [ -f "$COMMITTEE_NODE_FILE" ]; then
+        rm -f "$COMMITTEE_NODE_FILE"
+        print_info "  ✅ Đã xóa committee_node_${i}.json"
+    fi
+done
+# Also remove any other committee_node_*.json files that might exist
+rm -f "$METANODE_ROOT/config/committee_node_*.json" 2>/dev/null || true
+print_info "  ✅ Đã xóa tất cả committee_node_*.json files"
+print_info "  💡 Các file này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index"
+print_info "  💡 Tất cả nodes (0, 1, 2, 3) đều lấy committee từ Go state qua Unix Domain Socket, không đọc từ file"
+
+# Step 5: Verify executor configuration for Node 0
+print_step "Bước 5: Kiểm tra cấu hình executor cho Node 0..."
 
 # Executor is now configured via executor_enabled field in node_0.toml
 # No need to create separate enable_executor.toml file
@@ -440,27 +491,36 @@ fi
 
 print_info "✅ Executor được cấu hình qua executor_enabled trong node_0.toml"
 
-# Step 4.5: Regenerate Go protobuf (QUAN TRỌNG: Phải làm trước khi build Go)
-print_step "Bước 4.5: Regenerate Go protobuf..."
+# Step 5.5: Regenerate Go protobuf (QUAN TRỌNG: Phải làm trước khi build Go)
+print_step "Bước 5.5: Regenerate Go protobuf..."
 
 PROTOC_SCRIPT="$GO_PROJECT_ROOT/pkg/proto/protoc.sh"
 if [ -f "$PROTOC_SCRIPT" ]; then
     print_info "Regenerating Go protobuf từ $PROTOC_SCRIPT..."
     cd "$GO_PROJECT_ROOT/pkg/proto" || exit 1
-    bash "$PROTOC_SCRIPT"
-    if [ $? -eq 0 ]; then
-        print_info "✅ Đã regenerate Go protobuf"
+    
+    # Check if protoc-gen-go is available
+    if ! command -v protoc-gen-go &> /dev/null; then
+        print_warn "⚠️  protoc-gen-go không được cài đặt"
+        print_warn "   Cài đặt bằng: go install google.golang.org/protobuf/cmd/protoc-gen-go@latest"
+        print_warn "   Hoặc: go install github.com/golang/protobuf/protoc-gen-go@latest"
+        print_warn "   Bỏ qua bước regenerate protobuf (có thể gây lỗi nếu protobuf chưa được cập nhật)"
     else
-        print_error "❌ Lỗi khi regenerate Go protobuf"
-        exit 1
+        bash "$PROTOC_SCRIPT"
+        if [ $? -eq 0 ]; then
+            print_info "✅ Đã regenerate Go protobuf"
+        else
+            print_warn "⚠️  Lỗi khi regenerate Go protobuf (có thể do thiếu protoc-gen-go hoặc dependencies)"
+            print_warn "   Bỏ qua và tiếp tục (có thể gây lỗi nếu protobuf chưa được cập nhật)"
+        fi
     fi
 else
     print_warn "⚠️  Không tìm thấy protoc.sh tại $PROTOC_SCRIPT"
     print_warn "   Bỏ qua bước regenerate protobuf (có thể gây lỗi nếu protobuf chưa được cập nhật)"
 fi
 
-# Step 5: Start Go Master Node (đầu tiên)
-print_step "Bước 5: Khởi động Go Master Node (đầu tiên)..."
+# Step 6: Start Go Master Node (đầu tiên)
+print_step "Bước 6: Khởi động Go Master Node (đầu tiên)..."
 
 cd "$GO_PROJECT_ROOT/cmd/simple_chain" || exit 1
 
@@ -514,18 +574,35 @@ fi
 
 # Start in tmux with go run
 print_info "🚀 Khởi động Go Master Node (sẽ init genesis block mới với validators từ genesis.json)..."
-tmux new-session -d -s go-master -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data/data/xapian_node' && go run . -config=config-master.json"
+cd "$GO_PROJECT_ROOT/cmd/simple_chain" || exit 1
 
-sleep 8  # Tăng delay để Go Master có thời gian init genesis block
-
-# Verify Go Master Node is running
-if tmux has-session -t go-master 2>/dev/null; then
-    print_info "✅ Go Master Node đã khởi động (tmux session: go-master)"
-else
-    print_error "Không thể khởi động Go Master Node!"
+# Try to start tmux session
+if ! tmux new-session -d -s go-master -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data/data/xapian_node' && go run . -config=config-master.json 2>&1 | tee /tmp/go-master.log"; then
+    print_error "❌ Không thể tạo tmux session 'go-master'"
+    print_error "   Kiểm tra: tmux list-sessions"
     exit 1
 fi
+
+# Wait a bit for the session to start
+sleep 2
+
+# Verify Go Master Node is running
+if ! tmux has-session -t go-master 2>/dev/null; then
+    print_error "❌ Tmux session 'go-master' không tồn tại sau khi khởi động"
+    print_error "   Có thể Go Master Node đã crash ngay sau khi khởi động"
+    print_info "   Kiểm tra log:"
+    if [ -f "/tmp/go-master.log" ]; then
+        print_info "   - Log file: /tmp/go-master.log"
+        print_info "   - Last 20 lines:"
+        tail -20 /tmp/go-master.log 2>/dev/null || true
+    fi
+    print_info "   - Hoặc kiểm tra tmux: tmux attach -t go-master"
+    exit 1
+fi
+
+print_info "✅ Go Master Node đã khởi động (tmux session: go-master)"
+sleep 6  # Tăng delay để Go Master có thời gian init genesis block
 
 # CRITICAL: Verify Go Master đã init genesis block (check log)
 print_info "🔍 Kiểm tra Go Master đã init genesis block..."
@@ -539,8 +616,8 @@ else
     print_warn "     Tìm log 'lastblock header 1' (init genesis) hoặc 'lastblock header 2' (dùng block cũ)"
 fi
 
-# Step 6: Start Go Sub Node (sau Go Master, với delay để kết nối)
-print_step "Bước 6: Khởi động Go Sub Node (sau Go Master, delay để kết nối)..."
+# Step 7: Start Go Sub Node (sau Go Master, với delay để kết nối)
+print_step "Bước 7: Khởi động Go Sub Node (sau Go Master, delay để kết nối)..."
 
 cd "$GO_PROJECT_ROOT/cmd/simple_chain" || exit 1
 
@@ -563,27 +640,90 @@ if [ "$FULL_CLEAN_GO_MODCACHE" = "1" ]; then
 fi
 
 # Start in tmux with go run
-tmux new-session -d -s go-sub -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data-write/data/xapian_node' && go run . -config=config-sub-write.json"
+print_info "🚀 Khởi động Go Sub Node trong tmux session 'go-sub'..."
+cd "$GO_PROJECT_ROOT/cmd/simple_chain" || exit 1
+
+# Verify genesis.json exists
+if [ ! -f "$GO_PROJECT_ROOT/cmd/simple_chain/genesis.json" ]; then
+    print_error "❌ Không tìm thấy genesis.json tại $GO_PROJECT_ROOT/cmd/simple_chain/genesis.json"
+    exit 1
+fi
+
+# Try to start tmux session (đảm bảo working directory đúng)
+if ! tmux new-session -d -s go-sub -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
+    "cd '$GO_PROJECT_ROOT/cmd/simple_chain' && export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data-write/data/xapian_node' && go run . -config=config-sub-write.json 2>&1 | tee /tmp/go-sub.log"; then
+    print_error "❌ Không thể tạo tmux session 'go-sub'"
+    print_error "   Kiểm tra: tmux list-sessions"
+    exit 1
+fi
+
+# Wait a bit for the session to start
+sleep 2
+
+# Verify Go Sub Node is running
+if ! tmux has-session -t go-sub 2>/dev/null; then
+    print_error "❌ Tmux session 'go-sub' không tồn tại sau khi khởi động"
+    print_error "   Có thể Go Sub Node đã crash ngay sau khi khởi động"
+    print_info "   Kiểm tra log:"
+    if [ -f "/tmp/go-sub.log" ]; then
+        print_info "   - Log file: /tmp/go-sub.log"
+        print_info "   - Last 20 lines:"
+        tail -20 /tmp/go-sub.log 2>/dev/null || true
+    fi
+    print_info "   - Hoặc kiểm tra tmux: tmux attach -t go-sub"
+    print_info "   - Hoặc xem tất cả sessions: tmux list-sessions"
+    exit 1
+fi
 
 print_info "⏳ Đợi Go Sub Node kết nối với Go Master (15 giây)..."
 sleep 15  # Tăng delay để đảm bảo Go Sub có thời gian kết nối với Go Master
 
-# Verify Go Sub Node is running
-if tmux has-session -t go-sub 2>/dev/null; then
-    print_info "✅ Go Sub Node đã khởi động (tmux session: go-sub)"
-else
-    print_error "Không thể khởi động Go Sub Node!"
+# Verify Go Sub Node is still running after delay
+if ! tmux has-session -t go-sub 2>/dev/null; then
+    print_error "❌ Go Sub Node đã dừng sau khi khởi động (có thể crash)"
+    print_info "   Kiểm tra log:"
+    if [ -f "/tmp/go-sub.log" ]; then
+        print_info "   - Log file: /tmp/go-sub.log"
+        print_info "   - Last 30 lines:"
+        tail -30 /tmp/go-sub.log 2>/dev/null || true
+    fi
+    print_info "   - Hoặc kiểm tra: tmux attach -t go-sub"
     exit 1
 fi
 
-# Thêm delay trước khi khởi động Rust nodes để đảm bảo Go Master và Go Sub đã sẵn sàng
-print_info "⏳ Đợi Go Master và Go Sub hoàn toàn sẵn sàng trước khi khởi động Rust consensus (10 giây)..."
-print_info "   💡 Điều này đảm bảo Go Sub đã kết nối với Go Master và sẵn sàng nhận blocks từ Go Master"
-sleep 10
+print_info "✅ Go Sub Node đã khởi động (tmux session: go-sub)"
 
-# Step 7: Start Rust consensus nodes (sau Go Sub, sau khi Go Sub đã kết nối với Go Master)
-print_step "Bước 7: Khởi động 4 Rust consensus nodes (sau Go Sub, sau khi Go Sub đã kết nối với Go Master)..."
+# Thêm delay trước khi khởi động Rust nodes để đảm bảo Go Master và Go Sub đã sẵn sàng
+print_info "⏳ Đợi Go Master và Go Sub hoàn toàn sẵn sàng trước khi khởi động Rust consensus..."
+print_info "   💡 Điều này đảm bảo Go Sub đã kết nối với Go Master và sẵn sàng nhận blocks từ Go Master"
+
+# Kiểm tra Go Master sẵn sàng (check log hoặc socket)
+print_info "🔍 Kiểm tra Go Master đã sẵn sàng..."
+GO_MASTER_READY=false
+for i in {1..30}; do
+    # Check if Go Master log shows it's ready (có thể check "listening" hoặc "started")
+    if tmux capture-pane -t go-master -p 2>/dev/null | grep -qE "listening|started|ready|initialized" || \
+       [ -S "/tmp/rust-go.sock_2" ] || [ -S "/tmp/rust-go.sock_1" ]; then
+        GO_MASTER_READY=true
+        print_info "  ✅ Go Master đã sẵn sàng (sau $i giây)"
+        break
+    fi
+    if [ $i -lt 30 ]; then
+        sleep 1
+    fi
+done
+
+if [ "$GO_MASTER_READY" = false ]; then
+    print_warn "  ⚠️  Không thể xác nhận Go Master sẵn sàng, nhưng sẽ tiếp tục..."
+    print_warn "     Kiểm tra: tmux attach -t go-master"
+fi
+
+# Thêm delay để đảm bảo Go Master hoàn toàn sẵn sàng
+print_info "⏳ Đợi thêm 5 giây để đảm bảo Go Master hoàn toàn sẵn sàng..."
+sleep 5
+
+# Step 8: Start Rust consensus nodes (sau Go Sub, sau khi Go Sub đã kết nối với Go Master)
+print_step "Bước 8: Khởi động 4 Rust consensus nodes (sau Go Sub, sau khi Go Sub đã kết nối với Go Master)..."
 
 cd "$METANODE_ROOT" || exit 1
 
@@ -593,6 +733,28 @@ export RESET_EPOCH_TIMESTAMP_MS=1
 if [ -f "$METANODE_ROOT/scripts/node/run_nodes.sh" ]; then
     print_info "Khởi động Rust nodes..."
     print_info "💡 Rust nodes sẽ bắt đầu tạo blocks, Go Sub đã sẵn sàng nhận blocks từ Go Master"
+    
+    # CRITICAL: Đảm bảo dừng tất cả Rust nodes cũ trước khi khởi động mới
+    print_info "🔴 Dừng tất cả Rust nodes cũ (nếu có)..."
+    for i in 0 1 2 3; do
+        tmux kill-session -t "metanode-$i" 2>/dev/null && print_info "  ✅ Đã dừng metanode-$i" || true
+    done
+    # Kill all metanode processes
+    ps aux | grep -E "[m]etanode.*start" | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
+    sleep 2
+    
+    # Verify ports are free
+    for port in 9000 9001 9002 9003; do
+        PIDS=$(lsof -ti :$port 2>/dev/null || true)
+        if [ -n "$PIDS" ]; then
+            print_warn "  ⚠️  Port $port vẫn bị chiếm bởi: $PIDS, đang kill..."
+            for PID in $PIDS; do
+                kill -9 "$PID" 2>/dev/null || true
+            done
+        fi
+    done
+    sleep 1
+    
     cd "$METANODE_ROOT" || exit 1
     bash "$METANODE_ROOT/scripts/node/run_nodes.sh"
     sleep 5  # Đợi nodes khởi động
@@ -613,8 +775,8 @@ fi
 print_info "⏳ Đợi Rust nodes sẵn sàng (5 giây)..."
 sleep 5
 
-# Step 8: Verify system
-print_step "Bước 8: Kiểm tra hệ thống..."
+# Step 9: Verify system
+print_step "Bước 9: Kiểm tra hệ thống..."
 
 sleep 5
 
