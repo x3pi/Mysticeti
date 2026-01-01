@@ -1105,7 +1105,7 @@ impl ConsensusNode {
         Ok(unique_count)
     }
 
-    pub async fn shutdown(mut self) -> Result<()> {
+    pub async fn shutdown(self) -> Result<()> {
         info!("Shutting down consensus node...");
         if let Some(authority) = self.authority {
             authority.stop().await;
@@ -2114,8 +2114,19 @@ impl ConsensusNode {
                         new_epoch
                     );
                     
+                    // Get the directory containing the binary (where config.toml should be)
+                    let bin_dir = bin_path.parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    
+                    info!(
+                        "📸 Executing lvm-snap-rsync from directory: {:?}",
+                        bin_dir
+                    );
+                    
                     // Execute lvm-snap-rsync command with epoch ID
+                    // CRITICAL: Set working directory to bin_dir so config.toml can be found
                     let output = std::process::Command::new("sudo")
+                        .current_dir(bin_dir)
                         .arg(bin_path)
                         .arg("--id")
                         .arg(new_epoch.to_string())

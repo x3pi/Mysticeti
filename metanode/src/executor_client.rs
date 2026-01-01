@@ -173,6 +173,11 @@ impl ExecutorClient {
         // Count total transactions before sending
         let total_tx: usize = subdag.blocks.iter().map(|b| b.transactions().len()).sum();
         
+        // NOTE: Removed duplicate check here - duplicate prevention is handled at the source
+        // (commit_processor checks barrier BEFORE calculating global_exec_index and BEFORE sending)
+        // If we see duplicate here, it means barrier check failed, which is a critical bug
+        // We keep this check as a safety net, but the real fix is to ensure barrier check works correctly
+        
         // SEQUENTIAL BUFFERING: Add to buffer and try to send in order
         {
             let mut buffer = self.send_buffer.lock().await;

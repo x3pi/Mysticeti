@@ -375,14 +375,13 @@ impl CommitProcessor {
         // 1. Commit #1212 processed (barrier not set yet)
         // 2. Barrier set = 1209 (commit #1212 > barrier → past barrier)
         // 3. Commit #1212 about to be sent → should be skipped!
-        let mut barrier_snapshot: u32 = 0;
+        // 
+        // IMPORTANT: Always check current barrier value, don't use snapshot here
+        // because barrier_snapshot in run() loop may be different from barrier when this commit is sent
         let (is_past_barrier_now, barrier_value_now) = if let Some(barrier) = transition_barrier.as_ref() {
             let barrier_val = barrier.load(Ordering::Relaxed);
-            if barrier_val > 0 {
-                barrier_snapshot = barrier_val;
-            }
-            let effective_barrier = if barrier_val > 0 { barrier_val } else { barrier_snapshot };
-            (effective_barrier > 0 && commit_index > effective_barrier, effective_barrier)
+            // If barrier is set (barrier_val > 0) and commit_index > barrier, then commit is past barrier
+            (barrier_val > 0 && commit_index > barrier_val, barrier_val)
         } else {
             (false, 0)
         };
@@ -495,8 +494,15 @@ impl CommitProcessor {
                 info!("📤 [TX FLOW] Sending committed subdag to Go executor: global_exec_index={}, commit_index={}, epoch={}, blocks={}, total_tx={}", 
                     send_global_exec_index, commit_index, send_epoch, subdag.blocks.len(), total_transactions);
                 if let Err(e) = client.send_committed_subdag(subdag, send_epoch, send_global_exec_index).await {
-                    warn!("⚠️  [TX FLOW] Failed to send committed subdag to executor: {}", e);
-                    // Don't fail commit if executor is unavailable
+                    // CRITICAL FORK-SAFETY: If duplicate global_exec_index detected, this is a serious bug
+                    // Log error and skip this commit to prevent fork
+                    if e.to_string().contains("Duplicate global_exec_index") {
+                        warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! This commit will be skipped to prevent fork. Error: {}", 
+                            send_global_exec_index, e);
+                    } else {
+                        warn!("⚠️  [TX FLOW] Failed to send committed subdag to executor: {}", e);
+                        // Don't fail commit if executor is unavailable (network issues, etc.)
+                    }
                 } else {
                     info!("✅ [TX FLOW] Successfully sent committed subdag to Go executor: global_exec_index={}, commit_index={}, epoch={}, blocks={}", 
                         send_global_exec_index, commit_index, send_epoch, subdag.blocks.len());
@@ -530,8 +536,15 @@ impl CommitProcessor {
             
             if let Some(ref client) = executor_client {
                 if let Err(e) = client.send_committed_subdag(subdag, send_epoch, send_global_exec_index).await {
-                    warn!("⚠️  Failed to send committed subdag to executor: {}", e);
-                    // Don't fail commit if executor is unavailable
+                    // CRITICAL FORK-SAFETY: If duplicate global_exec_index detected, this is a serious bug
+                    // Log error and skip this commit to prevent fork
+                    if e.to_string().contains("Duplicate global_exec_index") {
+                        warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! This empty commit will be skipped to prevent fork. Error: {}", 
+                            send_global_exec_index, e);
+                    } else {
+                        warn!("⚠️  Failed to send committed subdag to executor: {}", e);
+                        // Don't fail commit if executor is unavailable (network issues, etc.)
+                    }
                 }
             }
         }

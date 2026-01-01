@@ -69,7 +69,7 @@ ls -l /mnt/lvm_public/latest
 Tạo file `/etc/rsyncd.conf` như sau:
 ```
 [snapshots]
-  path = /mnt/lvm_public/latest
+  path = /mnt/lvm_public
   read only = yes
   comment = Only share latest snapshot subdir
 ```

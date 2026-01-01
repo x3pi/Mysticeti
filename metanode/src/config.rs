@@ -155,7 +155,7 @@ fn default_adaptive_delay_ms() -> u64 {
 }
 
 fn default_lvm_snapshot_delay_seconds() -> u64 {
-    120 // Default delay: 2 minutes (120 seconds)
+    5 // Default delay: 5 seconds
 }
 
 impl NodeConfig {
