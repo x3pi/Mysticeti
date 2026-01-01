@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::{
+    adaptive_delay::AdaptiveDelayState,
     CommitConsumerArgs,
     authority_service::AuthorityService,
     block_manager::BlockManager,
@@ -175,6 +176,10 @@ where
         );
         info!("Consensus parameters: {:?}", parameters);
         info!("Consensus committee: {:?}", committee);
+        
+        // Save min_round_delay before moving parameters into Context
+        let min_round_delay_ms = parameters.min_round_delay.as_millis() as u64;
+        
         let context = Arc::new(Context::new(
             epoch_start_timestamp_ms,
             own_index,
@@ -258,6 +263,14 @@ where
 
         let round_tracker = Arc::new(RwLock::new(PeerRoundTracker::new(context.clone())));
 
+        // Create adaptive delay state (enabled by default with base delay from min_round_delay)
+        // TODO: Make this configurable from NodeConfig (currently using default: enabled, base_delay = min_round_delay)
+        let adaptive_delay_state = Arc::new(AdaptiveDelayState::new(
+            min_round_delay_ms,
+            true, // enabled by default - can be configured via NodeConfig in the future
+        ));
+        info!("Adaptive delay enabled: base_delay={}ms", min_round_delay_ms);
+
         let core = Core::new(
             context.clone(),
             leader_schedule,
@@ -270,6 +283,7 @@ where
             dag_state.clone(),
             sync_last_known_own_block,
             round_tracker.clone(),
+            Some(adaptive_delay_state.clone()),
         );
 
         let (core_dispatcher, core_thread_handle) =
@@ -300,6 +314,7 @@ where
             transaction_certifier.clone(),
             network_client.clone(),
             dag_state.clone(),
+            Some(adaptive_delay_state.clone()),
         )
         .start();
 

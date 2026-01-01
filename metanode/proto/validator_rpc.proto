@@ -25,6 +25,12 @@ message GetValidatorsAtBlockRequest {
     uint64 block_number = 1;  // Block number (0 cho genesis, last_global_exec_index cho epoch transition)
 }
 
+// Request để lấy last block number từ Go Master
+// Dùng để khởi tạo next_expected_index trong Rust executor_client
+message GetLastBlockNumberRequest {
+    // Không cần tham số, lấy từ DB
+}
+
 // Validator info từ Go state - các trường cần thiết cho committee.json + metadata + phí/phần thưởng
 message ValidatorInfo {
     // Các trường cần thiết cho committee.json (tên khớp với committee.json)
@@ -54,6 +60,11 @@ message ValidatorInfoList {
     uint64 last_global_exec_index = 3;    // Last global execution index from previous epoch
 }
 
+// Response cho GetLastBlockNumberRequest
+message LastBlockNumberResponse {
+    uint64 last_block_number = 1;  // Last block number from Go Master DB
+}
+
 // Request message
 // CRITICAL: Field numbers MUST match Go validator.proto for compatibility
 // Go validator.proto field numbers:
@@ -61,12 +72,14 @@ message ValidatorInfoList {
 //   - StatusRequest status_request = 2
 //   - GetActiveValidatorsRequest get_active_validators_request = 3
 //   - GetValidatorsAtBlockRequest get_validators_at_block_request = 4
+//   - GetLastBlockNumberRequest get_last_block_number_request = 5
 message Request {
     oneof payload {
         BlockRequest block_request = 1;  // Match Go
         StatusRequest status_request = 2;  // Match Go
         GetActiveValidatorsRequest get_active_validators_request = 3;  // Match Go
         GetValidatorsAtBlockRequest get_validators_at_block_request = 4;  // Match Go (was 2, fixed to 4)
+        GetLastBlockNumberRequest get_last_block_number_request = 5;  // New: Get last block number
     }
 }
 
@@ -78,6 +91,7 @@ message Response {
         ValidatorInfoList validator_info_list = 2; // Cho epoch transition - khớp với Go
         ServerStatus server_status = 3;  // Khớp với Go (không dùng nhưng cần để field numbers đúng)
         string error = 4; // Error message nếu có lỗi - khớp với Go
+        LastBlockNumberResponse last_block_number_response = 5;  // New: Last block number response
     }
 }
 

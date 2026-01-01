@@ -94,6 +94,25 @@ pub struct NodeConfig {
     /// Enable adaptive catch-up: automatically increase batch size and parallel fetches when lagging (default: true)
     #[serde(default = "default_adaptive_catchup")]
     pub adaptive_catchup_enabled: bool,
+    /// Enable adaptive delay: automatically adjust delay based on network average speed (default: true)
+    /// When enabled, if node is faster than network average, it will automatically add delay to sync with network
+    #[serde(default = "default_adaptive_delay")]
+    pub adaptive_delay_enabled: bool,
+    /// Base delay in milliseconds for adaptive delay calculation (default: 50ms)
+    /// This is used as base when calculating adaptive delay when node is ahead of network
+    #[serde(default = "default_adaptive_delay_ms")]
+    pub adaptive_delay_ms: u64,
+    /// Enable LVM snapshot creation after epoch transition (default: false)
+    /// Only nodes with this enabled will create snapshots
+    #[serde(default)]
+    pub enable_lvm_snapshot: bool,
+    /// Path to lvm-snap-rsync binary (required if enable_lvm_snapshot = true)
+    #[serde(default)]
+    pub lvm_snapshot_bin_path: Option<PathBuf>,
+    /// Delay in seconds before creating snapshot after epoch transition (default: 120 = 2 minutes)
+    /// This delay allows Go executor to finish processing and stabilize before snapshot
+    #[serde(default = "default_lvm_snapshot_delay_seconds")]
+    pub lvm_snapshot_delay_seconds: u64,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -125,6 +144,18 @@ fn default_commit_sync_batches_ahead() -> usize {
 
 fn default_adaptive_catchup() -> bool {
     true // Enable adaptive catch-up by default
+}
+
+fn default_adaptive_delay() -> bool {
+    true // Enable adaptive delay by default
+}
+
+fn default_adaptive_delay_ms() -> u64 {
+    50 // Default base delay: 50ms
+}
+
+fn default_lvm_snapshot_delay_seconds() -> u64 {
+    120 // Default delay: 2 minutes (120 seconds)
 }
 
 impl NodeConfig {
@@ -180,7 +211,7 @@ impl NodeConfig {
                 leader_timeout_ms: None,
                 min_round_delay_ms: None,
                 time_based_epoch_change: true, // Enabled by default
-                epoch_duration_seconds: Some(86400), // Default: 1 day (24 * 60 * 60 seconds)
+                epoch_duration_seconds: Some(300), // Default: 5 minutes (5 * 60 seconds)
                 max_clock_drift_seconds: 5,
                 enable_ntp_sync: false, // Disabled by default (enable for production)
                 ntp_servers: default_ntp_servers(),
@@ -190,6 +221,11 @@ impl NodeConfig {
                 commit_sync_parallel_fetches: default_commit_sync_parallel_fetches(),
                 commit_sync_batches_ahead: default_commit_sync_batches_ahead(),
                 adaptive_catchup_enabled: default_adaptive_catchup(),
+                adaptive_delay_enabled: default_adaptive_delay(),
+                adaptive_delay_ms: default_adaptive_delay_ms(),
+                enable_lvm_snapshot: false, // Disabled by default
+                lvm_snapshot_bin_path: None,
+                lvm_snapshot_delay_seconds: default_lvm_snapshot_delay_seconds(),
             };
 
             // Save keys - use private_key_bytes and public key bytes

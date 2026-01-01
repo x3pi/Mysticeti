@@ -47,7 +47,6 @@ kill -9 <pid>
 - Đây là hành vi bình thường
 - Có thể giảm recovery time bằng cách:
   - Tăng GC round để xóa dữ liệu cũ
-  - Sử dụng snapshot thay vì full recovery
 
 ### Committee mismatch
 

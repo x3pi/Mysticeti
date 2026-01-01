@@ -74,6 +74,10 @@ pub struct ConsensusNode {
     /// Queue for transactions received during barrier phase
     /// Transactions in this queue will be submitted to consensus in the next epoch
     pending_transactions_queue: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    /// LVM snapshot configuration (from config)
+    enable_lvm_snapshot: bool,
+    lvm_snapshot_bin_path: Option<std::path::PathBuf>,
+    lvm_snapshot_delay_seconds: u64,
 }
 
 impl ConsensusNode {
@@ -236,6 +240,14 @@ impl ConsensusNode {
             let executor_client = Arc::new(ExecutorClient::new(true, node_id));
             info!("✅ Executor client enabled for initial startup (node_id={}, socket=/tmp/executor{}.sock)", 
                 node_id, node_id);
+            
+            // Initialize next_expected_index from Go Master (only once at startup)
+            // After this, Rust will send blocks continuously and Go will buffer/process them sequentially
+            let executor_client_for_init = executor_client.clone();
+            tokio::spawn(async move {
+                executor_client_for_init.initialize_from_go().await;
+            });
+            
             commit_processor = commit_processor.with_executor_client(executor_client);
         } else {
             info!("ℹ️  Executor client disabled for initial startup (node_id={}, consensus only - executor_enabled=false in config)", config.node_id);
@@ -270,6 +282,9 @@ impl ConsensusNode {
             parameters.commit_sync_parallel_fetches,
             parameters.commit_sync_batches_ahead,
             config.adaptive_catchup_enabled);
+        info!("Adaptive delay: enabled={}, base_delay_ms={}", 
+            config.adaptive_delay_enabled,
+            config.adaptive_delay_ms);
 
         // Apply speed multiplier to consensus parameters (to slow down system)
         let speed_multiplier = config.speed_multiplier;
@@ -389,6 +404,7 @@ impl ConsensusNode {
             config.ntp_sync_interval_seconds,
             config.enable_ntp_sync,
         )));
+
 
         // Start clock sync tasks if enabled
         if config.enable_ntp_sync {
@@ -777,6 +793,9 @@ impl ConsensusNode {
             transition_barrier,
             global_exec_index_at_barrier,
             pending_transactions_queue,
+            enable_lvm_snapshot: config.enable_lvm_snapshot,
+            lvm_snapshot_bin_path: config.lvm_snapshot_bin_path,
+            lvm_snapshot_delay_seconds: config.lvm_snapshot_delay_seconds,
         })
     }
 
@@ -1086,7 +1105,7 @@ impl ConsensusNode {
         Ok(unique_count)
     }
 
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(mut self) -> Result<()> {
         info!("Shutting down consensus node...");
         if let Some(authority) = self.authority {
             authority.stop().await;
@@ -1578,6 +1597,22 @@ impl ConsensusNode {
             transition_commit_index
         );
         
+        // 2) Calculate last_global_exec_index at barrier (block number cuối cùng của epoch cũ)
+        // CRITICAL: This is the block number that Go executor MUST finish processing before snapshot
+        let old_epoch = self.current_epoch;
+        let last_commit_index_at_barrier = transition_commit_index;
+        let last_global_exec_index_at_barrier = calculate_global_exec_index(
+            old_epoch,
+            last_commit_index_at_barrier,
+            self.last_global_exec_index,
+        );
+        info!(
+            "📊 [SNAPSHOT] Last block of epoch {}: global_exec_index={} (commit_index={})",
+            old_epoch,
+            last_global_exec_index_at_barrier,
+            last_commit_index_at_barrier
+        );
+
         // 3) Graceful shutdown current authority (best-effort)
         self.graceful_shutdown().await?;
 
@@ -1589,18 +1624,11 @@ impl ConsensusNode {
         //
         // IMPORTANT: Commits past barrier MUST NOT be sent to Go Master (they are skipped in commit_processor)
         // This ensures Go Master only receives commits before barrier → sequential processing → no duplicate
-        let old_epoch = self.current_epoch;
+        // Note: old_epoch and last_global_exec_index_at_barrier already calculated above
         let last_commit_index = transition_commit_index; // Use barrier, not current_commit_index! (DETERMINISTIC)
-        let new_last_global_exec_index_from_barrier = calculate_global_exec_index(
-            old_epoch,
-            last_commit_index,
-            self.last_global_exec_index,
-        );
-        
-        // CRITICAL FORK-SAFETY: All nodes MUST use the same new_last_global_exec_index (from barrier)
-        // Even if a node processed commits past barrier (e.g., 1282, 1283), we MUST use barrier value
-        // This ensures all nodes compute the same global_exec_index for the new epoch
-        let new_last_global_exec_index = new_last_global_exec_index_from_barrier;
+        // Use the already calculated last_global_exec_index_at_barrier as new_last_global_exec_index
+        // This is the block number at barrier (last block of old epoch)
+        let new_last_global_exec_index = last_global_exec_index_at_barrier;
         
         if commit_index_diff > 0 {
             warn!(
@@ -1611,7 +1639,7 @@ impl ConsensusNode {
             );
             warn!(
                 "   - Barrier global_exec_index: {} (USED for fork-safety - deterministic)",
-                new_last_global_exec_index_from_barrier
+                new_last_global_exec_index
             );
             let last_sent_global_exec_index = calculate_global_exec_index(
                 old_epoch,
@@ -1871,6 +1899,13 @@ impl ConsensusNode {
         
         // Add executor client if enabled
         if let Some(ref client) = executor_client {
+            // Initialize next_expected_index from Go Master (only once at epoch transition)
+            // After this, Rust will send blocks continuously and Go will buffer/process them sequentially
+            let executor_client_for_init = client.clone();
+            tokio::spawn(async move {
+                executor_client_for_init.initialize_from_go().await;
+            });
+            
             commit_processor = commit_processor.with_executor_client(client.clone());
         }
         
@@ -2055,6 +2090,72 @@ impl ConsensusNode {
             "✅ Epoch transition COMPLETE in-process: now running epoch {} (clean consensus DB per-epoch).",
             proposal.new_epoch
         );
+        
+        // Trigger LVM snapshot creation if enabled (after delay to allow Go executor to stabilize)
+        if self.enable_lvm_snapshot {
+            if let Some(ref bin_path) = self.lvm_snapshot_bin_path {
+                let bin_path = bin_path.clone();
+                let new_epoch = proposal.new_epoch;
+                let delay_seconds = self.lvm_snapshot_delay_seconds;
+                
+                info!(
+                    "📸 LVM Snapshot scheduled: will create snapshot for epoch {} after {} seconds delay",
+                    new_epoch,
+                    delay_seconds
+                );
+                
+                // Spawn async task to delay and create snapshot
+                tokio::spawn(async move {
+                    // Wait for delay to allow Go executor to finish processing and stabilize
+                    tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds)).await;
+                    
+                    info!(
+                        "📸 Creating LVM snapshot for epoch {} (delay completed)",
+                        new_epoch
+                    );
+                    
+                    // Execute lvm-snap-rsync command with epoch ID
+                    let output = std::process::Command::new("sudo")
+                        .arg(bin_path)
+                        .arg("--id")
+                        .arg(new_epoch.to_string())
+                        .output();
+                    
+                    match output {
+                        Ok(result) => {
+                            if result.status.success() {
+                                let stdout = String::from_utf8_lossy(&result.stdout);
+                                info!(
+                                    "✅ LVM snapshot created successfully for epoch {}:\n{}",
+                                    new_epoch,
+                                    stdout
+                                );
+                            } else {
+                                let stderr = String::from_utf8_lossy(&result.stderr);
+                                tracing::warn!(
+                                    "⚠️  LVM snapshot creation failed for epoch {}:\n{}",
+                                    new_epoch,
+                                    stderr
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "❌ Failed to execute LVM snapshot command for epoch {}: {}",
+                                new_epoch,
+                                e
+                            );
+                        }
+                    }
+                });
+            } else {
+                tracing::warn!(
+                    "⚠️  LVM snapshot enabled but lvm_snapshot_bin_path not configured for epoch {}",
+                    proposal.new_epoch
+                );
+            }
+        }
+        
         Ok(())
     }
 }

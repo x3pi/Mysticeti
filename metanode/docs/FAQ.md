@@ -75,7 +75,6 @@ consensus_db/
 
 **Tối ưu:**
 - Tăng GC round để xóa dữ liệu cũ
-- Sử dụng snapshot thay vì full recovery
 - Sử dụng SSD để tăng tốc I/O
 
 ### Q: Recovery process hoạt động như thế nào?
@@ -128,7 +127,6 @@ INFO: Consensus authority started, took 42.6s
 
 **Có thể tối ưu:**
 - **Tăng GC round**: Xóa dữ liệu cũ, giảm số commits cần recover
-- **Snapshot**: Lưu snapshot định kỳ, recover từ snapshot thay vì từ đầu
 - **Lazy loading**: Chỉ load dữ liệu cần thiết, load thêm khi cần
 
 **Tăng GC round:**
@@ -228,10 +226,6 @@ rm -rf config/storage/
 **4. Parallel Fetching**
 - Tăng `commit_sync_parallel_fetches`
 - Fetch nhiều blocks song song
-
-**5. Snapshot**
-- Lưu snapshot định kỳ
-- Recover từ snapshot thay vì từ đầu
 
 ### Q: Làm sao biết recovery đã hoàn thành?
 

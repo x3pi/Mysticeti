@@ -47,6 +47,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    adaptive_delay::AdaptiveDelayState,
     CommitConsumerMonitor, CommitIndex,
     block::{BlockAPI, SignedBlock, VerifiedBlock},
     block_verifier::BlockVerifier,
@@ -114,6 +115,9 @@ pub(crate) struct CommitSyncer<C: NetworkClient> {
     // --- sync mode detection ---
     is_sync_mode: bool, // True when node is in aggressive sync mode due to significant lag
     last_sync_mode_log_at: tokio::time::Instant,
+    
+    // --- adaptive delay ---
+    adaptive_delay_state: Option<Arc<AdaptiveDelayState>>,
 }
 
 impl<C: NetworkClient> CommitSyncer<C> {
@@ -126,6 +130,7 @@ impl<C: NetworkClient> CommitSyncer<C> {
         transaction_certifier: TransactionCertifier,
         network_client: Arc<C>,
         dag_state: Arc<RwLock<DagState>>,
+        adaptive_delay_state: Option<Arc<AdaptiveDelayState>>,
     ) -> Self {
         let inner = Arc::new(Inner {
             context,
@@ -151,6 +156,7 @@ impl<C: NetworkClient> CommitSyncer<C> {
             last_logged_local_commit_index: 0,
             is_sync_mode: false,
             last_sync_mode_log_at: tokio::time::Instant::now() - Duration::from_secs(300),
+            adaptive_delay_state,
         }
     }
 
@@ -240,6 +246,11 @@ impl<C: NetworkClient> CommitSyncer<C> {
         metrics
             .commit_sync_local_index
             .set(local_commit_index as i64);
+        
+        // Update quorum commit rate tracker for adaptive delay
+        if let Some(adaptive_delay_state) = &self.adaptive_delay_state {
+            adaptive_delay_state.update_quorum_commit(quorum_commit_index);
+        }
         let highest_handled_index = self.inner.commit_consumer_monitor.highest_handled_commit();
         let highest_scheduled_index = self.highest_scheduled_index.unwrap_or(0);
         // Update synced_commit_index periodically to make sure it is no smaller than

@@ -23,6 +23,7 @@ pub mod proto {
 // So we can use the same proto module for all messages
 
 use proto::{CommittedBlock, CommittedEpochData, TransactionExe, GetActiveValidatorsRequest, GetValidatorsAtBlockRequest, Request, Response, ValidatorInfo};
+use std::collections::BTreeMap;
 
 /// Client to send committed blocks to Go executor via Unix Domain Socket
 /// Only enabled when config file exists (typically only node 0)
@@ -32,6 +33,11 @@ pub struct ExecutorClient {
     request_socket_path: String, // For sending requests (Rust -> Go)
     request_connection: Arc<Mutex<Option<UnixStream>>>,
     enabled: bool,
+    /// Buffer for out-of-order blocks to ensure sequential sending
+    /// Key: global_exec_index, Value: (epoch_data_bytes, epoch, commit_index)
+    send_buffer: Arc<Mutex<BTreeMap<u64, (Vec<u8>, u64, u32)>>>,
+    /// Next expected global_exec_index to send
+    next_expected_index: Arc<tokio::sync::Mutex<u64>>,
 }
 
 impl ExecutorClient {
@@ -52,6 +58,8 @@ impl ExecutorClient {
             enabled,
             request_socket_path,
             request_connection: Arc::new(Mutex::new(None)),
+            send_buffer: Arc::new(Mutex::new(BTreeMap::new())),
+            next_expected_index: Arc::new(tokio::sync::Mutex::new(1)), // Start from 1
         }
     }
 
@@ -60,7 +68,41 @@ impl ExecutorClient {
         self.enabled
     }
 
+    /// Initialize next_expected_index from Go Master's last block number
+    /// This should be called ONCE when executor client is created, not on every connect
+    /// After initialization, Rust will send blocks continuously and Go will buffer/process them sequentially
+    /// CRITICAL: Only update next_expected if Go Master has processed more blocks (don't reset to old value)
+    pub async fn initialize_from_go(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        
+        // Query Go Master for last block number (only once at startup)
+        if let Ok(last_block_number) = self.get_last_block_number().await {
+            let new_next_expected = last_block_number + 1;
+            let mut next_expected_guard = self.next_expected_index.lock().await;
+            let current_next_expected = *next_expected_guard;
+            
+            // CRITICAL: Only update if Go Master has processed more blocks than we've sent
+            // This prevents resetting next_expected to an old value (e.g., 50002) when Rust has already sent blocks up to 74860
+            if new_next_expected > current_next_expected {
+                *next_expected_guard = new_next_expected;
+                info!("📊 [INIT] Updated next_expected_index from Go Master: last_block_number={}, old_next_expected={}, new_next_expected={}", 
+                    last_block_number, current_next_expected, new_next_expected);
+            } else if new_next_expected < current_next_expected {
+                warn!("⚠️  [INIT] Go Master last_block_number={} (next_expected={}) is LESS than current next_expected={}. This means Rust has already sent blocks that Go hasn't processed yet. Keeping current value to avoid resetting progress.",
+                    last_block_number, new_next_expected, current_next_expected);
+            } else {
+                info!("📊 [INIT] next_expected_index already correct: last_block_number={}, next_expected={}", 
+                    last_block_number, current_next_expected);
+            }
+        } else {
+            warn!("⚠️  [INIT] Failed to get last block number from Go Master. Keeping current next_expected_index. Rust will continue sending blocks, Go will buffer and process sequentially.");
+        }
+    }
+
     /// Connect to executor socket (lazy connection with retry)
+    /// Just connects, doesn't query Go - Rust sends blocks continuously, Go buffers and processes sequentially
     async fn connect(&self) -> Result<()> {
         let mut conn_guard = self.connection.lock().await;
         
@@ -113,6 +155,7 @@ impl ExecutorClient {
 
     /// Send committed sub-DAG to executor
     /// CRITICAL FORK-SAFETY: global_exec_index and commit_index ensure deterministic execution order
+    /// SEQUENTIAL BUFFERING: Blocks are buffered and sent in order to ensure Go receives them sequentially
     pub async fn send_committed_subdag(
         &self,
         subdag: &CommittedSubDag,
@@ -123,12 +166,6 @@ impl ExecutorClient {
             return Ok(()); // Silently skip if not enabled
         }
 
-        // Connect if needed
-        if let Err(e) = self.connect().await {
-            warn!("⚠️  Executor connection failed, skipping send: {}", e);
-            return Ok(()); // Don't fail commit if executor is unavailable
-        }
-
         // Convert CommittedSubDag to protobuf CommittedEpochData
         // CRITICAL FORK-SAFETY: Include global_exec_index and commit_index for deterministic ordering
         let epoch_data_bytes = self.convert_to_protobuf(subdag, epoch, global_exec_index)?;
@@ -136,6 +173,118 @@ impl ExecutorClient {
         // Count total transactions before sending
         let total_tx: usize = subdag.blocks.iter().map(|b| b.transactions().len()).sum();
         
+        // SEQUENTIAL BUFFERING: Add to buffer and try to send in order
+        {
+            let mut buffer = self.send_buffer.lock().await;
+            buffer.insert(global_exec_index, (epoch_data_bytes, epoch, subdag.commit_ref.index));
+            info!("📦 [SEQUENTIAL-BUFFER] Added block to buffer: global_exec_index={}, commit_index={}, epoch={}, blocks={}, total_tx={}, buffer_size={}",
+                global_exec_index, subdag.commit_ref.index, epoch, subdag.blocks.len(), total_tx, buffer.len());
+        }
+        
+        // Try to send buffered blocks in order
+        self.flush_buffer().await?;
+        
+        Ok(())
+    }
+    
+    /// Flush buffered blocks in sequential order
+    /// This ensures Go executor receives blocks in the correct order even if Rust sends them out-of-order
+    async fn flush_buffer(&self) -> Result<()> {
+        // Connect if needed
+        if let Err(e) = self.connect().await {
+            warn!("⚠️  Executor connection failed, cannot flush buffer: {}", e);
+            return Ok(()); // Don't fail if executor is unavailable
+        }
+        
+        // CRITICAL: Do NOT skip blocks - ensure all blocks are sent sequentially
+        // If next_expected is behind, it means blocks are missing - we must wait for them
+        // Do not skip to min_buffered as this would break sequential ordering
+        // Instead, log a warning and let the system handle missing blocks through retry mechanism
+        {
+            let buffer = self.send_buffer.lock().await;
+            let next_expected = self.next_expected_index.lock().await;
+            if !buffer.is_empty() {
+                let min_buffered = *buffer.keys().next().unwrap_or(&0);
+                let gap = min_buffered.saturating_sub(*next_expected);
+                
+                // If gap is large, it means blocks are missing - log warning but do NOT skip
+                // We must send blocks sequentially, so we wait for the missing blocks
+                if gap > 100 {
+                    warn!("⚠️  [SEQUENTIAL-BUFFER] Large gap detected: next_expected={}, min_buffered={}, gap={}. Missing blocks detected - waiting for blocks to arrive. Do NOT skip to maintain sequential ordering.",
+                        *next_expected, min_buffered, gap);
+                }
+            }
+        }
+        
+        // Send all consecutive blocks starting from next_expected
+        loop {
+            // Get current next_expected and check if we have that block
+            let current_expected = {
+                let next_expected = self.next_expected_index.lock().await;
+                *next_expected
+            };
+            
+            // Try to get the block for current_expected
+            let block_data = {
+                let mut buffer = self.send_buffer.lock().await;
+                buffer.remove(&current_expected)
+            };
+            
+            if let Some((epoch_data_bytes, epoch, commit_index)) = block_data {
+                // This is the next expected block - send it immediately
+                info!("📤 [SEQUENTIAL-BUFFER] Sending block: global_exec_index={}, commit_index={}, epoch={}, size={} bytes",
+                    current_expected, commit_index, epoch, epoch_data_bytes.len());
+                
+                if let Err(e) = self.send_block_data(&epoch_data_bytes, current_expected, epoch, commit_index).await {
+                    warn!("⚠️  [SEQUENTIAL-BUFFER] Failed to send block global_exec_index={}: {}, re-adding to buffer", 
+                        current_expected, e);
+                    // Re-add to buffer for retry
+                    let mut buffer_retry = self.send_buffer.lock().await;
+                    buffer_retry.insert(current_expected, (epoch_data_bytes, epoch, commit_index));
+                    return Ok(());
+                }
+                
+                // Successfully sent, increment next_expected
+                {
+                    let mut next_expected = self.next_expected_index.lock().await;
+                    *next_expected += 1;
+                    info!("✅ [SEQUENTIAL-BUFFER] Successfully sent block global_exec_index={}, next_expected={}", 
+                        current_expected, *next_expected);
+                }
+            } else {
+                // No more consecutive blocks to send
+                break;
+            }
+        }
+        
+        // Log buffer status
+        {
+            let buffer = self.send_buffer.lock().await;
+            let next_expected = self.next_expected_index.lock().await;
+            if !buffer.is_empty() {
+                let min_buffered = *buffer.keys().next().unwrap_or(&0);
+                let max_buffered = *buffer.keys().last().unwrap_or(&0);
+                if buffer.len() > 10 {
+                    warn!("⚠️  [SEQUENTIAL-BUFFER] Buffer has {} blocks waiting (range: {}..{}, next_expected={}). Some blocks may be missing or out-of-order.",
+                        buffer.len(), min_buffered, max_buffered, *next_expected);
+                } else {
+                    info!("📊 [SEQUENTIAL-BUFFER] Buffer has {} blocks waiting (range: {}..{}, next_expected={})",
+                        buffer.len(), min_buffered, max_buffered, *next_expected);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Send block data via UDS (internal helper)
+    async fn send_block_data(
+        &self,
+        epoch_data_bytes: &[u8],
+        global_exec_index: u64,
+        epoch: u64,
+        commit_index: u32,
+    ) -> Result<()> {
         // Send via UDS with Uvarint length prefix (Go expects Uvarint)
         let mut conn_guard = self.connection.lock().await;
         if let Some(ref mut stream) = *conn_guard {
@@ -150,7 +299,7 @@ impl ExecutorClient {
             
             let send_result = timeout(SEND_TIMEOUT, async {
                 stream.write_all(&len_buf).await?;
-                stream.write_all(&epoch_data_bytes).await?;
+                stream.write_all(epoch_data_bytes).await?;
                 stream.flush().await?;
                 Ok::<(), std::io::Error>(())
             }).await;
@@ -160,28 +309,29 @@ impl ExecutorClient {
                 Ok(Err(e)) => Err(e),
                 Err(_) => {
                     // Timeout occurred
-                    warn!("⏱️  [EXECUTOR] Send timeout after {}s (commit_index={}), closing connection", 
-                        SEND_TIMEOUT.as_secs(), subdag.commit_ref.index);
+                    warn!("⏱️  [EXECUTOR] Send timeout after {}s (global_exec_index={}, commit_index={}), closing connection", 
+                        SEND_TIMEOUT.as_secs(), global_exec_index, commit_index);
                     *conn_guard = None; // Clear connection
-                    return Ok(()); // Don't fail commit, just skip send
+                    return Err(anyhow::anyhow!("Send timeout"));
                 }
             };
             
             match send_result {
                 Ok(_) => {
-                    info!("📤 [TX FLOW] Sent committed sub-DAG to Go executor: global_exec_index={}, commit_index={}, epoch={}, blocks={}, total_tx={}, data_size={} bytes", 
-                        global_exec_index, subdag.commit_ref.index, epoch, subdag.blocks.len(), total_tx, epoch_data_bytes.len());
+                    info!("📤 [TX FLOW] Sent committed sub-DAG to Go executor: global_exec_index={}, commit_index={}, epoch={}, data_size={} bytes", 
+                        global_exec_index, commit_index, epoch, epoch_data_bytes.len());
+                    Ok(())
                 }
                 Err(e) => {
-                    warn!("⚠️  [EXECUTOR] Failed to send committed sub-DAG (commit_index={}, total_tx={}): {}, reconnecting...", 
-                        subdag.commit_ref.index, total_tx, e);
+                    warn!("⚠️  [EXECUTOR] Failed to send committed sub-DAG (global_exec_index={}, commit_index={}): {}, reconnecting...", 
+                        global_exec_index, commit_index, e);
                     // Connection is dead, clear it so next send will reconnect
                     *conn_guard = None;
                     // Retry send after reconnection
                     drop(conn_guard);
                     if let Err(reconnect_err) = self.connect().await {
                         warn!("⚠️  [EXECUTOR] Failed to reconnect after send error: {}", reconnect_err);
-                        return Ok(()); // Don't fail commit if executor is unavailable
+                        return Err(anyhow::anyhow!("Reconnection failed: {}", reconnect_err));
                     }
                     // Retry send with timeout
                     let mut retry_guard = self.connection.lock().await;
@@ -191,34 +341,38 @@ impl ExecutorClient {
                         
                         let retry_result = timeout(SEND_TIMEOUT, async {
                             retry_stream.write_all(&retry_len_buf).await?;
-                            retry_stream.write_all(&epoch_data_bytes).await?;
+                            retry_stream.write_all(epoch_data_bytes).await?;
                             retry_stream.flush().await?;
                             Ok::<(), std::io::Error>(())
                         }).await;
                         
                         match retry_result {
                             Ok(Ok(())) => {
-                                info!("✅ [EXECUTOR] Successfully sent committed sub-DAG after reconnection: commit_index={}, total_tx={}", 
-                                    subdag.commit_ref.index, total_tx);
+                                info!("✅ [EXECUTOR] Successfully sent committed sub-DAG after reconnection: global_exec_index={}, commit_index={}", 
+                                    global_exec_index, commit_index);
+                                Ok(())
                             }
                             Ok(Err(retry_err)) => {
                                 warn!("⚠️  [EXECUTOR] Retry send also failed: {}", retry_err);
                                 *retry_guard = None; // Clear connection for next attempt
+                                Err(anyhow::anyhow!("Retry send failed: {}", retry_err))
                             }
                             Err(_) => {
-                                warn!("⏱️  [EXECUTOR] Retry send timeout after {}s (commit_index={})", 
-                                    SEND_TIMEOUT.as_secs(), subdag.commit_ref.index);
+                                warn!("⏱️  [EXECUTOR] Retry send timeout after {}s (global_exec_index={}, commit_index={})", 
+                                    SEND_TIMEOUT.as_secs(), global_exec_index, commit_index);
                                 *retry_guard = None; // Clear connection
+                                Err(anyhow::anyhow!("Retry send timeout"))
                             }
                         }
+                    } else {
+                        Err(anyhow::anyhow!("Connection lost after reconnection"))
                     }
                 }
             }
         } else {
             warn!("⚠️  [EXECUTOR] Executor connection lost, skipping send");
+            Err(anyhow::anyhow!("Connection lost"))
         }
-
-        Ok(())
     }
 
     /// Convert CommittedSubDag to protobuf CommittedEpochData bytes
@@ -561,6 +715,9 @@ impl ExecutorClient {
                 Some(proto::response::Payload::ServerStatus(_)) => {
                     warn!("🔍 [EXECUTOR-REQ] Payload is ServerStatus (not expected for this request)");
                 }
+                Some(proto::response::Payload::LastBlockNumberResponse(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is LastBlockNumberResponse (not expected for GetValidatorsAtBlockRequest)");
+                }
                 None => {
                     warn!("🔍 [EXECUTOR-REQ] Payload is None - response structure may be incorrect");
                     warn!("🔍 [EXECUTOR-REQ] Full response debug: {:?}", response);
@@ -597,6 +754,9 @@ impl ExecutorClient {
                 Some(proto::response::Payload::ServerStatus(_)) => {
                     return Err(anyhow::anyhow!("Unexpected ServerStatus response (expected ValidatorInfoList)"));
                 }
+                Some(proto::response::Payload::LastBlockNumberResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected LastBlockNumberResponse response (expected ValidatorInfoList)"));
+                }
                 None => {
                     return Err(anyhow::anyhow!("Unexpected response type from Go. Response payload: None. Response bytes (hex): {}", hex::encode(&response_buf)));
                 }
@@ -605,6 +765,92 @@ impl ExecutorClient {
             return Err(anyhow::anyhow!("Request connection is not available"));
         }
     }
+
+    /// Get last block number from Go Master
+    /// Used to initialize next_expected_index when connecting
+    pub async fn get_last_block_number(&self) -> Result<u64> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Connect to Go request socket if needed
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        // Create GetLastBlockNumberRequest
+        let request = Request {
+            payload: Some(proto::request::Payload::GetLastBlockNumberRequest(
+                proto::GetLastBlockNumberRequest {},
+            )),
+        };
+
+        // Encode request to protobuf bytes
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        // Send request via UDS
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            // Write 4-byte length prefix (big-endian)
+            let len = request_buf.len() as u32;
+            let len_bytes = len.to_be_bytes();
+            stream.write_all(&len_bytes).await?;
+            
+            // Write request data
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+            
+            info!("📤 [EXECUTOR-REQ] Sent GetLastBlockNumberRequest to Go (size: {} bytes)", request_buf.len());
+
+            // Read response (4-byte length prefix + response data)
+            use tokio::io::AsyncReadExt;
+            use tokio::time::{timeout, Duration};
+            
+            // Set timeout for reading response (5 seconds)
+            let read_timeout = Duration::from_secs(5);
+            
+            let mut len_buf = [0u8; 4];
+            timeout(read_timeout, stream.read_exact(&mut len_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response length: {}", e))??;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+            
+            if response_len == 0 {
+                return Err(anyhow::anyhow!("Received zero-length response from Go"));
+            }
+            if response_len > 10_000_000 { // 10MB limit
+                return Err(anyhow::anyhow!("Response too large: {} bytes", response_len));
+            }
+            
+            let mut response_buf = vec![0u8; response_len];
+            timeout(read_timeout, stream.read_exact(&mut response_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response data: {}", e))??;
+            
+            info!("📥 [EXECUTOR-REQ] Received {} bytes from Go, decoding...", response_buf.len());
+            
+            // Decode response
+            let response = Response::decode(&response_buf[..])
+                .map_err(|e| anyhow::anyhow!("Failed to decode response from Go: {}", e))?;
+            
+            match response.payload {
+                Some(proto::response::Payload::LastBlockNumberResponse(res)) => {
+                    let last_block_number = res.last_block_number;
+                    info!("✅ [EXECUTOR-REQ] Received LastBlockNumberResponse: last_block_number={}", last_block_number);
+                    return Ok(last_block_number);
+                }
+                Some(proto::response::Payload::Error(error_msg)) => {
+                    return Err(anyhow::anyhow!("Go returned error: {}", error_msg));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unexpected response type from Go (expected LastBlockNumberResponse)"));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Request connection is not available"));
+        }
+    }
+
+
 }
 
 /// Write uvarint to buffer (Go's binary.ReadUvarint format)

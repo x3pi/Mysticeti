@@ -491,7 +491,6 @@ impl PhasedEpochTransition {
 - [ ] **State Backup**
   - Backup consensus database
   - Backup committee.json
-  - Create snapshot of current state
 
 - [ ] **Testing**
   - Test transition trên testnet/staging

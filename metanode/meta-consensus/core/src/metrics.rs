@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use prometheus::{
-    Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry,
-    exponential_buckets, register_histogram_vec_with_registry, register_histogram_with_registry,
+    Gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry,
+    exponential_buckets, register_gauge_with_registry, register_histogram_vec_with_registry, register_histogram_with_registry,
     register_int_counter_vec_with_registry, register_int_counter_with_registry,
     register_int_gauge_vec_with_registry, register_int_gauge_with_registry, Error as PrometheusError,
 };
@@ -38,6 +38,21 @@ fn register_or_replace_int_gauge(
     registry: &Registry,
 ) -> IntGauge {
     match register_int_gauge_with_registry!(name, help, registry) {
+        Ok(metric) => metric,
+        Err(PrometheusError::AlreadyReg) => {
+            tracing::error!("Metric '{}' already registered in registry. This indicates a bug: each epoch should use a fresh Registry instance.", name);
+            panic!("Metric '{}' already registered. Ensure each epoch uses a fresh Registry::new() instance.", name);
+        }
+        Err(e) => panic!("Failed to register metric '{}': {}", name, e),
+    }
+}
+
+fn register_or_replace_gauge(
+    name: &str,
+    help: &str,
+    registry: &Registry,
+) -> Gauge {
+    match register_gauge_with_registry!(name, help, registry) {
         Ok(metric) => metric,
         Err(PrometheusError::AlreadyReg) => {
             tracing::error!("Metric '{}' already registered in registry. This indicates a bug: each epoch should use a fresh Registry instance.", name);
@@ -292,6 +307,14 @@ pub(crate) struct NodeMetrics {
     pub(crate) commit_sync_highest_synced_index: IntGauge,
     pub(crate) commit_sync_highest_fetched_index: IntGauge,
     pub(crate) commit_sync_local_index: IntGauge,
+    /// How many commits this node is ahead of quorum (negative = lagging)
+    pub(crate) commit_sync_lead: IntGauge,
+    /// Average commit rate of quorum (commits per second)
+    pub(crate) quorum_commit_rate: Gauge,
+    /// Average commit rate of this node (commits per second)
+    pub(crate) local_commit_rate: Gauge,
+    /// Current adaptive delay being applied (milliseconds)
+    pub(crate) adaptive_delay_ms: IntGauge,
     pub(crate) commit_sync_gap_on_processing: IntCounter,
     pub(crate) commit_sync_fetch_loop_latency: Histogram,
     pub(crate) commit_sync_fetch_once_latency: Histogram,
@@ -878,6 +901,26 @@ impl NodeMetrics {
             commit_sync_local_index: register_or_replace_int_gauge(
                 "commit_sync_local_index",
                 "The local commit index",
+                registry,
+            ),
+            commit_sync_lead: register_or_replace_int_gauge(
+                "commit_sync_lead",
+                "How many commits this node is ahead of quorum (negative = lagging)",
+                registry,
+            ),
+            quorum_commit_rate: register_or_replace_gauge(
+                "quorum_commit_rate",
+                "Average commit rate of quorum (commits per second)",
+                registry,
+            ),
+            local_commit_rate: register_or_replace_gauge(
+                "local_commit_rate",
+                "Average commit rate of this node (commits per second)",
+                registry,
+            ),
+            adaptive_delay_ms: register_or_replace_int_gauge(
+                "adaptive_delay_ms",
+                "Current adaptive delay being applied (milliseconds)",
                 registry,
             ),
             commit_sync_gap_on_processing: register_or_replace_int_counter(

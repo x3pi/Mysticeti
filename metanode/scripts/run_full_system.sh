@@ -74,6 +74,73 @@ print_step() {
     echo -e "${BLUE}📋 $1${NC}"
 }
 
+# Step 0: Check sudo permissions for LVM snapshot (if enabled)
+print_step "Bước 0: Kiểm tra quyền sudo cho lệnh snapshot..."
+
+# Check if any node has LVM snapshot enabled
+LVM_SNAPSHOT_ENABLED=false
+LVM_SNAPSHOT_BIN_PATH=""
+
+# Check node_0.toml first (most common case)
+if [ -f "$METANODE_ROOT/config/node_0.toml" ]; then
+    if grep -q "^enable_lvm_snapshot = true" "$METANODE_ROOT/config/node_0.toml" 2>/dev/null; then
+        LVM_SNAPSHOT_ENABLED=true
+        # Extract bin path from config
+        LVM_SNAPSHOT_BIN_PATH=$(grep "^lvm_snapshot_bin_path" "$METANODE_ROOT/config/node_0.toml" 2>/dev/null | sed 's/.*= *"\(.*\)".*/\1/' | sed "s/^ *//;s/ *$//")
+    fi
+fi
+
+# If not found in node_0, check other node configs
+if [ "$LVM_SNAPSHOT_ENABLED" = false ]; then
+    for node_config in "$METANODE_ROOT/config/node_"*.toml; do
+        if [ -f "$node_config" ]; then
+            if grep -q "^enable_lvm_snapshot = true" "$node_config" 2>/dev/null; then
+                LVM_SNAPSHOT_ENABLED=true
+                LVM_SNAPSHOT_BIN_PATH=$(grep "^lvm_snapshot_bin_path" "$node_config" 2>/dev/null | sed 's/.*= *"\(.*\)".*/\1/' | sed "s/^ *//;s/ *$//")
+                break
+            fi
+        fi
+    done
+fi
+
+# If still not found, use default path
+if [ -z "$LVM_SNAPSHOT_BIN_PATH" ]; then
+    LVM_SNAPSHOT_BIN_PATH="$METANODE_ROOT/bin/lvm-snap-rsync"
+fi
+
+if [ "$LVM_SNAPSHOT_ENABLED" = true ]; then
+    print_info "📸 LVM snapshot được bật trong config, đang kiểm tra quyền sudo..."
+    
+    # Check if binary exists
+    if [ ! -f "$LVM_SNAPSHOT_BIN_PATH" ]; then
+        print_warn "⚠️  File lvm-snap-rsync không tồn tại tại: $LVM_SNAPSHOT_BIN_PATH"
+        print_warn "   Snapshot sẽ không hoạt động khi epoch transition"
+        print_warn "   Đảm bảo file binary đã được build và copy vào đúng vị trí"
+    else
+        print_info "  ✅ File binary tồn tại: $LVM_SNAPSHOT_BIN_PATH"
+        
+        # Check sudo permissions (test with --help to avoid creating actual snapshot)
+        if sudo -n "$LVM_SNAPSHOT_BIN_PATH" --help >/dev/null 2>&1; then
+            print_info "  ✅ Quyền sudo cho snapshot đã được cấu hình (không cần password)"
+        else
+            print_error "❌ Quyền sudo cho lệnh snapshot CHƯA được cấu hình!"
+            print_error "   Lệnh snapshot sẽ KHÔNG hoạt động khi epoch transition"
+            print_error ""
+            print_error "   Để sửa tự động, chạy lệnh sau:"
+            print_error "   $SCRIPT_DIR/setup_sudo_snapshot.sh"
+            print_error ""
+            print_error "   Hoặc cấu hình thủ công:"
+            print_error "   sudo visudo"
+            print_error "   Thêm dòng: $(whoami) ALL=(ALL) NOPASSWD: $LVM_SNAPSHOT_BIN_PATH"
+            print_error ""
+            print_warn "   ⚠️  Script sẽ tiếp tục chạy, nhưng snapshot sẽ FAIL khi epoch transition"
+            print_warn "   Bạn có thể cấu hình sau và restart nodes"
+        fi
+    fi
+else
+    print_info "ℹ️  LVM snapshot không được bật trong config, bỏ qua kiểm tra"
+fi
+
 # Step 1: Clean up old data (CRITICAL: Must be done before starting any nodes)
 print_step "Bước 1: Xóa dữ liệu cũ (QUAN TRỌNG: Phải xóa trước khi khởi động nodes)..."
 
@@ -393,6 +460,68 @@ if [ ! -f "$METANODE_ROOT/config/committee_node_0.json" ]; then
 fi
 
 print_info "✅ Đã tạo committee mới (tạm thời để sync vào genesis.json)"
+
+# Step 4.0.5: Configure LVM snapshot - chỉ node 0 tạo snapshot, các node khác không tạo
+print_info "📸 Cấu hình LVM snapshot: chỉ node 0 tạo snapshot, các node khác không tạo..."
+
+# Enable snapshot cho node 0
+NODE_0_CONFIG="$METANODE_ROOT/config/node_0.toml"
+LVM_SNAPSHOT_BIN_PATH="$METANODE_ROOT/bin/lvm-snap-rsync"
+
+if [ -f "$NODE_0_CONFIG" ]; then
+    # Check if snapshot config already exists
+    if ! grep -q "^enable_lvm_snapshot" "$NODE_0_CONFIG" 2>/dev/null; then
+        # Add snapshot config to node_0.toml
+        print_info "  📝 Thêm cấu hình snapshot vào node_0.toml..."
+        cat >> "$NODE_0_CONFIG" << EOF
+
+# LVM Snapshot Configuration
+# Enable snapshot creation after epoch transition (only for nodes that should create snapshots)
+enable_lvm_snapshot = true
+# Path to lvm-snap-rsync binary
+lvm_snapshot_bin_path = "$LVM_SNAPSHOT_BIN_PATH"
+# Delay in seconds before creating snapshot after epoch transition (default: 120 = 2 minutes)
+# This delay allows Go executor to finish processing and stabilize before snapshot
+lvm_snapshot_delay_seconds = 120
+EOF
+        print_info "  ✅ Đã thêm cấu hình snapshot vào node_0.toml"
+    else
+        # Update existing config
+        print_info "  📝 Cập nhật cấu hình snapshot trong node_0.toml..."
+        # Enable snapshot
+        sed -i 's/^enable_lvm_snapshot = false/enable_lvm_snapshot = true/' "$NODE_0_CONFIG" 2>/dev/null || true
+        # Add or update bin path
+        if ! grep -q "^lvm_snapshot_bin_path" "$NODE_0_CONFIG" 2>/dev/null; then
+            sed -i "/^enable_lvm_snapshot = true/a lvm_snapshot_bin_path = \"$LVM_SNAPSHOT_BIN_PATH\"" "$NODE_0_CONFIG" 2>/dev/null || true
+        else
+            sed -i "s|^lvm_snapshot_bin_path = .*|lvm_snapshot_bin_path = \"$LVM_SNAPSHOT_BIN_PATH\"|" "$NODE_0_CONFIG" 2>/dev/null || true
+        fi
+        print_info "  ✅ Đã cập nhật cấu hình snapshot trong node_0.toml"
+    fi
+else
+    print_warn "  ⚠️  Không tìm thấy node_0.toml, bỏ qua cấu hình snapshot"
+fi
+
+# Đảm bảo các node khác (1, 2, 3) KHÔNG tạo snapshot
+for i in 1 2 3; do
+    NODE_CONFIG="$METANODE_ROOT/config/node_${i}.toml"
+    if [ -f "$NODE_CONFIG" ]; then
+        # Disable snapshot nếu có
+        if grep -q "^enable_lvm_snapshot = true" "$NODE_CONFIG" 2>/dev/null; then
+            print_info "  📝 Tắt snapshot cho node_${i}.toml..."
+            sed -i 's/^enable_lvm_snapshot = true/enable_lvm_snapshot = false/' "$NODE_CONFIG" 2>/dev/null || true
+            print_info "  ✅ Đã tắt snapshot cho node_${i}.toml"
+        fi
+        # Xóa bin path nếu có (không cần thiết cho nodes không tạo snapshot)
+        if grep -q "^lvm_snapshot_bin_path" "$NODE_CONFIG" 2>/dev/null; then
+            print_info "  📝 Xóa lvm_snapshot_bin_path khỏi node_${i}.toml..."
+            sed -i '/^lvm_snapshot_bin_path/d' "$NODE_CONFIG" 2>/dev/null || true
+            print_info "  ✅ Đã xóa lvm_snapshot_bin_path khỏi node_${i}.toml"
+        fi
+    fi
+done
+
+print_info "✅ Đã cấu hình snapshot: node 0 = enabled, nodes 1-3 = disabled"
 
 # Step 4.1: Sync committee vào genesis.json
 print_step "Bước 4.1: Sync committee vào genesis.json..."

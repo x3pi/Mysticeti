@@ -31,6 +31,7 @@ use crate::{
     block_verifier::NoopBlockVerifier, storage::mem_store::MemStore,
 };
 use crate::{
+    adaptive_delay::AdaptiveDelayState,
     ancestor::{AncestorState, AncestorStateManager},
     block::{
         Block, BlockAPI, BlockV1, BlockV2, ExtendedBlock, GENESIS_ROUND, SignedBlock, Slot,
@@ -113,6 +114,8 @@ pub(crate) struct Core {
     // quorum rounds periodically which is used across other components to make
     // decisions about block proposals.
     round_tracker: Arc<RwLock<PeerRoundTracker>>,
+    /// Adaptive delay state for automatically adjusting node speed based on network average
+    adaptive_delay_state: Option<Arc<AdaptiveDelayState>>,
 }
 
 impl Core {
@@ -128,6 +131,7 @@ impl Core {
         dag_state: Arc<RwLock<DagState>>,
         sync_last_known_own_block: bool,
         round_tracker: Arc<RwLock<PeerRoundTracker>>,
+        adaptive_delay_state: Option<Arc<AdaptiveDelayState>>,
     ) -> Self {
         let last_decided_leader = dag_state.read().last_commit_leader();
         let number_of_leaders = context
@@ -194,6 +198,7 @@ impl Core {
             last_known_proposed_round: min_propose_round,
             ancestor_state_manager,
             round_tracker,
+            adaptive_delay_state,
         }
         .recover()
     }
@@ -507,17 +512,37 @@ impl Core {
                 return None;
             }
 
+            // Calculate effective delay (base + adaptive delay if enabled)
+            let mut effective_delay = self.context.parameters.min_round_delay;
+            if let Some(adaptive_delay_state) = &self.adaptive_delay_state {
+                let local_commit_index = self.dag_state.read().last_commit_index();
+                let quorum_commit_index = self.context.metrics.node_metrics.commit_sync_quorum_index.get() as u32;
+                let adaptive_delay = adaptive_delay_state.calculate_adaptive_delay(
+                    local_commit_index,
+                    quorum_commit_index,
+                );
+                effective_delay += adaptive_delay;
+                
+                // Update metrics
+                self.context.metrics.node_metrics.adaptive_delay_ms.set(adaptive_delay.as_millis() as i64);
+                let lead = local_commit_index.saturating_sub(quorum_commit_index);
+                self.context.metrics.node_metrics.commit_sync_lead.set(lead as i64);
+                self.context.metrics.node_metrics.local_commit_rate.set(adaptive_delay_state.local_rate());
+                self.context.metrics.node_metrics.quorum_commit_rate.set(adaptive_delay_state.quorum_rate());
+            }
+            
             if Duration::from_millis(
                 self.context
                     .clock
                     .timestamp_utc_ms()
                     .saturating_sub(self.last_proposed_timestamp_ms()),
-            ) < self.context.parameters.min_round_delay
+            ) < effective_delay
             {
                 debug!(
-                    "Skipping block proposal for round {} as it is too soon after the last proposed block timestamp {}; min round delay is {}ms",
+                    "Skipping block proposal for round {} as it is too soon after the last proposed block timestamp {}; effective delay is {}ms (base: {}ms)",
                     clock_round,
                     self.last_proposed_timestamp_ms(),
+                    effective_delay.as_millis(),
                     self.context.parameters.min_round_delay.as_millis(),
                 );
                 return None;
@@ -886,6 +911,12 @@ impl Core {
             let subdags = self
                 .commit_observer
                 .handle_commit(sequenced_leaders, local)?;
+
+            // Update adaptive delay state with new commit index
+            if let Some(adaptive_delay_state) = &self.adaptive_delay_state {
+                let new_commit_index = self.dag_state.read().last_commit_index();
+                adaptive_delay_state.update_local_commit(new_commit_index);
+            }
 
             // Try to unsuspend blocks if gc_round has advanced.
             self.block_manager

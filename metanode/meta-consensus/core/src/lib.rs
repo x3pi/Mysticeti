@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /// Consensus modules.
+mod adaptive_delay;
 mod ancestor;
 mod authority_node;
 mod authority_service;
