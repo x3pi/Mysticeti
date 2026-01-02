@@ -1,0 +1,42 @@
+{
+  "epoch": 0,
+  "total_stake": 4,
+  "quorum_threshold": 3,
+  "validity_threshold": 2,
+  "authorities": [
+    {
+      "stake": 1,
+      "address": "/ip4/127.0.0.1/tcp/9000",
+      "hostname": "node-0",
+      "authority_key": "tdBXT0U2BJ52yUOsPiagT5gfVUO4zYnbOCwH27jJ836zHXl6ugyLHhaLOtGJ5F0DDf/NFSf9CQZ6qqAns6CvtCDZa4AT/Qi2PMYDz3IvgiMRn1emmx7Vgtswx+F3jQdC",
+      "protocol_key": "NKmVv60uF60OCkzcRycpMjfZnP2ndjIxQQYALmigyd8=",
+      "network_key": "tWK61m4MvDS1JAPQBNMix6V1r3ijzDXatM5oR6Qa2/4="
+    },
+    {
+      "stake": 1,
+      "address": "/ip4/127.0.0.1/tcp/9001",
+      "hostname": "node-1",
+      "authority_key": "mNjcCnYJ0uxHHTZvLbcjyVUzGcXVSJWqp4iXEUJ035JHxWuooVGUflM5o3t90MD8D72UVdshJa7Sb4YFHGC2Iu9CYosUEjHFSrJuQSRuGQYnPd3wCkKdCyv351Yp5fUH",
+      "protocol_key": "QdPjPSjDcNlvcdYM1cb/+ZX9fntZGpVRA51Ct6iiW7o=",
+      "network_key": "ZMIpGiqQjIQgM38njb7aKnhXIsUwjRt+/DR9E1xJHqU="
+    },
+    {
+      "stake": 1,
+      "address": "/ip4/127.0.0.1/tcp/9002",
+      "hostname": "node-2",
+      "authority_key": "pXnnuVHcgRulj3wSWj5XS7GHnxnNltioJ5Q8oQDegxx134nrHThuQmRBe30oLOGKFV1lr5rF04WuA2hI+2Cz/ZD6BRyO8vdESKyjYq8OEMHixeMEZ7RFchyMQJtlmvGN",
+      "protocol_key": "kvlhPup/0lWuHqR3k/ltdHsDExH2A68bVsfMARKaghg=",
+      "network_key": "Re/0FwHxBocOedBjtt51zImHs37CL4NAYpDenMce8JY="
+    },
+    {
+      "stake": 1,
+      "address": "/ip4/127.0.0.1/tcp/9003",
+      "hostname": "node-3",
+      "authority_key": "lRxnAY4pQB64+9nRZx0Zki9DnHlUbH/KgJOUg+s3p+cpo0xkxRimTmD7vLkO5b+OBNF/5B7RSYqxJiJZucj4yMnenjedaJ61EuV8CDgAOiRpmtFzN4PtS+BupKpEx1Cs",
+      "protocol_key": "Hw14A5dzrEG1FuE818Ohm5+DykNJSnl4uG06NuFVKX4=",
+      "network_key": "emnLs4fF1lJ7Ydpz9HlnoJDisYI8sf/1Xt5eE0zzxxA="
+    }
+  ],
+  "epoch_timestamp_ms": 1767322985507,
+  "last_global_exec_index": 0
+}

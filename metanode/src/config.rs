@@ -193,17 +193,14 @@ impl NodeConfig {
         fs::write(&shared_committee_path, &committee_json)?;
 
         // Generate individual node configs
+        // NOTE: Không tạo file committee_node_*.json nữa. Tất cả nodes sẽ fetch committee từ Go state.
         for (idx, (protocol_keypair, network_keypair, _authority_keypair)) in keypairs.iter().enumerate() {
-            // Per-node committee file (prevents nodes clobbering each other's committee.json on epoch transition).
-            let node_committee_path = output_dir.join(format!("committee_node_{}.json", idx));
-            fs::write(&node_committee_path, &committee_json)?;
-
             let config = NodeConfig {
                 node_id: idx,
                 network_address: format!("127.0.0.1:{}", 9000 + idx),
                 protocol_key_path: Some(output_dir.join(format!("node_{}_protocol_key.json", idx))),
                 network_key_path: Some(output_dir.join(format!("node_{}_network_key.json", idx))),
-                committee_path: Some(node_committee_path),
+                committee_path: None, // Không dùng file committee nữa - fetch từ Go state
                 storage_path: output_dir.join(format!("storage/node_{}", idx)),
                 enable_metrics: true,
                 metrics_port: 9100 + idx as u16,
@@ -292,101 +289,30 @@ impl NodeConfig {
         Ok((committee, keypairs))
     }
 
-    pub fn load_committee(&self) -> Result<Committee> {
-        let path = self
-            .committee_path
-            .as_ref()
-            .context("Committee path not specified")?;
-        let content = fs::read_to_string(path)?;
-        
-        // Try to load as CommitteeConfig first (with epoch_timestamp_ms)
-        // If that fails, fall back to plain Committee (backward compatibility)
-        match serde_json::from_str::<CommitteeConfig>(&content) {
-            Ok(config) => Ok(config.committee),
-            Err(_) => {
-                // Fallback: try loading as plain Committee (for backward compatibility)
-        let committee: Committee = serde_json::from_str(&content)?;
-        Ok(committee)
-            }
-        }
-    }
-
-    /// Save committee.json in the extended format (Committee + epoch_timestamp_ms + last_global_exec_index).
-    /// This is used during epoch transition to atomically update epoch + timestamp + global exec index for all nodes.
-    /// NOTE: This function preserves existing last_global_exec_index. For explicit control, use save_committee_with_global_exec_index.
-    #[allow(dead_code)] // Kept for backward compatibility and potential future use
-    pub fn save_committee_with_epoch_timestamp(
-        committee_path: &Path,
-        committee: &Committee,
-        epoch_timestamp_ms: u64,
-    ) -> Result<()> {
-        // Load existing last_global_exec_index if available (preserve it)
-        let existing_last_global_exec_index = Self::load_last_global_exec_index(committee_path).ok();
-        
-        let committee_config = CommitteeConfig {
-            committee: committee.clone(),
-            epoch_timestamp_ms: Some(epoch_timestamp_ms),
-            last_global_exec_index: existing_last_global_exec_index,
-        };
-        let committee_json = serde_json::to_string_pretty(&committee_config)?;
-
-        // Atomic write: write to temp file then rename.
-        // Prevents partial/corrupt committee.json if process crashes mid-write.
-        let tmp_path = committee_path.with_extension("json.tmp");
-        fs::write(&tmp_path, committee_json)?;
-        fs::rename(&tmp_path, committee_path)?;
-        Ok(())
-    }
-
-    /// Save committee.json with epoch timestamp and last global execution index
-    pub fn save_committee_with_global_exec_index(
-        committee_path: &Path,
-        committee: &Committee,
-        epoch_timestamp_ms: u64,
-        last_global_exec_index: u64,
-    ) -> Result<()> {
-        let committee_config = CommitteeConfig {
-            committee: committee.clone(),
-            epoch_timestamp_ms: Some(epoch_timestamp_ms),
-            last_global_exec_index: Some(last_global_exec_index),
-        };
-        let committee_json = serde_json::to_string_pretty(&committee_config)?;
-
-        // Atomic write: write to temp file then rename.
-        let tmp_path = committee_path.with_extension("json.tmp");
-        fs::write(&tmp_path, committee_json)?;
-        fs::rename(&tmp_path, committee_path)?;
-        Ok(())
-    }
-
-    /// Load last_global_exec_index from committee.json
-    pub fn load_last_global_exec_index(committee_path: &Path) -> Result<u64> {
-        if !committee_path.exists() {
-            // If committee.json doesn't exist, start from 0
-            return Ok(0);
-        }
-        
-        let content = fs::read_to_string(committee_path)?;
-        match serde_json::from_str::<CommitteeConfig>(&content) {
-            Ok(config) => Ok(config.last_global_exec_index.unwrap_or(0)),
-            Err(_) => {
-                // Fallback: try loading as plain Committee (backward compatibility)
-                Ok(0) // Default to 0 if can't parse
-            }
-        }
-    }
+    // REMOVED: All committee file operations - Committee is now ALWAYS fetched from Go state via Unix Domain Socket
+    // This ensures all nodes have identical committee data and eliminates file-based inconsistencies
+    // No more save/load committee from files - everything goes through Go state synchronization
 
     pub fn load_epoch_timestamp(&self) -> Result<u64> {
         // First, try to load from committee.json (new format)
-        if let Some(committee_path) = &self.committee_path {
-            if committee_path.exists() {
-                let content = fs::read_to_string(committee_path)?;
-                if let Ok(config) = serde_json::from_str::<CommitteeConfig>(&content) {
-                    if let Some(timestamp) = config.epoch_timestamp_ms {
-                        return Ok(timestamp);
-                    }
+        let committee_path = self.committee_path.clone().unwrap_or_else(|| std::path::PathBuf::from("config/committee.json"));
+        eprintln!("DEBUG: Loading epoch timestamp from: {:?}", committee_path);
+        if committee_path.exists() {
+            eprintln!("DEBUG: Committee file exists, reading...");
+            let content = fs::read_to_string(&committee_path)?;
+            eprintln!("DEBUG: Content length: {}", content.len());
+            if let Ok(config) = serde_json::from_str::<CommitteeConfig>(&content) {
+                if let Some(timestamp) = config.epoch_timestamp_ms {
+                    eprintln!("DEBUG: Found timestamp in committee.json: {}", timestamp);
+                    return Ok(timestamp);
+                } else {
+                    eprintln!("DEBUG: No timestamp in committee.json");
                 }
+            } else {
+                eprintln!("DEBUG: Failed to parse committee.json");
             }
+        } else {
+            eprintln!("DEBUG: Committee file does not exist");
         }
         
         // Fallback 1: Try to load from epoch_timestamp.txt (backward compatibility)
@@ -410,6 +336,7 @@ impl NodeConfig {
         
         // Fallback 2: use current time rounded to nearest second
         // This ensures all nodes starting at the same second get the same timestamp
+        eprintln!("DEBUG: Using fallback timestamp");
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

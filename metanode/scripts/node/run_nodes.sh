@@ -19,7 +19,7 @@ LOG_DIR="logs"
 # - If epoch_timestamp_ms is old, nodes will instantly propose epoch change on boot.
 # - Resetting makes "epoch_duration_seconds" behave like a fresh timer per run.
 # Set to 0 to disable: RESET_EPOCH_TIMESTAMP_MS=0 ./run_nodes.sh
-RESET_EPOCH_TIMESTAMP_MS="${RESET_EPOCH_TIMESTAMP_MS:-1}"
+RESET_EPOCH_TIMESTAMP_MS="${RESET_EPOCH_TIMESTAMP_MS:-0}"
 
 # Create a per-run log directory so we never lose early startup / epoch-transition logs
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"

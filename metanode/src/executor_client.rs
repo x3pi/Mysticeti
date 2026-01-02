@@ -33,6 +33,7 @@ pub struct ExecutorClient {
     request_socket_path: String, // For sending requests (Rust -> Go)
     request_connection: Arc<Mutex<Option<UnixStream>>>,
     enabled: bool,
+    can_commit: bool, // Only node 0 can actually commit transactions to Go state
     /// Buffer for out-of-order blocks to ensure sequential sending
     /// Key: global_exec_index, Value: (epoch_data_bytes, epoch, commit_index)
     send_buffer: Arc<Mutex<BTreeMap<u64, (Vec<u8>, u64, u32)>>>,
@@ -44,18 +45,20 @@ impl ExecutorClient {
     /// Create new executor client
     /// enabled: whether executor is enabled (check config file exists)
     /// socket_id: socket ID (0 for node 0)
-    pub fn new(enabled: bool, socket_id: usize) -> Self {
+    /// can_commit: whether this node can actually commit transactions (only node 0)
+    pub fn new(enabled: bool, socket_id: usize, can_commit: bool) -> Self {
         let socket_path = format!("/tmp/executor{}.sock", socket_id);
-        // Go listens for requests on /tmp/rust-go.sock (or /tmp/rust-go.sock_2 for non-master)
+        // Node 0 connects to Go Master socket (_2), nodes 1-3 connect to Go Sub socket (_1)
         let request_socket_path = if socket_id == 0 {
-            "/tmp/rust-go.sock_2".to_string() // Master node uses sock_2
+            "/tmp/rust-go.sock_2".to_string()
         } else {
-            "/tmp/rust-go.sock_1".to_string() // Non-master uses sock_1
+            "/tmp/rust-go.sock_1".to_string()
         };
         Self {
             socket_path,
             connection: Arc::new(Mutex::new(None)),
             enabled,
+            can_commit,
             request_socket_path,
             request_connection: Arc::new(Mutex::new(None)),
             send_buffer: Arc::new(Mutex::new(BTreeMap::new())),
@@ -66,6 +69,11 @@ impl ExecutorClient {
     /// Check if executor is enabled
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Check if this node can commit transactions (only node 0)
+    pub fn can_commit(&self) -> bool {
+        self.can_commit
     }
 
     /// Initialize next_expected_index from Go Master's last block number
@@ -164,6 +172,15 @@ impl ExecutorClient {
     ) -> Result<()> {
         if !self.is_enabled() {
             return Ok(()); // Silently skip if not enabled
+        }
+
+        if !self.can_commit() {
+            // This node has executor client but cannot commit (not node 0)
+            // Log but don't actually send the commit
+            let total_tx: usize = subdag.blocks.iter().map(|b| b.transactions().len()).sum();
+            info!("ℹ️  [EXECUTOR] Node has executor client but cannot commit (not node 0): global_exec_index={}, commit_index={}, epoch={}, blocks={}, total_tx={}",
+                global_exec_index, subdag.commit_ref.index, epoch, subdag.blocks.len(), total_tx);
+            return Ok(()); // Skip actual commit
         }
 
         // Convert CommittedSubDag to protobuf CommittedEpochData

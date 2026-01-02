@@ -91,7 +91,46 @@ impl RpcServer {
                     std::time::Duration::from_secs(5), // Giảm từ 30s xuống 5s để phát hiện connection chết sớm
                     stream.read_exact(&mut len_buf)
                 ).await;
-                
+
+                // SPECIAL TESTING MODE: If first 4 bytes are "TEST", treat as raw text transaction
+                let is_testing_mode = len_buf == [b'T', b'E', b'S', b'T'];
+
+                if is_testing_mode {
+                    // TESTING MODE: Read the rest as raw transaction data
+                    info!("🧪 [TX FLOW] Detected TESTING MODE from {:?}, reading raw transaction data...", peer_addr);
+                    let mut tx_data = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) => break, // EOF
+                            Ok(n) => tx_data.extend_from_slice(&buf[..n]),
+                            Err(e) => {
+                                error!("❌ [TX FLOW] Failed to read testing transaction data from {:?}: {}", peer_addr, e);
+                                return;
+                            }
+                        }
+                    }
+
+                    info!("📥 [TX FLOW] Received testing transaction: {} bytes", tx_data.len());
+
+                    // Process as raw transaction data (just use the data as-is)
+                    let is_length_prefixed = false; // Mark as not length-prefixed for testing
+                    if let Err(e) = Self::process_transaction_data(
+                        &client,
+                        &node,
+                        &mut stream,
+                        tx_data,
+                        is_length_prefixed,
+                    ).await {
+                        error!("❌ [TX FLOW] Failed to process testing transaction: {}", e);
+                        let _ = Self::send_binary_response(&mut stream, false, "Failed to process testing transaction").await;
+                    } else {
+                        info!("✅ [TX FLOW] Successfully processed testing transaction");
+                        let _ = Self::send_binary_response(&mut stream, true, "Testing transaction submitted").await;
+                    }
+                    return;
+                }
+
                 match read_len_result {
                     Ok(Ok(_)) => {
                         let data_len = u32::from_be_bytes(len_buf) as usize;

@@ -74,72 +74,11 @@ print_step() {
     echo -e "${BLUE}📋 $1${NC}"
 }
 
-# Step 0: Check sudo permissions for LVM snapshot (if enabled)
-print_step "Bước 0: Kiểm tra quyền sudo cho lệnh snapshot..."
+# Step 0: Check sudo permissions for LVM snapshot (if enabled) - SKIPPED
+print_step "Bước 0: Kiểm tra quyền sudo cho lệnh snapshot... (SKIPPED)"
 
-# Check if any node has LVM snapshot enabled
-LVM_SNAPSHOT_ENABLED=false
-LVM_SNAPSHOT_BIN_PATH=""
-
-# Check node_0.toml first (most common case)
-if [ -f "$METANODE_ROOT/config/node_0.toml" ]; then
-    if grep -q "^enable_lvm_snapshot = true" "$METANODE_ROOT/config/node_0.toml" 2>/dev/null; then
-        LVM_SNAPSHOT_ENABLED=true
-        # Extract bin path from config
-        LVM_SNAPSHOT_BIN_PATH=$(grep "^lvm_snapshot_bin_path" "$METANODE_ROOT/config/node_0.toml" 2>/dev/null | sed 's/.*= *"\(.*\)".*/\1/' | sed "s/^ *//;s/ *$//")
-    fi
-fi
-
-# If not found in node_0, check other node configs
-if [ "$LVM_SNAPSHOT_ENABLED" = false ]; then
-    for node_config in "$METANODE_ROOT/config/node_"*.toml; do
-        if [ -f "$node_config" ]; then
-            if grep -q "^enable_lvm_snapshot = true" "$node_config" 2>/dev/null; then
-                LVM_SNAPSHOT_ENABLED=true
-                LVM_SNAPSHOT_BIN_PATH=$(grep "^lvm_snapshot_bin_path" "$node_config" 2>/dev/null | sed 's/.*= *"\(.*\)".*/\1/' | sed "s/^ *//;s/ *$//")
-                break
-            fi
-        fi
-    done
-fi
-
-# If still not found, use default path
-if [ -z "$LVM_SNAPSHOT_BIN_PATH" ]; then
-    LVM_SNAPSHOT_BIN_PATH="$METANODE_ROOT/bin/lvm-snap-rsync"
-fi
-
-if [ "$LVM_SNAPSHOT_ENABLED" = true ]; then
-    print_info "📸 LVM snapshot được bật trong config, đang kiểm tra quyền sudo..."
-    
-    # Check if binary exists
-    if [ ! -f "$LVM_SNAPSHOT_BIN_PATH" ]; then
-        print_warn "⚠️  File lvm-snap-rsync không tồn tại tại: $LVM_SNAPSHOT_BIN_PATH"
-        print_warn "   Snapshot sẽ không hoạt động khi epoch transition"
-        print_warn "   Đảm bảo file binary đã được build và copy vào đúng vị trí"
-    else
-        print_info "  ✅ File binary tồn tại: $LVM_SNAPSHOT_BIN_PATH"
-        
-        # Check sudo permissions (test with --help to avoid creating actual snapshot)
-        if sudo -n "$LVM_SNAPSHOT_BIN_PATH" --help >/dev/null 2>&1; then
-            print_info "  ✅ Quyền sudo cho snapshot đã được cấu hình (không cần password)"
-        else
-            print_error "❌ Quyền sudo cho lệnh snapshot CHƯA được cấu hình!"
-            print_error "   Lệnh snapshot sẽ KHÔNG hoạt động khi epoch transition"
-            print_error ""
-            print_error "   Để sửa tự động, chạy lệnh sau:"
-            print_error "   $SCRIPT_DIR/setup_sudo_snapshot.sh"
-            print_error ""
-            print_error "   Hoặc cấu hình thủ công:"
-            print_error "   sudo visudo"
-            print_error "   Thêm dòng: $(whoami) ALL=(ALL) NOPASSWD: $LVM_SNAPSHOT_BIN_PATH"
-            print_error ""
-            print_warn "   ⚠️  Script sẽ tiếp tục chạy, nhưng snapshot sẽ FAIL khi epoch transition"
-            print_warn "   Bạn có thể cấu hình sau và restart nodes"
-        fi
-    fi
-else
-    print_info "ℹ️  LVM snapshot không được bật trong config, bỏ qua kiểm tra"
-fi
+# SKIPPED: Check sudo permissions for LVM snapshot
+print_info "ℹ️  Bỏ qua kiểm tra sudo cho LVM snapshot"
 
 # Step 1: Clean up old data (CRITICAL: Must be done before starting any nodes)
 print_step "Bước 1: Xóa dữ liệu cũ (QUAN TRỌNG: Phải xóa trước khi khởi động nodes)..."
@@ -424,42 +363,83 @@ if [ ! -f "$BINARY" ]; then
     exit 1
 fi
 
-# Remove old committee files first
-print_info "Xóa committee cũ..."
+# Remove old committee files first - NO LONGER NEEDED since nodes fetch from Go state
+print_info "🗑️  Xóa committee files cũ (nodes sẽ fetch từ Go state)..."
 cd "$METANODE_ROOT" || exit 1
 rm -f "$METANODE_ROOT/config/committee.json"
-# CRITICAL: Xóa TẤT CẢ committee_node_*.json files vì tất cả nodes đều lấy từ Go state
-# Files này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index
-print_info "🗑️  Xóa TẤT CẢ committee_node_*.json files (tất cả nodes đều load từ Go state)..."
-for i in 0 1 2 3; do
-    COMMITTEE_NODE_FILE="$METANODE_ROOT/config/committee_node_${i}.json"
-    if [ -f "$COMMITTEE_NODE_FILE" ]; then
-        rm -f "$COMMITTEE_NODE_FILE"
-        print_info "  ✅ Đã xóa committee_node_${i}.json"
-    fi
-done
-# Also remove any other committee_node_*.json files that might exist
-rm -f "$METANODE_ROOT/config/committee_node_*.json" 2>/dev/null || true
+# KHÔNG xóa committee_node_0.json nữa - giữ lại làm file chuẩn
+rm -f "$METANODE_ROOT/config/committee_node_[1-9].json" 2>/dev/null || true
+rm -f "$METANODE_ROOT/config/committee_node_[1-9][0-9].json" 2>/dev/null || true
 rm -f "$METANODE_ROOT/config/node_*.toml"
 rm -f "$METANODE_ROOT/config/node_*_protocol_key.json"
 rm -f "$METANODE_ROOT/config/node_*_network_key.json"
 
-# Generate new committee for 4 nodes (chỉ để có keys và node configs)
-# CRITICAL: committee_node_*.json sẽ bị xóa ngay sau khi sync vào genesis.json
-# Tất cả nodes sẽ lấy committee từ Go state, không đọc từ file
-print_info "Tạo committee mới cho 4 nodes (epoch 0)..."
-print_info "💡 Committee files sẽ được dùng để sync vào genesis.json, sau đó sẽ bị xóa"
-print_info "   Tất cả nodes sẽ lấy committee từ Go state qua Unix Domain Socket"
+# Generate keys and node configs, AND generate genesis.json for Go
+print_info "🔑 Tạo keys và node configs cho 4 nodes..."
+print_info "📄 Đồng thời tạo genesis.json cho Go từ keys của Rust"
+print_info "💡 Committee data sẽ được fetch từ Go state qua Unix Domain Socket"
 cd "$METANODE_ROOT" || exit 1
+
+# Generate Rust keys and configs
 "$BINARY" generate --nodes 4 --output config
 
-# Verify committee file exists (tạm thời để sync vào genesis.json)
-if [ ! -f "$METANODE_ROOT/config/committee_node_0.json" ]; then
-    print_error "Không thể tạo committee files!"
+# UPDATE committee.json với stake từ genesis.json (từ delegator_stakes)
+print_info "🔄 Update committee.json với stake từ genesis.json..."
+UPDATE_SCRIPT="$METANODE_ROOT/scripts/update_committee_from_genesis.py"
+if [ -f "$UPDATE_SCRIPT" ]; then
+    if python3 "$UPDATE_SCRIPT"; then
+        print_info "✅ Đã update committee.json với stake từ delegator_stakes"
+    else
+        print_warn "⚠️  Lỗi khi update committee.json, sẽ dùng giá trị mặc định"
+    fi
+else
+    print_warn "⚠️  Không tìm thấy script update_committee_from_genesis.py"
+fi
+
+# Generate genesis.json from the Rust-generated keys (PRESERVE ALLOC)
+print_info "🔄 Tạo/Cập nhật genesis.json từ keys của Rust (GIỮ NGUYÊN alloc)..."
+GENESIS_OUTPUT="$GO_PROJECT_ROOT/cmd/simple_chain/genesis.json"
+
+if [ -f "$METANODE_ROOT/config/node_0.toml" ]; then
+    # Check if genesis.json already has alloc - if yes, only update validators
+    if [ -f "$GENESIS_OUTPUT" ] && grep -q '"alloc"' "$GENESIS_OUTPUT"; then
+        print_info "  📝 Genesis.json đã có alloc - chỉ update validators để giữ nguyên alloc..."
+        SYNC_SCRIPT="$METANODE_ROOT/scripts/sync_committee_to_genesis.py"
+        if [ -f "$SYNC_SCRIPT" ]; then
+            python3 "$SYNC_SCRIPT" "$METANODE_ROOT/config/committee.json" "$GENESIS_OUTPUT"
+            if [ $? -eq 0 ]; then
+                print_info "✅ Đã update validators trong genesis.json (alloc được bảo toàn)"
+            else
+                print_error "❌ Lỗi khi update validators trong genesis.json"
+                exit 1
+            fi
+        else
+            print_error "❌ Không tìm thấy script sync_committee_to_genesis.py"
+            exit 1
+        fi
+    else
+        print_info "  📝 Genesis.json chưa có alloc - tạo mới từ Rust keys..."
+        GENESIS_SCRIPT="$METANODE_ROOT/scripts/generate_genesis_from_rust_keys.sh"
+        if [ -f "$GENESIS_SCRIPT" ]; then
+            bash "$GENESIS_SCRIPT" "$METANODE_ROOT/config" "$GENESIS_OUTPUT"
+            if [ $? -eq 0 ]; then
+                print_info "✅ Đã tạo genesis.json từ keys của Rust: $GENESIS_OUTPUT"
+            else
+                print_error "❌ Lỗi khi tạo genesis.json từ Rust keys"
+                exit 1
+            fi
+        else
+            print_error "❌ Không tìm thấy script generate_genesis_from_rust_keys.sh"
+            print_info "   Tạo script tại: $GENESIS_SCRIPT"
+            exit 1
+        fi
+    fi
+else
+    print_error "❌ Không tìm thấy node_0.toml sau khi generate"
     exit 1
 fi
 
-print_info "✅ Đã tạo committee mới (tạm thời để sync vào genesis.json)"
+print_info "✅ Đã tạo keys, node configs và genesis.json đồng bộ"
 
 # Step 4.0.5: Configure LVM snapshot - chỉ node 0 tạo snapshot, các node khác không tạo
 print_info "📸 Cấu hình LVM snapshot: chỉ node 0 tạo snapshot, các node khác không tạo..."
@@ -523,89 +503,27 @@ done
 
 print_info "✅ Đã cấu hình snapshot: node 0 = enabled, nodes 1-3 = disabled"
 
-# Step 4.1: Sync committee vào genesis.json
-print_step "Bước 4.1: Sync committee vào genesis.json..."
+# Step 4.1: Kiểm tra genesis.json có validators
+print_step "Bước 4.1: Kiểm tra genesis.json có validators..."
 
-# CRITICAL: Sync committee vào genesis.json (BẮT BUỘC)
-# Tất cả nodes sẽ lấy committee từ Go state, nên Go phải có validators trong genesis.json
-COMMITTEE_SOURCE="$METANODE_ROOT/config/committee_node_0.json"
 GENESIS_TARGET="$GO_PROJECT_ROOT/cmd/simple_chain/genesis.json"
-
-# Check if sync script exists - tìm ở nhiều vị trí có thể
-SYNC_SCRIPT=""
-POSSIBLE_PATHS=(
-    "$METANODE_ROOT/scripts/sync_committee_to_genesis.py"
-    "$GO_PROJECT_ROOT/sync_committee_to_genesis.py"
-    "$MYSTICETI_ROOT/sync_committee_to_genesis.py"
-    "$(cd "$METANODE_ROOT/../.." && pwd)/sync_committee_to_genesis.py"
-)
-
-for path in "${POSSIBLE_PATHS[@]}"; do
-    if [ -f "$path" ]; then
-        SYNC_SCRIPT="$path"
-        break
-    fi
-done
-
-if [ -z "$SYNC_SCRIPT" ] || [ ! -f "$SYNC_SCRIPT" ]; then
-    print_error "❌ Script sync_committee_to_genesis.py không tìm thấy (BẮT BUỘC)"
-    print_error "   Đã tìm tại:"
-    for path in "${POSSIBLE_PATHS[@]}"; do
-        print_error "     - $path"
-    done
-    print_error "   Script này cần thiết để sync committee vào genesis.json"
-    print_error "   Tất cả nodes lấy committee từ Go, nên Go phải có validators trong genesis.json"
-    exit 1
-fi
-
-if [ ! -f "$COMMITTEE_SOURCE" ]; then
-    print_error "❌ Không tìm thấy committee file: $COMMITTEE_SOURCE"
-    exit 1
-fi
 
 if [ ! -f "$GENESIS_TARGET" ]; then
     print_error "❌ Không tìm thấy genesis.json: $GENESIS_TARGET"
     exit 1
 fi
 
-print_info "📝 Syncing committee từ $COMMITTEE_SOURCE vào $GENESIS_TARGET..."
-print_info "   💡 Điều này đảm bảo Go Master sẽ init genesis với validators mới từ Rust committee"
-print_info "   💡 Tất cả Rust nodes sẽ lấy committee từ Go state qua Unix Domain Socket"
-python3 "$SYNC_SCRIPT" "$COMMITTEE_SOURCE" "$GENESIS_TARGET"
-
-if [ $? -ne 0 ]; then
-    print_error "❌ Lỗi khi sync committee vào genesis.json"
-    exit 1
-fi
-
-print_info "✅ Đã sync committee vào genesis.json"
-
 # Verify genesis.json có validators
-VALIDATOR_COUNT=$(grep -c '"address"' "$GENESIS_TARGET" 2>/dev/null || echo "0")
+VALIDATOR_COUNT=$(grep -c '"p2p_address"' "$GENESIS_TARGET" 2>/dev/null || echo "0")
 if [ "$VALIDATOR_COUNT" -gt 0 ]; then
-    print_info "  ✅ Genesis.json có $VALIDATOR_COUNT validators"
+    print_info "✅ Genesis.json có $VALIDATOR_COUNT validators (sẵn sàng cho Go init genesis)"
 else
-    print_error "  ❌ Genesis.json không có validators! Go sẽ không có validators để init genesis"
+    print_error "❌ Genesis.json không có validators! Go sẽ không có validators để init genesis"
     exit 1
 fi
 
-# CRITICAL: Xóa TẤT CẢ committee_node_*.json files ngay sau khi sync
-# Tất cả nodes đều lấy committee từ Go state qua Unix Domain Socket, không đọc từ file
-# Files này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index
-print_info "🗑️  Xóa TẤT CẢ committee_node_*.json files sau khi sync vào genesis.json..."
-print_info "   💡 Đảm bảo tất cả nodes (0, 1, 2, 3) đều lấy committee từ Go state qua Unix Domain Socket"
-for i in 0 1 2 3; do
-    COMMITTEE_NODE_FILE="$METANODE_ROOT/config/committee_node_${i}.json"
-    if [ -f "$COMMITTEE_NODE_FILE" ]; then
-        rm -f "$COMMITTEE_NODE_FILE"
-        print_info "  ✅ Đã xóa committee_node_${i}.json"
-    fi
-done
-# Also remove any other committee_node_*.json files that might exist
-rm -f "$METANODE_ROOT/config/committee_node_*.json" 2>/dev/null || true
-print_info "  ✅ Đã xóa tất cả committee_node_*.json files"
-print_info "  💡 Các file này sẽ được tạo lại sau epoch transition để lưu epoch_timestamp_ms và last_global_exec_index"
-print_info "  💡 Tất cả nodes (0, 1, 2, 3) đều lấy committee từ Go state qua Unix Domain Socket, không đọc từ file"
+print_info "💡 Go Master và Go Sub sẽ đọc validators từ genesis.json"
+print_info "💡 Rust nodes sẽ fetch committee từ Go state qua Unix Domain Socket"
 
 # Step 5: Verify executor configuration for Node 0
 print_step "Bước 5: Kiểm tra cấu hình executor cho Node 0..."
@@ -731,7 +649,28 @@ if ! tmux has-session -t go-master 2>/dev/null; then
 fi
 
 print_info "✅ Go Master Node đã khởi động (tmux session: go-master)"
-sleep 6  # Tăng delay để Go Master có thời gian init genesis block
+print_info "⏳ Đợi Go Master init genesis block và register validators..."
+sleep 15  # Tăng delay để Go Master có thời gian init genesis block và register validators
+
+# Verify Go Master đã init genesis và có validators
+print_info "🔍 Kiểm tra Go Master đã init genesis và có validators..."
+VALIDATOR_CHECK=false
+for i in {1..30}; do
+    # Check if Go Master has validators in stake state DB
+    if tmux capture-pane -t go-master -p 2>/dev/null | grep -qE "Found [1-9][0-9]* validators in stake state DB|Found [1-9] validators in stake state DB"; then
+        VALIDATOR_CHECK=true
+        print_info "  ✅ Go Master đã init genesis và register validators (sau $i giây)"
+        break
+    fi
+    if [ $i -lt 30 ]; then
+        sleep 1
+    fi
+done
+
+if [ "$VALIDATOR_CHECK" = false ]; then
+    print_warn "  ⚠️  Không xác nhận được Go Master đã init validators (có thể vẫn đang init)"
+    print_warn "     Rust nodes có thể fail khi fetch committee"
+fi
 
 # CRITICAL: Verify Go Master đã init genesis block (check log)
 print_info "🔍 Kiểm tra Go Master đã init genesis block..."
@@ -856,8 +795,8 @@ print_step "Bước 8: Khởi động 4 Rust consensus nodes (sau Go Sub, sau kh
 
 cd "$METANODE_ROOT" || exit 1
 
-# Reset epoch timestamp to start from epoch 0
-export RESET_EPOCH_TIMESTAMP_MS=1
+# Keep epoch timestamp from config (do not reset)
+# export RESET_EPOCH_TIMESTAMP_MS=1
 
 if [ -f "$METANODE_ROOT/scripts/node/run_nodes.sh" ]; then
     print_info "Khởi động Rust nodes..."

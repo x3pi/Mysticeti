@@ -3,7 +3,8 @@
 Script để sync committee từ Rust committee.json vào Go genesis.json
 - Đọc committee từ committee_node_0.json (hoặc committee.json)
 - Update genesis.json với validators từ committee
-- Tạo delegator_stakes từ stake trong committee
+- GIỮ NGUYÊN delegator_stakes và total_staked_amount hiện tại
+- Chỉ update keys: authority_key, protocol_key, network_key
 """
 
 import json
@@ -21,8 +22,27 @@ def load_genesis(genesis_path: str) -> Dict[str, Any]:
     with open(genesis_path, 'r') as f:
         return json.load(f)
 
+def save_genesis_backup_first(genesis_path: str, genesis: Dict[str, Any]):
+    """Save genesis.json - AN TOÀN: backup trước, sau đó ghi đúng"""
+    import os
+
+    # Tạo backup
+    backup_path = genesis_path + '.backup_safe'
+    if os.path.exists(genesis_path):
+        with open(genesis_path, 'r') as f:
+            original_content = f.read()
+        with open(backup_path, 'w') as f:
+            f.write(original_content)
+        print(f"   💾 Đã backup file gốc vào: {backup_path}")
+
+    # Ghi file mới với format đẹp
+    with open(genesis_path, 'w') as f:
+        json.dump(genesis, f, indent=2)
+
+    print(f"   ✅ Đã ghi file mới với {len(genesis.get('validators', []))} validators")
+
 def save_genesis(genesis_path: str, genesis: Dict[str, Any]):
-    """Save genesis.json"""
+    """Save genesis.json - FULL SAVE (có thể ghi đè)"""
     with open(genesis_path, 'w') as f:
         json.dump(genesis, f, indent=2)
 
@@ -38,106 +58,133 @@ def extract_committee_data(committee: Dict[str, Any]) -> List[Dict[str, Any]]:
     return authorities
 
 def sync_committee_to_genesis(committee_path: str, genesis_path: str):
-    """Sync committee vào genesis.json"""
+    """COPY TOÀN BỘ FILE GENESIS RỒI CHỈ SỬA DANH SÁCH VALIDATORS"""
     print(f"📝 Loading committee from: {committee_path}")
     committee = load_committee(committee_path)
-    
+
     print(f"📝 Loading genesis.json from: {genesis_path}")
     genesis = load_genesis(genesis_path)
-    
+
     # Extract authorities from committee
     authorities = extract_committee_data(committee)
     print(f"✅ Found {len(authorities)} validators in committee")
-    
+
     if not authorities:
         print("❌ Error: No validators found in committee!")
         sys.exit(1)
-    
-    # Initialize validators array if not exists
-    if 'validators' not in genesis:
-        genesis['validators'] = []
-    
-    # Clear existing validators (hoặc merge nếu cần)
-    genesis['validators'] = []
-    
-    # Convert each authority to validator format
+
+    # COPY TOÀN BỘ genesis object để đảm bảo không mất gì
+    final_genesis = genesis.copy()
+    original_validators = genesis.get('validators', [])
+    print(f"📝 Found {len(original_validators)} existing validators in genesis")
+    print(f"📝 Found {len(final_genesis.get('alloc', []))} alloc entries")
+
+    # Tạo danh sách validators mới từ committee nhưng GIỮ NGUYÊN alloc từ genesis gốc
+    new_validators = []
     for idx, authority in enumerate(authorities):
-        # Extract keys (có thể là base64 hoặc hex)
+        if idx >= len(original_validators):
+            print(f"⚠️  Warning: Committee has more validators ({len(authorities)}) than genesis ({len(original_validators)})")
+            break
+
+        # COPY TOÀN BỘ validator từ genesis gốc (giữ delegator_stakes, total_staked_amount, etc.)
+        validator_copy = original_validators[idx].copy()
+
+        # CHỈ UPDATE cryptographic keys từ committee
         authority_key = authority.get('authority_key', '')
         protocol_key = authority.get('protocol_key', '')
         network_key = authority.get('network_key', '')
-        address = authority.get('address', '')
         hostname = authority.get('hostname', f'node-{idx}')
-        stake = authority.get('stake', 1)
-        
-        # Convert stake từ normalized (1) về wei (10^18)
-        # stake trong committee là normalized (1 = 1 token)
-        # genesis.json cần wei (1 token = 10^18 wei)
-        stake_wei = stake * 1_000_000_000_000_000_000  # 10^18
-        
-        # Generate Ethereum address từ authority_key (hoặc dùng address có sẵn)
-        # Nếu address là Multiaddr format, cần convert
-        eth_address = None
-        if address.startswith('/ip4/'):
-            # Multiaddr format - generate deterministic address từ hostname
-            import hashlib
-            hash_obj = hashlib.sha256(f"{hostname}-{authority_key}".encode())
-            eth_address = "0x" + hash_obj.hexdigest()[:40]
-        elif address.startswith('0x'):
-            eth_address = address
-        else:
-            # Generate từ hostname
-            import hashlib
-            hash_obj = hashlib.sha256(f"{hostname}-{authority_key}".encode())
-            eth_address = "0x" + hash_obj.hexdigest()[:40]
-        
-        # Extract port từ Multiaddr address
-        port = 9000 + idx
-        if address.startswith('/ip4/'):
-            try:
-                # Parse /ip4/127.0.0.1/tcp/9000
-                parts = address.split('/')
-                for i, part in enumerate(parts):
-                    if part == 'tcp' and i + 1 < len(parts):
-                        port = int(parts[i + 1])
-                        break
-            except:
-                port = 9000 + idx
-        
-        # Create validator entry
-        validator = {
-            "address": eth_address,
-            "primary_address": f"127.0.0.1:{4000 + idx * 100}",
-            "worker_address": f"127.0.0.1:{4012 + idx * 100}",
-            "p2p_address": address if address.startswith('/ip4/') else f"/ip4/127.0.0.1/tcp/{port}",
-            "description": f"Validator {hostname} from committee",
-            "website": f"https://validator-{idx}.com",
-            "image": f"https://example.com/validator-{idx}.png",
-            "commission_rate": 5,
-            "min_self_delegation": "1000000000000000000",
-            "accumulated_rewards_per_share": "0",
-            "delegator_stakes": [
-                {
-                    "address": eth_address,
-                    "amount": str(stake_wei)
-                }
-            ],
-            "total_staked_amount": str(stake_wei),
-            "network_key": network_key,
-            "hostname": hostname,
-            "authority_key": authority_key,
-            "protocol_key": protocol_key
-        }
-        
-        genesis['validators'].append(validator)
-        print(f"  ✅ Added validator {idx}: {hostname} (address: {eth_address}, stake: {stake} -> {stake_wei} wei)")
-    
-    # Save updated genesis.json
-    print(f"💾 Saving updated genesis.json to: {genesis_path}")
-    save_genesis(genesis_path, genesis)
-    
-    print(f"✅ Successfully synced {len(genesis['validators'])} validators to genesis.json")
+
+        validator_copy['authority_key'] = authority_key
+        validator_copy['protocol_key'] = protocol_key
+        validator_copy['network_key'] = network_key
+        validator_copy['hostname'] = hostname
+        validator_copy['description'] = f"Validator {hostname} from committee"
+
+        new_validators.append(validator_copy)
+        print(f"  ✅ Updated validator {idx}: {hostname} (copied original alloc)")
+
+    # CHỈ THAY THẾ phần validators, giữ nguyên mọi thứ khác
+    final_genesis['validators'] = new_validators
+
+    # TÍNH LẠI total_stake, quorum_threshold, validity_threshold từ delegator_stakes
+    total_stake = 0
+    for validator in new_validators:
+        # Lấy total_staked_amount trực tiếp từ genesis (đã tính sẵn)
+        total_staked_str = validator.get('total_staked_amount', '0')
+        try:
+            total_staked_wei = int(total_staked_str)
+            # Chia cho 1e18 để chuyển từ wei sang token
+            validator_stake = total_staked_wei // (10**18)
+            total_stake += validator_stake
+            print(f"  📊 Validator stake: {validator_stake} (from {total_staked_str})")
+        except ValueError:
+            print(f"  ⚠️  Invalid total_staked_amount: {total_staked_str}")
+
+    # Tính threshold theo công thức
+    if total_stake > 0:
+        quorum_threshold = (total_stake * 2) // 3  # 2/3 total_stake
+        validity_threshold = total_stake // 3      # 1/3 total_stake
+
+        final_genesis['total_stake'] = total_stake
+        final_genesis['quorum_threshold'] = quorum_threshold
+        final_genesis['validity_threshold'] = validity_threshold
+
+        print(f"  📊 Total stake: {total_stake}")
+        print(f"  📊 Quorum threshold: {quorum_threshold} (2/3)")
+        print(f"  📊 Validity threshold: {validity_threshold} (1/3)")
+    else:
+        print(f"  ⚠️  No stake found, keeping existing values")
+
+    # ĐẢM BẢO các trường khác được giữ nguyên
+    # alloc, config, etc. đã được copy từ genesis gốc
+
+    # Save updated genesis.json - BACKUP TRƯỚC
+    print(f"💾 Saving updated genesis.json to: {genesis_path} (BACKUP FIRST)")
+    print(f"   📊 Validators: {len(new_validators)} (updated)")
+    print(f"   📊 Alloc: {len(final_genesis.get('alloc', []))} (preserved)")
+    print(f"   🔒 Backup file gốc trước khi ghi")
+
+    # Ghi với backup an toàn
+    save_genesis_backup_first(genesis_path, final_genesis)
+
+    print(f"✅ Successfully synced keys for {len(new_validators)} validators")
     print(f"   💡 Go Master sẽ init genesis với validators này khi khởi động")
+    print(f"   🔒 Toàn bộ alloc và cấu trúc khác được bảo toàn 100%!")
+
+    # CẬP NHẬT committee.json với stake và threshold chính xác
+    committee_path = "config/committee.json"
+    try:
+        with open(committee_path, 'r') as f:
+            committee = json.load(f)
+
+        # Update committee với total_stake và threshold từ final_genesis
+        committee['total_stake'] = final_genesis.get('total_stake', 4)
+        committee['quorum_threshold'] = final_genesis.get('quorum_threshold', 3)
+        committee['validity_threshold'] = final_genesis.get('validity_threshold', 2)
+
+        # Update stake cho từng authority
+        for idx, authority in enumerate(committee.get('authorities', [])):
+            if idx < len(new_validators):
+                validator = new_validators[idx]
+                total_staked_str = validator.get('total_staked_amount', '0')
+                try:
+                    stake_wei = int(total_staked_str)
+                    stake_tokens = stake_wei // (10**18)
+                    authority['stake'] = stake_tokens
+                except ValueError:
+                    print(f"  ⚠️  Invalid stake for authority {idx}")
+
+        with open(committee_path, 'w') as f:
+            json.dump(committee, f, indent=2)
+
+        print(f"✅ Updated committee.json with correct stake and thresholds")
+        print(f"   📊 Committee total_stake: {committee.get('total_stake')}")
+        print(f"   📊 Committee quorum_threshold: {committee.get('quorum_threshold')}")
+        print(f"   📊 Committee validity_threshold: {committee.get('validity_threshold')}")
+
+    except Exception as e:
+        print(f"⚠️  Could not update committee.json: {e}")
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
