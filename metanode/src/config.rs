@@ -294,26 +294,8 @@ impl NodeConfig {
     // No more save/load committee from files - everything goes through Go state synchronization
 
     pub fn load_epoch_timestamp(&self) -> Result<u64> {
-        // First, try to load from committee.json (new format)
-        let committee_path = self.committee_path.clone().unwrap_or_else(|| std::path::PathBuf::from("config/committee.json"));
-        eprintln!("DEBUG: Loading epoch timestamp from: {:?}", committee_path);
-        if committee_path.exists() {
-            eprintln!("DEBUG: Committee file exists, reading...");
-            let content = fs::read_to_string(&committee_path)?;
-            eprintln!("DEBUG: Content length: {}", content.len());
-            if let Ok(config) = serde_json::from_str::<CommitteeConfig>(&content) {
-                if let Some(timestamp) = config.epoch_timestamp_ms {
-                    eprintln!("DEBUG: Found timestamp in committee.json: {}", timestamp);
-                    return Ok(timestamp);
-                } else {
-                    eprintln!("DEBUG: No timestamp in committee.json");
-                }
-            } else {
-                eprintln!("DEBUG: Failed to parse committee.json");
-            }
-        } else {
-            eprintln!("DEBUG: Committee file does not exist");
-        }
+        // REMOVED: Load from committee.json - Now get timestamp from Go state only
+        // This ensures consistent timestamp across all nodes
         
         // Fallback 1: Try to load from epoch_timestamp.txt (backward compatibility)
         if let Some(committee_path) = &self.committee_path {
@@ -334,17 +316,12 @@ impl NodeConfig {
             }
         }
         
-        // Fallback 2: use current time rounded to nearest second
-        // This ensures all nodes starting at the same second get the same timestamp
-        eprintln!("DEBUG: Using fallback timestamp");
-        let now_ms = std::time::SystemTime::now()
+        // Use current timestamp - will be overridden by Go state
+        eprintln!("DEBUG: Using current timestamp (will be overridden by Go state)");
+        let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
-        // Round down to nearest second to increase chance of same timestamp
-        let timestamp_seconds = now_ms / 1000;
-        let timestamp_ms = timestamp_seconds * 1000;
         
         // Save to committee.json if possible
         if let Some(committee_path) = &self.committee_path {

@@ -566,8 +566,6 @@ impl ExecutorClient {
         unreachable!()
     }
 
-    /// Get active validators from Go state for epoch transition
-    /// Returns list of validators that are not jailed and have stake > 0
     pub async fn get_active_validators(&self) -> Result<Vec<ValidatorInfo>> {
         if !self.is_enabled() {
             return Err(anyhow::anyhow!("Executor client is not enabled"));
@@ -632,7 +630,7 @@ impl ExecutorClient {
 
     /// Get validators at a specific block number from Go state
     /// Used for startup (block 0) and epoch transition (last_global_exec_index)
-    pub async fn get_validators_at_block(&self, block_number: u64) -> Result<Vec<ValidatorInfo>> {
+    pub async fn get_validators_at_block(&self, block_number: u64) -> Result<(Vec<ValidatorInfo>, u64)> {
         if !self.is_enabled() {
             return Err(anyhow::anyhow!("Executor client is not enabled"));
         }
@@ -748,11 +746,11 @@ impl ExecutorClient {
             
             match response.payload {
                 Some(proto::response::Payload::ValidatorInfoList(validator_info_list)) => {
-                    info!("✅ [EXECUTOR-REQ] Received ValidatorInfoList from Go at block {} with {} validators, epoch_timestamp_ms={}, last_global_exec_index={}", 
-                        block_number, validator_info_list.validators.len(), 
-                        validator_info_list.epoch_timestamp_ms, 
+                    info!("✅ [EXECUTOR-REQ] Received ValidatorInfoList from Go at block {} with {} validators, epoch_timestamp_ms={}, last_global_exec_index={}",
+                        block_number, validator_info_list.validators.len(),
+                        validator_info_list.epoch_timestamp_ms,
                         validator_info_list.last_global_exec_index);
-                    
+
                     // CRITICAL: Log each ValidatorInfo exactly as received from Go
                     for (idx, validator) in validator_info_list.validators.iter().enumerate() {
                         let auth_key_preview = if validator.authority_key.len() > 50 {
@@ -761,11 +759,11 @@ impl ExecutorClient {
                             validator.authority_key.clone()
                         };
                         info!("📥 [RUST←GO] ValidatorInfo[{}]: address={}, stake={}, name={}, authority_key={}, protocol_key={}, network_key={}",
-                            idx, validator.address, validator.stake, validator.name, 
+                            idx, validator.address, validator.stake, validator.name,
                             auth_key_preview, validator.protocol_key, validator.network_key);
                     }
-                    
-                    return Ok(validator_info_list.validators);
+
+                    return Ok((validator_info_list.validators, validator_info_list.epoch_timestamp_ms));
                 }
                 Some(proto::response::Payload::Error(error_msg)) => {
                     return Err(anyhow::anyhow!("Go returned error: {}", error_msg));

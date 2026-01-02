@@ -15,6 +15,9 @@ use tracing::{info, error};
 use thiserror::Error;
 use bcs;
 
+// Import ExecutorClient
+use crate::executor_client::ExecutorClient;
+
 /// Error types for epoch change operations
 #[derive(Debug, Error)]
 #[allow(dead_code)] // Error variants will be used when implementing full epoch transition
@@ -43,7 +46,8 @@ pub enum EpochChangeError {
 #[derive(Serialize, Deserialize)]
 pub struct EpochChangeProposal {
     pub new_epoch: u64,
-    pub new_committee: Committee,
+    // REMOVED: new_committee - will fetch from Go state during transition
+    // This ensures committee is always calculated from current Go staking state
     pub new_epoch_timestamp_ms: u64,
     pub proposal_commit_index: u32,
     pub proposer_value: u32,  // Store as u32 for BCS compatibility
@@ -54,9 +58,9 @@ pub struct EpochChangeProposal {
 
 impl EpochChangeProposal {
     /// Create new proposal with AuthorityIndex and ProtocolKeySignature
+    /// NOTE: No longer requires new_committee - will fetch from Go state during transition
     pub fn new_with_signature(
         new_epoch: u64,
-        new_committee: Committee,
         new_epoch_timestamp_ms: u64,
         proposal_commit_index: u32,
         proposer: AuthorityIndex,
@@ -65,7 +69,6 @@ impl EpochChangeProposal {
     ) -> Self {
         Self {
             new_epoch,
-            new_committee,
             new_epoch_timestamp_ms,
             proposal_commit_index,
             proposer_value: proposer.value() as u32,
@@ -90,7 +93,6 @@ impl Clone for EpochChangeProposal {
     fn clone(&self) -> Self {
         Self {
             new_epoch: self.new_epoch,
-            new_committee: self.new_committee.clone(),
             new_epoch_timestamp_ms: self.new_epoch_timestamp_ms,
             proposal_commit_index: self.proposal_commit_index,
             proposer_value: self.proposer_value,
@@ -104,12 +106,12 @@ impl fmt::Debug for EpochChangeProposal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EpochChangeProposal")
             .field("new_epoch", &self.new_epoch)
-            .field("new_committee", &self.new_committee)
             .field("new_epoch_timestamp_ms", &self.new_epoch_timestamp_ms)
             .field("proposal_commit_index", &self.proposal_commit_index)
             .field("proposer", &self.proposer())
             .field("signature", &hex::encode(&self.signature_bytes[..8.min(self.signature_bytes.len())]))
             .field("created_at_seconds", &self.created_at_seconds)
+            .field("note", &"committee_from_go_state")
             .finish()
     }
 }
@@ -117,7 +119,6 @@ impl fmt::Debug for EpochChangeProposal {
 impl EpochChangeProposal {
     pub fn new(
         new_epoch: u64,
-        new_committee: Committee,
         new_epoch_timestamp_ms: u64,
         proposal_commit_index: u32,
         proposer: AuthorityIndex,
@@ -129,7 +130,6 @@ impl EpochChangeProposal {
             .as_secs();
         Self::new_with_signature(
             new_epoch,
-            new_committee,
             new_epoch_timestamp_ms,
             proposal_commit_index,
             proposer,
@@ -230,6 +230,9 @@ pub struct EpochChangeManager {
 
     /// Throttle noisy time-based check logs.
     last_time_based_check_log_ms: u64,
+    /// Executor client to fetch committee from Go state during transition
+    #[allow(dead_code)] // Will be used when implementing transition
+    executor_client: Option<Arc<ExecutorClient>>,
 }
 
 impl EpochChangeManager {
@@ -256,20 +259,21 @@ impl EpochChangeManager {
             epoch_duration_seconds,
             max_clock_drift_ms,
             last_time_based_check_log_ms: 0,
+            executor_client: None,
         }
     }
 
     /// Reset internal state for a new epoch.
     /// This is used when restarting consensus in-process to ensure epoch is independent
     /// (no old proposals/votes/seen hashes are carried over).
+    /// NOTE: Committee will be updated from Go state during transition
     pub fn reset_for_new_epoch(
         &mut self,
         new_epoch: u64,
-        new_committee: Arc<Committee>,
         new_epoch_start_timestamp_ms: u64,
     ) {
         self.current_epoch = new_epoch;
-        self.committee = new_committee;
+        // NOTE: committee will be updated from Go state during transition
         self.epoch_start_timestamp_ms = new_epoch_start_timestamp_ms;
 
         // Clear all epoch-scoped state.
@@ -294,17 +298,16 @@ impl EpochChangeManager {
     }
 
     /// Hash a proposal for identification
-    /// 
+    ///
     /// CRITICAL FORK-SAFETY: Hash phải được tính GIỐNG NHAU ở tất cả nodes
     /// Nếu hash khác nhau, nodes sẽ không thể validate proposal → fork
-    /// 
+    ///
     /// Hash được tính từ các field deterministic:
     /// - new_epoch: Epoch number (deterministic)
-    /// - new_committee.epoch(): Committee epoch (should match new_epoch)
     /// - new_epoch_timestamp_ms: Epoch start timestamp (phải giống nhau ở tất cả nodes)
     /// - proposal_commit_index: Commit index khi proposal được tạo (deterministic)
     /// - proposer().value(): Proposer authority index (deterministic)
-    /// 
+    ///
     /// Tất cả các field này đều deterministic và giống nhau ở tất cả nodes
     /// → Hash sẽ giống nhau ở tất cả nodes → Không fork
     pub fn hash_proposal(&self, proposal: &EpochChangeProposal) -> Vec<u8> {
@@ -312,9 +315,8 @@ impl EpochChangeManager {
         // CRITICAL: Format string phải giống nhau ở tất cả nodes
         // Không được thay đổi format này vì sẽ làm hash khác nhau → fork
         let proposal_data = format!(
-            "{}-{}-{}-{}-{}",
+            "{}-{}-{}-{}",
             proposal.new_epoch,
-            proposal.new_committee.epoch(),
             proposal.new_epoch_timestamp_ms,
             proposal.proposal_commit_index,
             proposal.proposer().value()
@@ -387,9 +389,9 @@ impl EpochChangeManager {
     }
 
     /// Propose epoch change
+    /// NOTE: Committee will be fetched from Go state during transition
     pub fn propose_epoch_change(
         &mut self,
-        new_committee: Committee,
         new_epoch_timestamp_ms: u64,
         proposal_commit_index: u32,
         proposer: AuthorityIndex,
@@ -398,16 +400,13 @@ impl EpochChangeManager {
         // Check rate limit
         self.check_rate_limit(proposer)?;
 
-        // Validate new committee
-        self.validate_new_committee(&new_committee)?;
-
         let new_epoch = self.current_epoch + 1;
 
         // Create proposal message to sign
+        // NOTE: No committee in proposal - will fetch from Go state during transition
         let proposal_message = format!(
-            "epoch_change:{}:{}:{}:{}:{}",
+            "epoch_change:{}:{}:{}:{}",
             new_epoch,
-            new_committee.epoch(),
             new_epoch_timestamp_ms,
             proposal_commit_index,
             proposer.value()
@@ -418,7 +417,6 @@ impl EpochChangeManager {
 
         let proposal = EpochChangeProposal::new(
             new_epoch,
-            new_committee,
             new_epoch_timestamp_ms,
             proposal_commit_index,
             proposer,
@@ -438,7 +436,7 @@ impl EpochChangeManager {
 
         let hash_hex = hex::encode(&proposal_hash[..8]);
         info!(
-            "📝 Epoch change proposal created: epoch {} -> {}, proposal_hash={}, proposer={}, commit_index={}, timestamp={}",
+            "📝 Epoch change proposal created: epoch {} -> {}, proposal_hash={}, proposer={}, commit_index={}, timestamp={} (committee_from_go_state)",
             self.current_epoch,
             new_epoch,
             hash_hex,
@@ -458,6 +456,11 @@ impl EpochChangeManager {
     /// Get epoch duration in seconds
     pub fn epoch_duration_seconds(&self) -> u64 {
         self.epoch_duration_seconds
+    }
+
+    /// Set executor client for fetching committee from Go state
+    pub fn set_executor_client(&mut self, executor_client: Arc<ExecutorClient>) {
+        self.executor_client = Some(executor_client);
     }
 
     /// Get pending proposals count
@@ -492,10 +495,9 @@ impl EpochChangeManager {
         // Create vote message
         let proposal_hash = self.hash_proposal(proposal);
         let vote_message = format!(
-            "epoch_vote:{}:{}:{}",
+            "epoch_vote:{}:{}",
             hex::encode(&proposal_hash[..8]),
-            approve,
-            self.committee.authority(proposal.proposer()).stake
+            approve
         );
 
         // Sign vote
@@ -620,8 +622,7 @@ impl EpochChangeManager {
             "Epoch must increment by 1"
         );
 
-        // 2. Validate committee
-        self.validate_new_committee(&proposal.new_committee)?;
+        // 2. Committee validation will happen during transition with committee from Go state
 
         // 3. Check if this is a catch-up scenario and sync timestamp if needed
         let now_ms = SystemTime::now()
@@ -684,10 +685,11 @@ impl EpochChangeManager {
         Ok(())
     }
 
-    /// Validate new committee
+    /// Validate new committee (will be called during transition with committee from Go state)
+    #[allow(dead_code)] // Will be used when implementing transition validation
     fn validate_new_committee(&self, new: &Committee) -> Result<()> {
         ensure!(new.size() >= 4, "Minimum 4 nodes required");
-        
+
         // Validate quorum threshold
         let f = (new.total_stake() - 1) / 3;
         ensure!(
@@ -708,9 +710,8 @@ impl EpochChangeManager {
     #[allow(dead_code)] // Used internally by validate_proposal
     fn verify_proposal_signature(&self, proposal: &EpochChangeProposal) -> Result<()> {
         let proposal_message = format!(
-            "epoch_change:{}:{}:{}:{}:{}",
+            "epoch_change:{}:{}:{}:{}",
             proposal.new_epoch,
-            proposal.new_committee.epoch(),
             proposal.new_epoch_timestamp_ms,
             proposal.proposal_commit_index,
             proposal.proposer().value()
@@ -743,11 +744,11 @@ impl EpochChangeManager {
     }
 
     /// Should approve proposal (basic logic - can be enhanced)
+    /// NOTE: Committee validation will happen during transition with committee from Go state
     #[allow(dead_code)] // Used internally by vote_on_proposal
-    fn should_approve_proposal(&self, proposal: &EpochChangeProposal) -> Result<bool> {
-        // For now, approve if committee is valid
-        // Can add more complex logic later
-        self.validate_new_committee(&proposal.new_committee)?;
+    fn should_approve_proposal(&self, _proposal: &EpochChangeProposal) -> Result<bool> {
+        // For now, approve all valid proposals
+        // Committee validation will happen during actual transition
         Ok(true)
     }
 

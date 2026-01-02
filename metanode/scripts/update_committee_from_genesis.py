@@ -5,6 +5,7 @@ Tính stake từ delegator_stakes và update threshold
 """
 import json
 import sys
+import time
 
 def update_committee_from_genesis():
     committee_file = '/home/abc/chain-n/Mysticeti/metanode/config/committee.json'
@@ -71,7 +72,14 @@ def update_committee_from_genesis():
     with open(committee_file, 'w') as f:
         json.dump(committee, f, indent=2)
 
-    print("✅ Updated committee.json với stake từ delegator_stakes")
+    # Update genesis.json với epoch_timestamp_ms từ committee.json nếu cần
+    if genesis.get('config', {}).get('epoch_timestamp_ms') is None:
+        genesis['config']['epoch_timestamp_ms'] = committee.get('epoch_timestamp_ms', int(time.time() * 1000))
+        with open(genesis_file, 'w') as f:
+            json.dump(genesis, f, indent=2)
+        print(f"✅ Updated genesis.json với epoch_timestamp_ms: {genesis['config']['epoch_timestamp_ms']}")
+
+    print("✅ Updated committee.json và genesis.json với stake từ delegator_stakes")
     return True
 
 if __name__ == '__main__':

@@ -16,6 +16,7 @@ use crate::epoch_change::EpochChangeManager;
 use crate::clock_sync::ClockSyncManager;
 use prometheus::Registry;
 use mysten_metrics::RegistryService;
+use serde_json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -115,8 +116,42 @@ impl ConsensusNode {
         ));
 
         // Fetch validators from Go at block 0 (genesis)
-        let validators = executor_client.get_validators_at_block(0).await
+        let (validators, _go_epoch_timestamp_ms) = executor_client.get_validators_at_block(0).await
             .map_err(|e| anyhow::anyhow!("Failed to fetch committee from Go state: {}", e))?;
+
+        // Load epoch_timestamp_ms from genesis.json instead of Go state for consistency
+        let genesis_path = std::path::Path::new("../../mtn-simple-2025/cmd/simple_chain/genesis.json");
+        let epoch_timestamp_ms = if genesis_path.exists() {
+            match std::fs::read_to_string(genesis_path) {
+                Ok(content) => {
+                    match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(json) => {
+                            match json.get("config").and_then(|c| c.get("epoch_timestamp_ms")).and_then(|ts| ts.as_u64()) {
+                                Some(ts) => {
+                                    info!("📅 Using epoch_timestamp_ms from genesis.json: {}", ts);
+                                    ts
+                                },
+                                None => {
+                                    warn!("⚠️  Could not find epoch_timestamp_ms in genesis.json, using Go timestamp: {}", _go_epoch_timestamp_ms);
+                                    _go_epoch_timestamp_ms
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            warn!("⚠️  Failed to parse genesis.json: {}, using Go timestamp: {}", e, _go_epoch_timestamp_ms);
+                            _go_epoch_timestamp_ms
+                        }
+                    }
+                },
+                Err(e) => {
+                    warn!("⚠️  Failed to read genesis.json: {}, using Go timestamp: {}", e, _go_epoch_timestamp_ms);
+                    _go_epoch_timestamp_ms
+                }
+            }
+        } else {
+            warn!("⚠️  genesis.json not found at {:?}, using Go timestamp: {}", genesis_path, _go_epoch_timestamp_ms);
+            _go_epoch_timestamp_ms
+        };
 
         if validators.is_empty() {
             anyhow::bail!("Go state returned empty validators list at genesis block");
@@ -303,8 +338,8 @@ impl ConsensusNode {
             parameters.round_prober_request_timeout_ms = round_prober_request_timeout_ms;
         }
 
-        // Load epoch start timestamp
-        let epoch_start_timestamp = config.load_epoch_timestamp()?;
+        // Use epoch timestamp from genesis.json for consistency across all nodes
+        let epoch_start_timestamp = epoch_timestamp_ms;
         let current_epoch = committee.epoch();
 
         // Per-epoch DB path
@@ -489,13 +524,10 @@ impl ConsensusNode {
                             let mut manager = epoch_change_manager_clone.write().await;
                             let current_commit_index = current_commit_index_clone.load(Ordering::SeqCst);
                             
-                            let new_committee = Committee::new(current_epoch + 1, new_authorities);
-                            
                             let new_epoch_timestamp_ms = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
-                                .as_millis() as u64
-                                + 10_000;
+                                .as_millis() as u64;
                             
                             let proposal_commit_index = current_commit_index.saturating_add(100);
                             
@@ -503,7 +535,6 @@ impl ConsensusNode {
                                 current_epoch, current_epoch + 1, proposal_commit_index, current_commit_index);
                             
                             match manager.propose_epoch_change(
-                                new_committee,
                                 new_epoch_timestamp_ms,
                                 proposal_commit_index,
                                 own_index_clone,
@@ -902,7 +933,7 @@ impl ConsensusNode {
         loop {
             // Get validators from Go at specific block
             match executor_client.get_validators_at_block(block_number).await {
-                Ok(validators) => {
+                Ok((validators, _epoch_timestamp_ms)) => {
                     if !validators.is_empty() {
                          info!("📋 [COMMITTEE FETCH] Successfully received {} validators from Go at block {}", validators.len(), block_number);
                          // For epoch transition, epoch will be set by caller
@@ -1156,8 +1187,15 @@ impl ConsensusNode {
         // 4) Build new committee from Go state
         // FIX: LOOP INFINITELY to fetch from Go, ensure no fallback to local files.
         let executor_client = Arc::new(ExecutorClient::new(true, 0, false)); // node_id không cần thiết khi gọi Go state, không commit trong transition
+
+        // Set executor client for epoch change manager
+        {
+            let mut mgr = self.epoch_change_manager.write().await;
+            mgr.set_executor_client(executor_client.clone());
+        }
+
         let block_number = self.last_global_exec_index; // Use last epoch's known global index
-        
+
         info!("🔄 [EPOCH-TRANSITION] Fetching committee from Go state at block {}...", block_number);
         
         // This helper now contains the infinite loop. It will NOT return until Go responds successfully.
@@ -1185,7 +1223,6 @@ impl ConsensusNode {
             let mut mgr = self.epoch_change_manager.write().await;
             mgr.reset_for_new_epoch(
                 proposal.new_epoch,
-                Arc::new(proposal.new_committee.clone()),
                 proposal.new_epoch_timestamp_ms,
             );
         }
@@ -1266,7 +1303,7 @@ impl ConsensusNode {
             NetworkType::Tonic,
             proposal.new_epoch_timestamp_ms,
             self.own_index,
-            proposal.new_committee.clone(),
+            new_committee.clone(),
             parameters,
             self.protocol_config.clone(),
             self.protocol_keypair.clone(),
