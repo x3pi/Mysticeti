@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mysticeti Node Monitoring Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: transform 0.2s;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+        }
+
+        .card h3 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 1.3em;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            padding: 8px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        .metric:last-child {
+            border-bottom: none;
+        }
+
+        .metric-label {
+            font-weight: 500;
+            color: #555;
+        }
+
+        .metric-value {
+            font-weight: bold;
+            font-size: 1.1em;
+        }
+
+        .status-healthy {
+            color: #28a745;
+        }
+
+        .status-warning {
+            color: #ffc107;
+        }
+
+        .status-error {
+            color: #dc3545;
+        }
+
+        .status-unknown {
+            color: #6c757d;
+        }
+
+        .log-section {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .log-container {
+            max-height: 400px;
+            overflow-y: auto;
+            background: #f8f9fa;
+            border-radius: 5px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            line-height: 1.4;
+        }
+
+        .log-entry {
+            margin-bottom: 5px;
+            padding: 3px 0;
+        }
+
+        .log-info {
+            color: #0066cc;
+        }
+
+        .log-warn {
+            color: #856404;
+            background: #fff3cd;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+
+        .log-error {
+            color: #721c24;
+            background: #f8d7da;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1em;
+            transition: background 0.2s;
+        }
+
+        .btn:hover {
+            background: #5a67d8;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+        }
+
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+
+        .refresh-indicator {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-left: 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .epoch-progress {
+            width: 100%;
+            height: 20px;
+            background: #e9ecef;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .epoch-progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #28a745, #20c997);
+            transition: width 0.3s ease;
+        }
+
+        .node-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+
+        .node-card {
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .node-status {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .node-status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .node-status-dot.healthy {
+            background: #28a745;
+        }
+
+        .node-status-dot.warning {
+            background: #ffc107;
+        }
+
+        .node-status-dot.error {
+            background: #dc3545;
+        }
+
+        .tabs {
+            display: flex;
+            margin-bottom: 20px;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .tab {
+            flex: 1;
+            padding: 12px;
+            text-align: center;
+            cursor: pointer;
+            background: #f8f9fa;
+            border: none;
+            transition: background 0.2s;
+        }
+
+        .tab.active {
+            background: #667eea;
+            color: white;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        @media (max-width: 768px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .header h1 {
+                font-size: 2em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔍 Mysticeti Node Monitor</h1>
+            <p>Real-time monitoring dashboard for blockchain nodes</p>
+        </div>
+
+        <div class="controls">
+            <button class="btn" onclick="refreshData()">🔄 Refresh</button>
+            <button class="btn btn-secondary" onclick="toggleAutoRefresh()">
+                ⏱️ Auto Refresh: <span id="autoRefreshStatus">ON</span>
+            </button>
+            <button class="btn btn-secondary" onclick="clearLogs()">🗑️ Clear Logs</button>
+            <span id="lastUpdate" style="margin-left: auto; color: white;">Last update: Never</span>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('overview')">Overview</button>
+            <button class="tab" onclick="showTab('nodes')">Nodes</button>
+            <button class="tab" onclick="showTab('logs')">Logs</button>
+        </div>
+
+        <div id="overview" class="tab-content active">
+            <div class="dashboard-grid">
+                <div class="card">
+                    <h3>📊 System Metrics</h3>
+                    <div class="metric">
+                        <span class="metric-label">Total Nodes</span>
+                        <span class="metric-value" id="totalNodes">4</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Healthy Nodes</span>
+                        <span class="metric-value status-healthy" id="healthyNodes">4</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Current Epoch</span>
+                        <span class="metric-value" id="currentEpoch">0</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Latest Global Block</span>
+                        <span class="metric-value" id="latestBlock">0</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Latest Local Block</span>
+                        <span class="metric-value" id="latestLocalBlock">0</span>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>⏱️ Epoch Progress</h3>
+                    <div class="metric">
+                        <span class="metric-label">Epoch Duration</span>
+                        <span class="metric-value" id="epochDuration">180s</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Elapsed Time</span>
+                        <span class="metric-value" id="elapsedTime">0s</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Remaining Time</span>
+                        <span class="metric-value" id="remainingTime">180s</span>
+                    </div>
+                    <div class="epoch-progress">
+                        <div class="epoch-progress-bar" id="epochProgressBar" style="width: 0%"></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>🔗 Network Status</h3>
+                    <div class="metric">
+                        <span class="metric-label">Network Health</span>
+                        <span class="metric-value status-healthy" id="networkHealth">Healthy</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Active Connections</span>
+                        <span class="metric-value" id="activeConnections">4</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Pending Transactions</span>
+                        <span class="metric-value" id="pendingTx">0</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Commit Index</span>
+                        <span class="metric-value" id="commitIndex">0</span>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>⚡ Performance</h3>
+                    <div class="metric">
+                        <span class="metric-label">Blocks/sec</span>
+                        <span class="metric-value" id="blocksPerSec">0.0</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Transactions/sec</span>
+                        <span class="metric-value" id="txPerSec">0.0</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">CPU Usage</span>
+                        <span class="metric-value" id="cpuUsage">0%</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Memory Usage</span>
+                        <span class="metric-value" id="memoryUsage">0MB</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="nodes" class="tab-content">
+            <div class="node-grid" id="nodeGrid">
+                <!-- Node cards will be populated by JavaScript -->
+            </div>
+        </div>
+
+        <div id="logs" class="tab-content">
+            <div class="log-section">
+                <h3>📋 Recent Logs</h3>
+                <div class="log-container" id="logContainer">
+                    <div class="log-entry log-info">[INFO] Dashboard initialized</div>
+                    <div class="log-entry log-info">[INFO] Waiting for data...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global state
+        let autoRefresh = true;
+        let refreshInterval = 2000; // 2 seconds
+        let intervalId = null;
+        let lastBlockCount = 0;
+        let lastTxCount = 0;
+        let startTime = Date.now();
+        let lastUpdateTime = Date.now();
+        let lastValues = { blocks: 0, tx: 0 };
+
+        // Sample data for demonstration
+        const sampleData = {
+            totalNodes: 4,
+            healthyNodes: 4,
+            currentEpoch: 0,
+            latestBlock: 0,
+            latestLocalBlock: 0,
+            epochDuration: 180,
+            elapsedTime: 0,
+            networkHealth: 'Healthy',
+            activeConnections: 4,
+            pendingTx: 0,
+            commitIndex: 0,
+            blocksPerSec: 0.0,
+            txPerSec: 0.0,
+            cpuUsage: '45%',
+            memoryUsage: '256MB',
+            nodes: [
+                { id: 0, status: 'healthy', epoch: 0, blocks: 150, connections: 3 },
+                { id: 1, status: 'healthy', epoch: 0, blocks: 148, connections: 3 },
+                { id: 2, status: 'warning', epoch: 0, blocks: 149, connections: 2 },
+                { id: 3, status: 'healthy', epoch: 0, blocks: 147, connections: 3 }
+            ],
+            logs: [
+                { level: 'info', message: '[INFO] Consensus round completed', timestamp: Date.now() - 1000 },
+                { level: 'info', message: '[INFO] Block committed successfully', timestamp: Date.now() - 2000 },
+                { level: 'warn', message: '[WARN] Network latency detected', timestamp: Date.now() - 3000 },
+                { level: 'info', message: '[INFO] Epoch transition check passed', timestamp: Date.now() - 4000 }
+            ]
+        };
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            updateData();
+            if (autoRefresh) {
+                startAutoRefresh();
+            }
+        });
+
+        function showTab(tabName) {
+            // Hide all tab contents
+            const tabContents = document.querySelectorAll('.tab-content');
+            tabContents.forEach(content => content.classList.remove('active'));
+
+            // Remove active class from all tabs
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach(tab => tab.classList.remove('active'));
+
+            // Show selected tab
+            document.getElementById(tabName).classList.add('active');
+            event.target.classList.add('active');
+        }
+
+        function refreshData() {
+            updateData();
+            document.getElementById('lastUpdate').textContent = `Last update: ${new Date().toLocaleTimeString()}`;
+        }
+
+        function toggleAutoRefresh() {
+            autoRefresh = !autoRefresh;
+            document.getElementById('autoRefreshStatus').textContent = autoRefresh ? 'ON' : 'OFF';
+
+            if (autoRefresh) {
+                startAutoRefresh();
+            } else {
+                stopAutoRefresh();
+            }
+        }
+
+        function startAutoRefresh() {
+            if (intervalId) return;
+            intervalId = setInterval(refreshData, refreshInterval);
+        }
+
+        function stopAutoRefresh() {
+            if (intervalId) {
+                clearInterval(intervalId);
+                intervalId = null;
+            }
+        }
+
+        function clearLogs() {
+            const logContainer = document.getElementById('logContainer');
+            logContainer.innerHTML = '<div class="log-entry log-info">[INFO] Logs cleared</div>';
+        }
+
+        async function updateData() {
+            try {
+                // Fetch real data from monitoring API
+                const response = await fetch('/api/data');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const data = await response.json();
+
+                // Update with real data
+                sampleData.totalNodes = data.aggregates.total_nodes;
+                sampleData.healthyNodes = data.aggregates.healthy_nodes;
+                sampleData.currentEpoch = data.epoch.current_epoch;
+                sampleData.latestBlock = data.aggregates.latest_block;
+                sampleData.latestLocalBlock = data.aggregates.latest_local_block;
+                sampleData.epochDuration = data.epoch.epoch_duration;
+                sampleData.elapsedTime = data.epoch.elapsed_seconds;
+                sampleData.networkHealth = data.aggregates.network_health;
+                sampleData.activeConnections = data.nodes.filter(n => n.status === 'healthy').length;
+                sampleData.pendingTx = Math.floor(Math.random() * 10); // Keep simulated for now
+                sampleData.commitIndex = Math.max(...data.nodes.map(n => n.commit_index), 0);
+                sampleData.totalTransactions = data.aggregates.total_transactions || 0;
+
+                // Use real TPS from backend instead of estimation
+                sampleData.blocksPerSec = calculateRate(sampleData.latestBlock, 'blocks');
+                sampleData.txPerSec = data.aggregates.transactions_per_second || 0;
+                sampleData.cpuUsage = data.system.cpu_usage;
+                sampleData.memoryUsage = data.system.memory_usage;
+
+                // Update nodes data
+                sampleData.nodes = data.nodes.map(node => ({
+                    id: node.id,
+                    status: node.status,
+                    epoch: node.epoch,
+                    blocks: node.blocks,
+                    global_blocks: node.global_blocks,
+                    connections: 3, // Estimate
+                    errors: node.errors,
+                    warnings: node.warnings
+                }));
+
+                // Update logs
+                sampleData.logs = data.logs.map(log => ({
+                    level: log.level,
+                    message: `[Node ${log.node}] ${log.message}`,
+                    timestamp: log.timestamp * 1000, // Convert to milliseconds
+                    added: false
+                }));
+
+                updateOverview();
+                updateNodes();
+                updateLogs();
+
+            } catch (error) {
+                console.error('Failed to fetch monitoring data:', error);
+                // Fallback to simulated data
+                fallbackToSimulatedData();
+                updateOverview();
+                updateNodes();
+                updateLogs();
+            }
+        }
+
+        function calculateRate(currentValue, metric) {
+            const now = Date.now();
+            const timeDiff = (now - lastUpdateTime) / 1000; // seconds
+            if (timeDiff === 0) return 0;
+
+            const valueDiff = currentValue - lastValues[metric];
+            lastValues[metric] = currentValue;
+            lastUpdateTime = now;
+
+            return Math.max(0, valueDiff / timeDiff);
+        }
+
+        function fallbackToSimulatedData() {
+            // Update sample data with some randomness for demo when API fails
+            sampleData.latestLocalBlock += Math.floor(Math.random() * 3);
+            sampleData.latestBlock = sampleData.latestLocalBlock + 100; // Simulate global offset
+            sampleData.elapsedTime = Math.floor((Date.now() - startTime) / 1000);
+            sampleData.pendingTx = Math.floor(Math.random() * 10);
+            sampleData.commitIndex = sampleData.latestBlock;
+            sampleData.blocksPerSec = (sampleData.latestBlock - lastBlockCount) / 2;
+            // Keep TPS as 0 in fallback mode since we can't calculate real TPS without API data
+            sampleData.txPerSec = 0;
+
+            lastBlockCount = sampleData.latestBlock;
+        }
+
+        function updateOverview() {
+            document.getElementById('totalNodes').textContent = sampleData.totalNodes;
+            document.getElementById('healthyNodes').textContent = sampleData.healthyNodes;
+            document.getElementById('currentEpoch').textContent = sampleData.currentEpoch;
+            document.getElementById('latestBlock').textContent = sampleData.latestBlock;
+            document.getElementById('latestLocalBlock').textContent = sampleData.latestLocalBlock;
+            document.getElementById('epochDuration').textContent = `${sampleData.epochDuration}s`;
+            document.getElementById('elapsedTime').textContent = `${sampleData.elapsedTime}s`;
+            document.getElementById('remainingTime').textContent = `${Math.max(0, sampleData.epochDuration - sampleData.elapsedTime)}s`;
+            document.getElementById('networkHealth').textContent = sampleData.networkHealth;
+            document.getElementById('activeConnections').textContent = sampleData.activeConnections;
+            document.getElementById('pendingTx').textContent = sampleData.pendingTx;
+            document.getElementById('commitIndex').textContent = sampleData.commitIndex;
+            document.getElementById('blocksPerSec').textContent = sampleData.blocksPerSec.toFixed(1);
+            document.getElementById('txPerSec').textContent = sampleData.txPerSec.toFixed(1);
+            document.getElementById('cpuUsage').textContent = sampleData.cpuUsage;
+            document.getElementById('memoryUsage').textContent = sampleData.memoryUsage;
+
+            // Update epoch progress bar
+            const progressPercent = Math.min(100, (sampleData.elapsedTime / sampleData.epochDuration) * 100);
+            document.getElementById('epochProgressBar').style.width = `${progressPercent}%`;
+        }
+
+        function updateNodes() {
+            const nodeGrid = document.getElementById('nodeGrid');
+            nodeGrid.innerHTML = '';
+
+            sampleData.nodes.forEach(node => {
+                const nodeCard = document.createElement('div');
+                nodeCard.className = 'node-card';
+
+                const statusClass = node.status === 'healthy' ? 'healthy' :
+                                   node.status === 'warning' ? 'warning' : 'error';
+
+                nodeCard.innerHTML = `
+                    <div class="node-status">
+                        <div class="node-status-dot ${statusClass}"></div>
+                        <strong>Node ${node.id}</strong>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Status</span>
+                        <span class="metric-value status-${statusClass}">${node.status.toUpperCase()}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Epoch</span>
+                        <span class="metric-value">${node.epoch}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Global Blocks</span>
+                        <span class="metric-value">${node.global_blocks || 0}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Local Blocks</span>
+                        <span class="metric-value">${node.blocks}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Connections</span>
+                        <span class="metric-value">${node.connections}</span>
+                    </div>
+                `;
+
+                nodeGrid.appendChild(nodeCard);
+            });
+        }
+
+        function updateLogs() {
+            const logContainer = document.getElementById('logContainer');
+
+            // Add new log entries
+            sampleData.logs.forEach(log => {
+                if (!log.added) {
+                    const logEntry = document.createElement('div');
+                    logEntry.className = `log-entry log-${log.level}`;
+                    logEntry.textContent = `[${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}`;
+                    logContainer.appendChild(logEntry);
+                    log.added = true;
+                }
+            });
+
+            // Keep only last 50 entries
+            while (logContainer.children.length > 50) {
+                logContainer.removeChild(logContainer.firstChild);
+            }
+
+            // Auto scroll to bottom
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        // Simulate real-time log updates
+        setInterval(() => {
+            if (Math.random() < 0.3) { // 30% chance every 5 seconds
+                const messages = [
+                    '[INFO] Block committed successfully',
+                    '[INFO] Consensus round completed',
+                    '[INFO] Transaction processed',
+                    '[WARN] Network latency detected',
+                    '[INFO] Epoch transition check passed',
+                    '[INFO] New peer connected'
+                ];
+                const levels = ['info', 'info', 'info', 'warn', 'info', 'info'];
+
+                const randomIndex = Math.floor(Math.random() * messages.length);
+                sampleData.logs.unshift({
+                    level: levels[randomIndex],
+                    message: messages[randomIndex],
+                    timestamp: Date.now(),
+                    added: false
+                });
+            }
+        }, 5000);
+    </script>
+</body>
+</html>

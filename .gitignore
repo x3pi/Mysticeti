@@ -1,29 +1,70 @@
+# =============================================================================
+# Mysticeti Blockchain Node - .gitignore
+# =============================================================================
+#
+# This .gitignore is organized by sections for better maintainability.
+# Each section focuses on a specific type of files/artifacts.
+#
+# SECURITY NOTE: Never commit private keys, secrets, or sensitive configuration!
+# Files in the "Configuration and secrets" section are CRITICAL to exclude.
+#
+# To test: git status --ignored
+# =============================================================================
+
+# Build artifacts and dependencies
+# =============================================================================
+
 # Rust build artifacts
 **/target/
 **/*.rs.bk
 **/*.pdb
 
-# Cargo
+# Cargo.lock (only ignore in workspace root, keep in individual crates if needed)
 Cargo.lock
-**/Cargo.lock
 
-# Logs
+# Compiled binaries and libraries
+**/*.exe
+**/*.dll
+**/*.so
+**/*.dylib
+
+# Rust documentation
+**/target/doc/
+
+# Rust test and benchmark artifacts
+**/*.profraw
+
+# Node modules (JavaScript/TypeScript)
+**/node_modules/
+
+# Python virtual environments and cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.Python
+**/env/
+**/venv/
+**/ENV/
+**/env.bak/
+**/venv.bak/
+# Monitoring virtual environment
+metanode/monitoring/venv/
+
+# =============================================================================
+# Logs and databases
+# =============================================================================
+
+# Log files
 **/logs/
 *.log
 **/*.log
+**/*.log.*
 
-# Node configuration and keys (IMPORTANT: Contains private keys!)
-metanode/config/node_*_protocol_key.json
-metanode/config/node_*_network_key.json
-metanode/config/node_*.toml
-metanode/config/committee.json
-metanode/config/epoch_timestamp.txt
-
-# Storage databases
+# Storage databases (IMPORTANT: Contains blockchain state)
 metanode/config/storage/
 **/consensus_db/
 **/*.sst
-**/*.log
 **/CURRENT
 **/IDENTITY
 **/LOCK
@@ -31,17 +72,48 @@ metanode/config/storage/
 **/MANIFEST-*
 **/OPTIONS-*
 
+# Temporary database files
+**/*.db.tmp
+**/*.db.lock
+
+# =============================================================================
+# Configuration and secrets (SECURITY CRITICAL)
+# =============================================================================
+
+# Node configuration files (may contain sensitive data)
+metanode/config/node_*.toml
+metanode/config/committee.json
+metanode/config/committee_*.json
+metanode/config/epoch_timestamp.txt
+
+# Cryptographic keys (NEVER COMMIT - Contains private keys!)
+metanode/config/node_*_protocol_key.json
+metanode/config/node_*_network_key.json
+**/private_key.pem
+**/secret_key.pem
+**/*_key.json
+
+# Environment files (may contain secrets)
+**/.env
+**/.env.local
+**/.env.*.local
+**/.env.production
+**/.env.staging
+
+# =============================================================================
+# Development and testing
+# =============================================================================
+
 # IDE and editor files
 **/.idea/
 **/.vscode/
 **/.vs/
 **/*.swp
 **/*.swo
+**/*.swn
 **/*~
-**/.DS_Store
-**/Thumbs.db
 
-# OS files
+# OS generated files
 .DS_Store
 .DS_Store?
 ._*
@@ -49,40 +121,44 @@ metanode/config/storage/
 .Trashes
 ehthumbs.db
 Thumbs.db
+**/Thumbs.db
 
 # Temporary files
 **/*.tmp
 **/*.temp
 **/*.bak
 **/*.backup
+**/*.orig
+**/*.rej
 
-# Test coverage
+# Test coverage reports
 **/coverage/
 **/*.gcda
 **/*.gcno
 **/*.gcov
+**/*.lcov
+
+# Benchmark results
+**/benchmarks/
+
+# =============================================================================
+# Documentation and build artifacts
+# =============================================================================
 
 # Documentation builds
 **/book/
 **/_book/
+**/docs/build/
+**/docs/.doctrees/
 
-# Node modules (if any)
-**/node_modules/
+# Build artifacts
+**/build/
+**/dist/
+**/*.egg-info/
 
-# Environment files
-**/.env
-**/.env.local
-**/.env.*.local
-
-# Compiled binaries (keep source, ignore binaries)
-**/*.exe
-**/*.dll
-**/*.so
-**/*.dylib
-
-# Backup files
-**/*~
-**/*.orig
+# =============================================================================
+# System and tools
+# =============================================================================
 
 # tmux session files
 **/.tmux/
@@ -90,6 +166,124 @@ Thumbs.db
 # System files
 **/.fuse_hidden*
 **/.nfs*
+**/desktop.ini
 
-metanode/config/committee_*.json
+# Backup files
+**/*~
+**/*.orig
+
+# =============================================================================
+# Project specific
+# =============================================================================
+
+# External binaries (built from source)
 sui
+simple_chain
+**/simple_chain
+**/mysticeti-*
+
+# Go binaries
+**/*.test
+**/main
+
+# Local development overrides
+**/.local
+**/local.toml
+**/dev.toml
+
+# Debug and profiling files
+**/*.debug
+**/*.dSYM/
+**/*.prof
+**/*.profraw
+
+# Performance profiling
+**/perf.data
+**/perf.data.old
+
+# Flame graphs
+**/flamegraph.svg
+
+# =============================================================================
+# CI/CD and deployment
+# =============================================================================
+
+# CI cache and artifacts
+**/.cache/
+**/ci-cache/
+**/*.tar.gz
+**/*.zip
+
+# Docker
+**/.dockerignore.tmp
+**/docker-compose.override.yml
+
+# Kubernetes
+**/k8s/
+**/*-deployment.yaml
+**/*-service.yaml
+
+# Terraform
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.backup
+
+# =============================================================================
+# Backup and archive files
+# =============================================================================
+
+**/*.tar
+**/*.gz
+**/*.bz2
+**/*.xz
+**/*.7z
+**/*.rar
+**/*.iso
+
+# =============================================================================
+# Security and secrets (additional)
+# =============================================================================
+
+# AWS credentials
+**/.aws/
+**/aws-credentials
+
+# GCP service accounts and secrets
+**/service-account*.json
+**/secrets.json
+**/*-secrets.json
+
+# Generic secrets files
+**/secrets/
+**/*.secret
+**/*.key
+
+# SSH keys
+**/id_rsa
+**/id_rsa.pub
+**/known_hosts
+
+# Password files
+**/passwords.txt
+**/*-secrets.*
+**/credentials.txt
+
+# =============================================================================
+# Local environment overrides (uncomment as needed)
+# =============================================================================
+
+# Uncomment the following lines if you want to ignore additional local files:
+# **/.local.env
+# **/local-config.toml
+# **/*.local.db
+# **/debug.log
+# **/trace.log
+
+# Uncomment for specific IDEs you use:
+# **/.eclipse/
+# **/.atom/
+# **/.sublime/
+
+# Uncomment for specific OS files:
+# **/.Trash/
+# **/lost+found/
