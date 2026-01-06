@@ -20,6 +20,7 @@ mod context;
 mod core;
 mod core_thread;
 mod dag_state;
+mod epoch_change;
 mod error;
 pub mod epoch_change_provider;
 mod leader_schedule;
@@ -55,6 +56,8 @@ mod randomized_tests;
 /// Exported Consensus API.
 pub use authority_node::{ConsensusAuthority, NetworkType};
 pub use block::{BlockAPI, CertifiedBlock, CertifiedBlocksOutput};
+pub use epoch_change::{EpochChangeProposal, EpochChangeVote};
+pub use epoch_change_provider::EpochChangeProcessor;
 
 /// Exported API for testing and tools.
 pub use block::{TestBlock, Transaction, VerifiedBlock};

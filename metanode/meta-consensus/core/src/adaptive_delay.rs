@@ -64,10 +64,6 @@ impl CommitRateTracker {
         }
     }
 
-    /// Get current commit index
-    pub(crate) fn current_index(&self) -> Option<CommitIndex> {
-        self.commits.back().map(|(_, idx)| *idx)
-    }
 }
 
 /// Shared state for adaptive delay calculation
@@ -177,10 +173,6 @@ impl AdaptiveDelayState {
         Duration::from_millis(adaptive_delay_ms)
     }
 
-    /// Get current adaptive delay
-    pub(crate) fn current_delay_ms(&self) -> u64 {
-        *self.current_adaptive_delay_ms.read()
-    }
 
     /// Get local commit rate
     pub(crate) fn local_rate(&self) -> f64 {

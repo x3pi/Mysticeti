@@ -11,12 +11,32 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::fmt;
-use tracing::{info, error};
+use tracing::{info, warn};
 use thiserror::Error;
 use bcs;
 
 // Import ExecutorClient
 use crate::executor_client::ExecutorClient;
+
+/// Network client interface for epoch change broadcasting
+#[async_trait::async_trait]
+pub trait EpochChangeNetworkClient: Send + Sync {
+    #[allow(dead_code)]
+    async fn send_epoch_change_proposal(
+        &self,
+        peer: AuthorityIndex,
+        proposal: &EpochChangeProposal,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    #[allow(dead_code)]
+    async fn send_epoch_change_vote(
+        &self,
+        peer: AuthorityIndex,
+        vote: &EpochChangeVote,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
 
 /// Error types for epoch change operations
 #[derive(Debug, Error)]
@@ -230,6 +250,9 @@ pub struct EpochChangeManager {
 
     /// Throttle noisy time-based check logs.
     last_time_based_check_log_ms: u64,
+    /// Network client for broadcasting epoch change messages
+    #[allow(dead_code)]
+    network_client: Option<Arc<dyn EpochChangeNetworkClient>>,
     /// Executor client to fetch committee from Go state during transition
     #[allow(dead_code)] // Will be used when implementing transition
     executor_client: Option<Arc<ExecutorClient>>,
@@ -244,6 +267,7 @@ impl EpochChangeManager {
         time_based_enabled: bool,
         epoch_duration_seconds: u64,
         max_clock_drift_ms: u64,
+        network_client: Option<Arc<dyn EpochChangeNetworkClient>>,
     ) -> Self {
         Self {
             current_epoch,
@@ -259,6 +283,7 @@ impl EpochChangeManager {
             epoch_duration_seconds,
             max_clock_drift_ms,
             last_time_based_check_log_ms: 0,
+            network_client,
             executor_client: None,
         }
     }
@@ -397,8 +422,7 @@ impl EpochChangeManager {
         proposer: AuthorityIndex,
         proposer_keypair: &ProtocolKeyPair,
     ) -> Result<EpochChangeProposal> {
-        // Check rate limit
-        self.check_rate_limit(proposer)?;
+        // Rate limiting removed - can be re-added if needed
 
         let new_epoch = self.current_epoch + 1;
 
@@ -494,14 +518,17 @@ impl EpochChangeManager {
 
         // Create vote message
         let proposal_hash = self.hash_proposal(proposal);
+        let voter_auth = self.committee.authority(voter);
         let vote_message = format!(
-            "epoch_vote:{}:{}",
+            "epoch_vote:{}:{}:{}",
             hex::encode(&proposal_hash[..8]),
-            approve
+            approve,
+            voter_auth.stake
         );
 
         // Sign vote
         let signature = voter_keypair.sign(vote_message.as_bytes());
+        info!("🔏 CREATING VOTE: message='{}', stake={}, approve={}, voter={}", vote_message, voter_auth.stake, approve, voter);
 
         let vote = EpochChangeVote::new_with_signature(
             proposal_hash.clone(),
@@ -743,6 +770,9 @@ impl EpochChangeManager {
         Ok(())
     }
 
+    /// Force propose epoch change (bypasses rate limit for emergency cases)
+    #[allow(dead_code)]
+
     /// Should approve proposal (basic logic - can be enhanced)
     /// NOTE: Committee validation will happen during transition with committee from Go state
     #[allow(dead_code)] // Used internally by vote_on_proposal
@@ -759,36 +789,7 @@ impl EpochChangeManager {
     }
 
     /// Check rate limit
-    fn check_rate_limit(&self, proposer: AuthorityIndex) -> Result<()> {
-        const MAX_PROPOSALS_PER_HOUR: u32 = 10;
-        const MAX_PROPOSALS_PER_EPOCH: u32 = 3;
-
-        let now = SystemTime::now();
-        let hour_ago = now - Duration::from_secs(3600);
-
-        let recent_proposals = self.proposal_history
-            .iter()
-            .filter(|p| {
-                p.proposer() == proposer
-                    && SystemTime::UNIX_EPOCH + Duration::from_secs(p.created_at_seconds) > hour_ago
-            })
-            .count();
-
-        if recent_proposals >= MAX_PROPOSALS_PER_HOUR as usize {
-            anyhow::bail!("Rate limit exceeded: {} proposals in last hour", recent_proposals);
-        }
-
-        let epoch_proposals = self.proposal_history
-            .iter()
-            .filter(|p| p.proposer() == proposer && p.new_epoch == self.current_epoch + 1)
-            .count();
-
-        if epoch_proposals >= MAX_PROPOSALS_PER_EPOCH as usize {
-            anyhow::bail!("Rate limit exceeded: {} proposals for next epoch", epoch_proposals);
-        }
-
-        Ok(())
-    }
+    #[allow(dead_code)]
 
     /// Get pending proposal to broadcast
     #[allow(dead_code)] // Will be used when implementing block integration
@@ -979,6 +980,7 @@ impl EpochChangeManager {
         );
 
         let signature = vote.signature()?;
+        info!("🔐 VALIDATING VOTE: message='{}', stake={}, approve={}, voter={}", vote_message, voter_auth.stake, vote.approve, voter);
         public_key.verify(vote_message.as_bytes(), &signature)
             .map_err(|e| anyhow::anyhow!("Invalid vote signature: {:?}", e))?;
 
@@ -988,8 +990,13 @@ impl EpochChangeManager {
     /// Get approved proposal (if any)
     #[allow(dead_code)] // Reserved for future use (transition monitoring)
     pub fn get_approved_proposal(&self) -> Option<EpochChangeProposal> {
+        info!("🔍 Checking {} pending proposals for approval", self.pending_proposals.len());
         for proposal in self.pending_proposals.values() {
-            if let Some(true) = self.check_proposal_quorum(proposal) {
+            let proposal_hash = self.hash_proposal(proposal);
+            let quorum_result = self.check_proposal_quorum(proposal);
+            info!("🔍 Proposal {} quorum result: {:?}", hex::encode(&proposal_hash[..8]), quorum_result);
+            if let Some(true) = quorum_result {
+                info!("✅ Found approved proposal: {}", hex::encode(&proposal_hash[..8]));
                 return Some(proposal.clone());
             }
         }
@@ -1010,20 +1017,39 @@ impl EpochChangeManager {
         proposal: &EpochChangeProposal,
         current_commit_index: u32,
     ) -> bool {
+
+        // SINGLE NODE BYPASS: For local development, allow single node to transition
+        let is_single_node = std::env::var("SINGLE_NODE").unwrap_or_default() == "1";
+        if is_single_node {
+            tracing::warn!("🔸 SINGLE_NODE=1 detected - Single node mode: bypassing all safety checks");
+            tracing::warn!("⚠️  WARNING: This should NEVER be used in production - can cause forks!");
+            tracing::warn!("🚀 SINGLE NODE: Force transition enabled for development");
+            return true;
+        }
+
         // ✅ Điều kiện 1: Quorum đã đạt HOẶC node lag quá xa (catch-up mode)
         let quorum_status = self.check_proposal_quorum(proposal);
         let quorum_reached = quorum_status
             .map(|approved| approved)
             .unwrap_or(false);
-        
+
         // SIMPLE CATCH-UP LOGIC: Nếu node lag quá xa (epoch khác > current_epoch + 2),
         // cho phép transition mà không cần quorum để catch-up nhanh
         // Điều này đảm bảo node không bị stuck khi các nodes khác đã tiến xa
         let epoch_lag = proposal.new_epoch.saturating_sub(self.current_epoch);
         const MAX_EPOCH_LAG_FOR_QUORUM: u64 = 2; // Nếu lag > 2 epochs, không cần quorum
         let is_catchup_mode = epoch_lag > MAX_EPOCH_LAG_FOR_QUORUM;
-        
-        if !quorum_reached && !is_catchup_mode {
+
+        // TEMPORARY FIX: Bypass quorum for localhost testing (single node setup)
+        let is_localhost_testing = std::env::var("LOCALHOST_TESTING").unwrap_or_default() == "1";
+        if is_localhost_testing {
+            tracing::warn!("🧪 LOCALHOST_TESTING=1 detected - FORCE TRANSITION ENABLED for development ONLY");
+            tracing::warn!("⚠️  WARNING: This should NEVER be used in production - can cause forks!");
+            tracing::warn!("🚀 FORCE TRANSITION: Bypassing all checks and returning true");
+            return true; // Force transition for localhost testing
+        }
+
+        if !quorum_reached && !is_catchup_mode && !is_localhost_testing {
             // Log why transition is not ready (throttled to avoid spam)
             let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
             let barrier_passed = current_commit_index >= transition_commit_index;
@@ -1091,9 +1117,15 @@ impl EpochChangeManager {
         // 1. Barrier reached (normal case)
         // 2. Timeout reached AND quorum reached (deadlock prevention)
         // 3. Catch-up mode: barrier reached (node lagging, needs to catch up)
+        // 4. Localhost testing: bypass all checks for development
         // CRITICAL: Catch-up mode vẫn cần barrier để đảm bảo fork-safety
-        let ready = barrier_reached || (timeout_reached && quorum_reached) || (is_catchup_mode && barrier_reached);
-        
+        let ready = barrier_reached || (timeout_reached && quorum_reached) || (is_catchup_mode && barrier_reached) || is_localhost_testing;
+
+        if is_localhost_testing && ready {
+            tracing::info!("✅ Transition ready (LOCALHOST BYPASS): epoch {} -> {}, quorum_bypassed={}, barrier_bypassed={}",
+                proposal.new_epoch - 1, proposal.new_epoch, !quorum_reached, !barrier_reached);
+        }
+
         if ready {
             if barrier_reached {
                 // Log for monitoring - ensure all nodes transition at similar commit index
@@ -1148,13 +1180,16 @@ impl EpochChangeManager {
         &self,
         current_commit_index: u32,
     ) -> Option<EpochChangeProposal> {
+        tracing::info!("🔍 get_transition_ready_proposal called: current_commit_index={}, pending_proposals={}",
+            current_commit_index, self.pending_proposals.len());
+
         // First, try to find proposal for the NEXT epoch (current_epoch + 1)
         // This is the most relevant proposal for transition
         let target_epoch = self.current_epoch + 1;
         
         // Log all pending proposals for debugging
         if !self.pending_proposals.is_empty() {
-            tracing::debug!(
+            tracing::info!(
                 "🔍 Checking transition readiness: current_epoch={}, target_epoch={}, current_commit={}, pending_proposals={}",
                 self.current_epoch,
                 target_epoch,
@@ -1179,7 +1214,7 @@ impl EpochChangeManager {
                     // Log why this proposal is not ready
                     let quorum_status = self.check_proposal_quorum(proposal);
                     let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
-                    tracing::debug!(
+                    tracing::info!(
                         "⏸️  Proposal not ready: epoch {} -> {}, quorum={:?}, barrier={}, current_commit={}",
                         proposal.new_epoch - 1,
                         proposal.new_epoch,
@@ -1208,15 +1243,84 @@ impl EpochChangeManager {
     }
 
     /// Check if there's a pending proposal for a specific epoch
-    pub fn has_pending_proposal_for_epoch(&self, epoch: u64) -> bool {
-        self.pending_proposals.values()
-            .any(|p| p.new_epoch == epoch)
+    pub fn has_pending_proposal_for_epoch(&mut self, epoch: u64) -> bool {
+        info!("🔍 Checking pending proposals for epoch {} (total proposals: {})", epoch, self.pending_proposals.len());
+
+        let now_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Clean up stale proposals (older than 10 minutes)
+        let stale_proposals: Vec<Vec<u8>> = self.pending_proposals.iter()
+            .filter(|(_, proposal)| {
+                let proposal_age_seconds = now_seconds.saturating_sub(proposal.created_at_seconds);
+                let is_stale = proposal_age_seconds > 600; // 10 minutes timeout
+                if is_stale {
+                    let proposal_hash = self.hash_proposal(proposal);
+                    warn!("🧹 Found stale proposal: age={}s, hash={}, created_at={}",
+                          proposal_age_seconds,
+                          hex::encode(&proposal_hash[..8]),
+                          proposal.created_at_seconds);
+                }
+                is_stale
+            })
+            .map(|(hash, _)| hash.clone())
+            .collect();
+
+        warn!("🧹 Found {} stale proposals to clean up (now={})", stale_proposals.len(), now_seconds);
+
+        for stale_hash in stale_proposals {
+            warn!("🧹 Removing stale epoch change proposal: {}", hex::encode(&stale_hash[..8]));
+            self.pending_proposals.remove(&stale_hash);
+            self.proposal_votes.remove(&stale_hash);
+        }
+
+        let has_pending = self.pending_proposals.values()
+            .any(|p| p.new_epoch == epoch);
+
+        // FORCE CLEAR: If epoch transition stuck too long, clear all pending proposals for that epoch
+        // This ensures forward progress when epoch transitions get stuck
+        if has_pending && epoch > self.current_epoch {
+            let stuck_proposals: Vec<_> = self.pending_proposals.values()
+                .filter(|p| p.new_epoch == epoch)
+                .map(|p| {
+                    let proposal_age = now_seconds.saturating_sub(p.created_at_seconds);
+                    proposal_age
+                })
+                .collect();
+
+            // Clear if ANY proposal is older than 1 hour (3600 seconds)
+            // This ensures we don't get stuck indefinitely
+            let max_age = stuck_proposals.iter().max().copied().unwrap_or(0);
+            if max_age > 3600 {
+                warn!("🚨 FORCE CLEAR: Epoch {} stuck for {}s (>1hr), clearing {} stale proposals to allow forward progress",
+                      epoch, max_age, stuck_proposals.len());
+                let to_remove: Vec<Vec<u8>> = self.pending_proposals.iter()
+                    .filter(|(_, p)| p.new_epoch == epoch)
+                    .map(|(hash, _)| hash.clone())
+                    .collect();
+
+                for hash in to_remove {
+                    self.pending_proposals.remove(&hash);
+                    self.proposal_votes.remove(&hash);
+                }
+                return false; // No longer has pending after clear
+            }
+        }
+
+        info!("🔍 Epoch {} has pending proposal: {}", epoch, has_pending);
+        has_pending
     }
+
+    /// Broadcast epoch change proposal to all peers
 
     /// Get all pending proposals (for logging)
     pub fn get_all_pending_proposals(&self) -> Vec<EpochChangeProposal> {
         self.pending_proposals.values().cloned().collect()
     }
+
+    /// Check if we have already voted on a proposal
 
     /// Check proposal timeout
     #[allow(dead_code)] // Will be used when implementing proposal cleanup

@@ -86,6 +86,24 @@ fn build_tonic_services(out_dir: &Path) {
                 .codec_path(codec_path)
                 .build(),
         )
+        .method(
+            tonic_build::manual::Method::builder()
+                .name("send_epoch_change_proposal")
+                .route_name("SendEpochChangeProposal")
+                .input_type("crate::network::tonic_network::SendEpochChangeProposalRequest")
+                .output_type("crate::network::tonic_network::SendEpochChangeProposalResponse")
+                .codec_path(codec_path)
+                .build(),
+        )
+        .method(
+            tonic_build::manual::Method::builder()
+                .name("send_epoch_change_vote")
+                .route_name("SendEpochChangeVote")
+                .input_type("crate::network::tonic_network::SendEpochChangeVoteRequest")
+                .output_type("crate::network::tonic_network::SendEpochChangeVoteResponse")
+                .codec_path(codec_path)
+                .build(),
+        )
         .build();
 
     tonic_build::manual::Builder::new()

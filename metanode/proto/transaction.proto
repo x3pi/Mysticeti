@@ -1,9 +1,6 @@
 syntax = "proto3";
-
 package transaction;
-
 option go_package = "/proto";
-
 option java_package = "com.meta_node.protos.compiled.transaction";
 
 enum ACTION {
@@ -41,12 +38,14 @@ message Transaction {
   bytes Nonce = 12;
   bytes FromAddress = 13;
   bool ReadOnly = 14;
+
   // Bổ sung cho giao dịch eth
   uint64 ChainID = 15;
   uint64 Type = 16;
   bytes R = 17;
   bytes S = 18;
   bytes V = 19;
+
   // Thêm cho EIP-1559/EIP-2930
   bytes GasTipCap = 20;
   bytes GasFeeCap = 21;
@@ -57,6 +56,7 @@ message AccessTuple {
   bytes Address = 1;
   repeated bytes StorageKeys = 2;
 }
+
 
 message TransactionHashData {
   bytes FromAddress = 1;
@@ -79,8 +79,12 @@ message TransactionHashData {
   repeated AccessTuple AccessList = 18;
 }
 
+
+
+
 message DeployData {
   bytes Code = 1;
+  // string StorageHost = 2; // DEPRECATED
   bytes StorageAddress = 3;
 }
 
@@ -160,47 +164,10 @@ message TransactionsFromLeader {
   uint64 TimeStamp = 4;
 }
 
+
 message TransactionHashWithError {
-  bytes Hash = 1;
-  int64 Code = 2;
-  string Description = 3;
-  bytes Output = 4;
+  bytes Hash = 1;  // Hash của giao dịch gây lỗi
+  int64 Code = 2;             // Mã lỗi
+  string Description = 3;     // Mô tả lỗi
+  bytes Output = 4; // chuỗi byte do evm return
 }
-
-message TransactionLogEntry {
-  bytes TransactionHash = 1;
-  bytes FromAddress = 2;
-  bytes ToAddress = 3;
-  bytes Amount = 4;
-  bytes Nonce = 5;
-  uint64 MaxGas = 6;
-  uint64 MaxGasPrice = 7;
-  bytes GasTipCap = 8;
-  bytes GasFeeCap = 9;
-  uint64 ChainID = 10;
-  uint64 Type = 11;
-  bytes R = 12;
-  bytes S = 13;
-  bytes V = 14;
-  bytes Sign = 15;
-  bytes LastDeviceKey = 16;
-  bytes NewDeviceKey = 17;
-  bytes Data = 18;
-  repeated bytes RelatedAddresses = 19;
-  repeated AccessTuple AccessList = 20;
-  bool ReadOnly = 21;
-  uint64 MaxTimeUse = 22;
-  uint64 ReceivedTimestamp = 23;
-  uint32 WorkerId = 24;
-  uint64 Size = 25;
-  uint32 IndexInBatch = 26;
-}
-
-message TransactionLogBatch {
-  uint64 ReceivedTimestamp = 1;
-  uint32 WorkerId = 2;
-  uint32 TotalTransactions = 3;
-  repeated TransactionLogEntry TransactionLogs = 4;
-  uint64 TotalSize = 5;
-}
-

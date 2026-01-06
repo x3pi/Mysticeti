@@ -44,6 +44,9 @@ impl TxSocketServer {
         let listener = UnixListener::bind(&self.socket_path)?;
         info!("🔌 Transaction UDS server started on {}", self.socket_path);
 
+        // DEBUG: Log that we're waiting for connections
+        info!("🔌 [DEBUG] UDS server waiting for connections on {}", self.socket_path);
+
         // Set socket permissions (read/write for owner and group)
         #[cfg(unix)]
         {
@@ -53,19 +56,26 @@ impl TxSocketServer {
         }
 
         loop {
+            // DEBUG: Log before accepting
+            info!("🔌 [DEBUG] UDS server waiting for connections...");
+
             match listener.accept().await {
-                Ok((stream, _)) => {
+                Ok((stream, addr)) => {
+                    info!("🔌 [TX FLOW] ✅ ACCEPTED new UDS connection from client: {:?}", addr);
+
                     let client = self.transaction_client.clone();
                     let node = self.node.clone();
 
                     tokio::spawn(async move {
+                        info!("🔌 [DEBUG] Spawned handler for UDS connection");
                         if let Err(e) = Self::handle_connection(stream, client, node).await {
                             error!("Error handling UDS connection: {}", e);
                         }
                     });
                 }
                 Err(e) => {
-                    error!("Failed to accept UDS connection: {}", e);
+                    error!("❌ [UDS ERROR] Failed to accept UDS connection: {}", e);
+                    // Continue loop instead of breaking
                 }
             }
         }
@@ -132,10 +142,14 @@ impl TxSocketServer {
             &tx_hash_preview
         };
         
-        info!("📥 [TX FLOW] Received transaction data via UDS: size={} bytes, hash={}...", 
+        info!("📥 [TX FLOW] Received transaction data via UDS: size={} bytes, hash={}...",
             data_len, tx_hash_short);
-        info!("🔍 [TX HASH] Rust received from Go-sub: full_hash={}, size={} bytes", 
+        info!("🔍 [TX HASH] Rust received from Go-sub: full_hash={}, size={} bytes",
             tx_hash_preview, data_len);
+
+        // DEBUG: Log raw bytes received
+        info!("🔍 [DEBUG] Raw data preview (first 50 bytes): {}", hex::encode(&tx_data[..tx_data.len().min(50)]));
+        info!("🔍 [DEBUG] Data starts with: 0x{:02x} 0x{:02x} 0x{:02x} 0x{:02x}", tx_data.get(0).unwrap_or(&0), tx_data.get(1).unwrap_or(&0), tx_data.get(2).unwrap_or(&0), tx_data.get(3).unwrap_or(&0));
 
         // THỐNG NHẤT: Go LUÔN gửi pb.Transactions (nhiều transactions)
         // Rust CHỈ xử lý Transactions message, không xử lý single Transaction hoặc raw data
@@ -205,10 +219,12 @@ impl TxSocketServer {
         };
 
         // Check if node is ready to accept transactions or should queue them
+        info!("🔍 [DEBUG] About to check initial transaction acceptance");
         if let Some(ref node) = node {
             let node_guard = node.lock().await;
             let (should_accept, should_queue, reason) = node_guard.check_transaction_acceptance().await;
-            
+            info!("🔍 [DEBUG] Initial check result: should_accept={}, should_queue={}, reason={}", should_accept, should_queue, reason);
+
             if should_queue {
                 // Queue transactions for next epoch (barrier phase)
                 info!("📦 [TX FLOW] Queueing {} transactions for next epoch: {}", transactions_to_submit.len(), reason);
@@ -297,8 +313,10 @@ impl TxSocketServer {
         let should_queue_final = if let Some(ref node) = node {
             let node_guard = node.lock().await;
             let (should_accept_final, should_queue_final, reason_final) = node_guard.check_transaction_acceptance().await;
-            
-            if should_queue_final {
+
+            info!("🔍 [DEBUG] Final check result: should_accept_final={}, should_queue_final={}, reason_final={}", should_accept_final, should_queue_final, reason_final);
+            info!("🔍 [DEBUG] Final check: should_queue_final={}", should_queue_final);
+        if should_queue_final {
                 // Barrier was set between initial check and submission - queue transaction instead
                 warn!("⚠️ [RACE CONDITION] Barrier was set between initial check and submission - queueing transaction instead: {}", reason_final);
                 // Queue all transactions (node_guard is still held)
@@ -341,6 +359,7 @@ impl TxSocketServer {
             false // No node reference, continue with submission
         };
         
+        info!("🔍 [DEBUG] Final check: should_queue_final={}", should_queue_final);
         if should_queue_final {
             return Ok(()); // Already handled above
         }
@@ -350,6 +369,7 @@ impl TxSocketServer {
 
         // Submit transactions to consensus
         // Each transaction is now a single Transaction protobuf message (not Transactions message)
+        info!("🚀 [DEBUG] About to call client.submit() with {} transactions", transactions_to_submit.len());
         match client.submit(transactions_to_submit.clone()).await {
             Ok((block_ref, indices, _)) => {
                 info!("✅ [TX FLOW] Transaction(s) included in block via UDS: first_hash={}, block={:?}, indices={:?}, count={}", 

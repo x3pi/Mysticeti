@@ -31,6 +31,8 @@ use crate::{
     context::Context,
     core_thread::CoreThreadDispatcher,
     dag_state::DagState,
+    epoch_change::{EpochChangeProposal, EpochChangeVote},
+    epoch_change_provider::EpochChangeProcessor,
     error::{ConsensusError, ConsensusResult},
     network::{BlockStream, ExtendedSerializedBlock, NetworkService},
     round_tracker::PeerRoundTracker,
@@ -55,6 +57,7 @@ pub(crate) struct AuthorityService<C: CoreThreadDispatcher> {
     dag_state: Arc<RwLock<DagState>>,
     store: Arc<dyn Store>,
     round_tracker: Arc<RwLock<PeerRoundTracker>>,
+    epoch_change_processor: Arc<RwLock<Option<Box<dyn EpochChangeProcessor>>>>,
 }
 
 impl<C: CoreThreadDispatcher> AuthorityService<C> {
@@ -69,6 +72,7 @@ impl<C: CoreThreadDispatcher> AuthorityService<C> {
         transaction_certifier: TransactionCertifier,
         dag_state: Arc<RwLock<DagState>>,
         store: Arc<dyn Store>,
+        epoch_change_processor: Option<Box<dyn EpochChangeProcessor>>,
     ) -> Self {
         let subscription_counter = Arc::new(SubscriptionCounter::new(context.clone()));
         Self {
@@ -83,6 +87,7 @@ impl<C: CoreThreadDispatcher> AuthorityService<C> {
             dag_state,
             store,
             round_tracker,
+            epoch_change_processor: Arc::new(RwLock::new(epoch_change_processor)),
         }
     }
 
@@ -636,6 +641,38 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
 
         Ok((highest_received_rounds, highest_accepted_rounds))
     }
+
+    async fn handle_send_epoch_change_proposal(
+        &self,
+        _peer: AuthorityIndex,
+        proposal: EpochChangeProposal,
+    ) -> ConsensusResult<()> {
+        // Forward to epoch change processor if available
+        if let Some(ref processor) = *self.epoch_change_processor.read() {
+            let proposal_bytes = bcs::to_bytes(&proposal).map_err(|e| {
+                ConsensusError::NetworkRequest(format!("serialize proposal failed: {e:?}"))
+            })?;
+            processor.process_proposal(&proposal_bytes);
+        }
+
+        Ok(())
+    }
+
+    async fn handle_send_epoch_change_vote(
+        &self,
+        _peer: AuthorityIndex,
+        vote: EpochChangeVote,
+    ) -> ConsensusResult<()> {
+        // Forward to epoch change processor if available
+        if let Some(ref processor) = *self.epoch_change_processor.read() {
+            let vote_bytes = bcs::to_bytes(&vote).map_err(|e| {
+                ConsensusError::NetworkRequest(format!("serialize vote failed: {e:?}"))
+            })?;
+            processor.process_vote(&vote_bytes);
+        }
+
+        Ok(())
+    }
 }
 
 struct Counter {
@@ -995,6 +1032,7 @@ mod tests {
             transaction_certifier,
             dag_state,
             store,
+            None,
         ));
 
         // Test delaying blocks with time drift.
@@ -1113,6 +1151,7 @@ mod tests {
             transaction_certifier,
             dag_state.clone(),
             store,
+            None,
         ));
 
         // GIVEN: 40 rounds of blocks in the dag state.
@@ -1280,6 +1319,7 @@ mod tests {
             transaction_certifier,
             dag_state.clone(),
             store,
+            None,
         ));
 
         // Create some blocks for a few authorities. Create some equivocations as well and store in dag state.

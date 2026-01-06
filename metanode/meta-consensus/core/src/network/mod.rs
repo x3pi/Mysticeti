@@ -107,6 +107,24 @@ pub(crate) trait NetworkClient: Send + Sync + Sized + 'static {
         timeout: Duration,
     ) -> ConsensusResult<(Vec<Round>, Vec<Round>)>;
 
+    /// Sends an epoch change proposal to a peer.
+    #[allow(dead_code)]
+    async fn send_epoch_change_proposal(
+        &self,
+        peer: AuthorityIndex,
+        proposal: &crate::epoch_change::EpochChangeProposal,
+        timeout: Duration,
+    ) -> ConsensusResult<()>;
+
+    /// Sends an epoch change vote to a peer.
+    #[allow(dead_code)]
+    async fn send_epoch_change_vote(
+        &self,
+        peer: AuthorityIndex,
+        vote: &crate::epoch_change::EpochChangeVote,
+        timeout: Duration,
+    ) -> ConsensusResult<()>;
+
     /// Sends a serialized SignedBlock to a peer.
     #[cfg(test)]
     async fn send_block(
@@ -169,6 +187,20 @@ pub(crate) trait NetworkService: Send + Sync + 'static {
         &self,
         peer: AuthorityIndex,
     ) -> ConsensusResult<(Vec<Round>, Vec<Round>)>;
+
+    /// Handles the epoch change proposal sent from the peer.
+    async fn handle_send_epoch_change_proposal(
+        &self,
+        peer: AuthorityIndex,
+        proposal: crate::epoch_change::EpochChangeProposal,
+    ) -> ConsensusResult<()>;
+
+    /// Handles the epoch change vote sent from the peer.
+    async fn handle_send_epoch_change_vote(
+        &self,
+        peer: AuthorityIndex,
+        vote: crate::epoch_change::EpochChangeVote,
+    ) -> ConsensusResult<()>;
 }
 
 /// An `AuthorityNode` holds a `NetworkManager` until shutdown.

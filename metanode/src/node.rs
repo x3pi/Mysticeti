@@ -67,8 +67,8 @@ pub struct ConsensusNode {
     registry_service: Option<Arc<RegistryService>>,
     /// Current epoch registry ID (for cleanup if needed)
     current_registry_id: Option<mysten_metrics::RegistryID>,
-    /// Executor enabled flag (from config)
-    executor_enabled: bool,
+    /// Executor commit enabled flag (from config) - allows committing blocks to Go
+    executor_commit_enabled: bool,
     /// Transition barrier for current CommitProcessor (to prevent sending commits past barrier)
     /// This prevents duplicate global_exec_index between epochs
     transition_barrier: Arc<AtomicU32>,
@@ -111,8 +111,9 @@ impl ConsensusNode {
         // Always enable executor client for committee fetching during startup
         let executor_client = Arc::new(ExecutorClient::new(
             true, // Always enable for committee fetching
-            config.node_id,
             false, // Don't commit during committee fetching
+            config.executor_send_socket_path.clone(),
+            config.executor_receive_socket_path.clone(),
         ));
 
         // Fetch validators from Go at block 0 (genesis)
@@ -276,13 +277,21 @@ impl ConsensusNode {
             .with_global_exec_index_at_barrier(global_exec_index_at_barrier_for_processor)
             .with_pending_transactions_queue(pending_transactions_queue.clone());
         
-        // Always create executor client for all nodes to fetch committee from Go state
-        // But only node 0 can actually commit transactions
+        // Create executor client based on config settings
+        // executor_read_enabled: allows reading committee state from Go
+        // executor_commit_enabled: allows committing blocks to Go
         let node_id = config.node_id;
-        let can_commit = node_id == 0; // Only node 0 can commit transactions
-        let executor_client = Arc::new(ExecutorClient::new(true, node_id, can_commit));
-        info!("✅ Executor client enabled for initial startup (node_id={}, can_commit={}, socket=/tmp/executor{}.sock)",
-            node_id, can_commit, node_id);
+        let can_commit = config.executor_commit_enabled;
+
+        // Only create executor client if reading is enabled
+        let executor_client = if config.executor_read_enabled {
+            Arc::new(ExecutorClient::new(true, can_commit, config.executor_send_socket_path.clone(), config.executor_receive_socket_path.clone()))
+        } else {
+            // Create disabled executor client for nodes that don't read from Go
+            Arc::new(ExecutorClient::new(false, false, "".to_string(), "".to_string()))
+        };
+        info!("✅ Executor client configured (node_id={}, read_enabled={}, commit_enabled={}, send_socket={}, receive_socket={})",
+            node_id, config.executor_read_enabled, can_commit, config.executor_send_socket_path, config.executor_receive_socket_path);
 
         let executor_client_for_init = executor_client.clone();
         tokio::spawn(async move {
@@ -380,6 +389,7 @@ impl ConsensusNode {
             config.time_based_epoch_change,
             epoch_duration_seconds,
             max_clock_drift_ms,
+            None, // network_client
         )));
         
         // Initialize clock sync manager
@@ -697,7 +707,7 @@ impl ConsensusNode {
             last_transition_hash: None,
             registry_service,
             current_registry_id: None,
-            executor_enabled: config.executor_enabled,
+            executor_commit_enabled: config.executor_commit_enabled,
             transition_barrier,
             global_exec_index_at_barrier,
             pending_transactions_queue,
@@ -1089,6 +1099,7 @@ impl ConsensusNode {
         &mut self,
         proposal: &crate::epoch_change::EpochChangeProposal,
         current_commit_index: u32,
+        config: &crate::config::NodeConfig,
     ) -> Result<()> {
         let proposal_hash = {
             let mgr = self.epoch_change_manager.read().await;
@@ -1186,7 +1197,13 @@ impl ConsensusNode {
 
         // 4) Build new committee from Go state
         // FIX: LOOP INFINITELY to fetch from Go, ensure no fallback to local files.
-        let executor_client = Arc::new(ExecutorClient::new(true, 0, false)); // node_id không cần thiết khi gọi Go state, không commit trong transition
+        // Only create executor client for transition if reading is enabled
+        let executor_client = if config.executor_read_enabled {
+            Arc::new(ExecutorClient::new(true, false, config.executor_send_socket_path.clone(), config.executor_receive_socket_path.clone())) // không commit trong transition
+        } else {
+            warn!("⚠️  Cannot perform epoch transition: executor_read_enabled=false, cannot fetch committee from Go");
+            anyhow::bail!("Executor read not enabled, cannot fetch committee for epoch transition");
+        };
 
         // Set executor client for epoch change manager
         {
@@ -1194,8 +1211,8 @@ impl ConsensusNode {
             mgr.set_executor_client(executor_client.clone());
         }
 
-        let block_number = self.last_global_exec_index; // Use last epoch's known global index
-
+        let block_number = new_last_global_exec_index;
+        
         info!("🔄 [EPOCH-TRANSITION] Fetching committee from Go state at block {}...", block_number);
         
         // This helper now contains the infinite loop. It will NOT return until Go responds successfully.
@@ -1242,9 +1259,9 @@ impl ConsensusNode {
         let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
         let commit_index_for_callback = self.current_commit_index.clone();
         let new_epoch = proposal.new_epoch;
-        let executor_enabled = self.executor_enabled;
-        let executor_client_opt = if executor_enabled {
-            let client = Arc::new(ExecutorClient::new(true, 0, true)); // node_id không cần thiết khi gọi Go state, luôn có thể commit trong transition
+        let executor_commit_enabled = self.executor_commit_enabled;
+        let executor_client_opt = if executor_commit_enabled {
+            let client = Arc::new(ExecutorClient::new(true, true, config.executor_send_socket_path.clone(), config.executor_receive_socket_path.clone())); // luôn có thể commit trong transition
             Some(client)
         } else {
             None

@@ -10,7 +10,6 @@ use fastcrypto::traits::ToFromBytes;
 use mysten_network::Multiaddr;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::{Path, PathBuf}};
-use tracing::info;
 
 /// Extended committee configuration with epoch timestamp and global execution index
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,10 +74,19 @@ pub struct NodeConfig {
     /// NTP sync interval in seconds (default: 300 = 5 minutes)
     #[serde(default = "default_ntp_sync_interval_seconds")]
     pub ntp_sync_interval_seconds: u64,
-    /// Enable executor client to send committed blocks to Go executor (default: false)
-    /// Only node 0 should have this enabled
+    /// Enable executor client for reading committee state from Go executor (default: false)
+    /// All nodes can read committee and epoch state for proper operation
     #[serde(default)]
-    pub executor_enabled: bool,
+    pub executor_read_enabled: bool,
+    /// Enable executor client to send committed blocks to Go executor (default: false)
+    /// Only designated nodes should have this enabled for committing transactions
+    /// This allows flexible testing with different commit node configurations
+    #[serde(default)]
+    pub executor_commit_enabled: bool,
+    /// Socket path for sending blocks from Rust to Go executor (default: /tmp/executor{N}.sock)
+    pub executor_send_socket_path: String,
+    /// Socket path for receiving responses from Go executor (default: /tmp/rust-go.sock_{N+1})
+    pub executor_receive_socket_path: String,
     /// Commit sync batch size for catch-up (default: 200, higher = faster catch-up but more memory)
     /// When node is lagging, larger batch size allows fetching more commits in parallel
     #[serde(default = "default_commit_sync_batch_size")]
@@ -208,12 +216,15 @@ impl NodeConfig {
                 leader_timeout_ms: None,
                 min_round_delay_ms: None,
                 time_based_epoch_change: true, // Enabled by default
-                epoch_duration_seconds: Some(300), // Default: 5 minutes (5 * 60 seconds)
+                epoch_duration_seconds: Some(180), // Default: 3 minutes (3 * 60 seconds)
                 max_clock_drift_seconds: 5,
                 enable_ntp_sync: false, // Disabled by default (enable for production)
                 ntp_servers: default_ntp_servers(),
                 ntp_sync_interval_seconds: 300,
-                executor_enabled: idx == 0, // Only node 0 has executor enabled by default
+                executor_read_enabled: true, // All nodes can read committee state from Go
+                executor_commit_enabled: idx == 0, // Only node 0 can commit blocks by default
+                executor_send_socket_path: format!("/tmp/executor{}.sock", idx), // Rust -> Go
+                executor_receive_socket_path: "/tmp/rust-go.sock_1".to_string(), // Go -> Rust (all nodes read from same socket)
                 commit_sync_batch_size: default_commit_sync_batch_size(),
                 commit_sync_parallel_fetches: default_commit_sync_parallel_fetches(),
                 commit_sync_batches_ahead: default_commit_sync_batches_ahead(),
@@ -293,120 +304,8 @@ impl NodeConfig {
     // This ensures all nodes have identical committee data and eliminates file-based inconsistencies
     // No more save/load committee from files - everything goes through Go state synchronization
 
-    pub fn load_epoch_timestamp(&self) -> Result<u64> {
-        // REMOVED: Load from committee.json - Now get timestamp from Go state only
-        // This ensures consistent timestamp across all nodes
-        
-        // Fallback 1: Try to load from epoch_timestamp.txt (backward compatibility)
-        if let Some(committee_path) = &self.committee_path {
-            let epoch_path = committee_path
-                .parent()
-                .context("Committee path has no parent directory")?
-                .join("epoch_timestamp.txt");
-            
-            if epoch_path.exists() {
-                let content = fs::read_to_string(&epoch_path)?;
-                let timestamp = content.trim().parse::<u64>()
-                    .context("Failed to parse epoch timestamp")?;
-                
-                // Migrate to committee.json if possible
-                self.migrate_epoch_timestamp_to_committee(timestamp)?;
-                
-                return Ok(timestamp);
-            }
-        }
-        
-        // Use current timestamp - will be overridden by Go state
-        eprintln!("DEBUG: Using current timestamp (will be overridden by Go state)");
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        
-        // Save to committee.json if possible
-        if let Some(committee_path) = &self.committee_path {
-            if committee_path.exists() {
-                self.save_epoch_timestamp_to_committee(timestamp_ms)?;
-            } else {
-                // If committee.json doesn't exist, save to epoch_timestamp.txt (backward compatibility)
-                if let Some(parent) = committee_path.parent() {
-                    let epoch_path = parent.join("epoch_timestamp.txt");
-                    // Only write if file doesn't exist (to avoid race conditions)
-                    if !epoch_path.exists() {
-                        let _ = std::fs::write(&epoch_path, timestamp_ms.to_string());
-                    }
-                }
-            }
-        }
-        
-        Ok(timestamp_ms)
-    }
     
-    /// Migrate epoch_timestamp from epoch_timestamp.txt to committee.json
-    fn migrate_epoch_timestamp_to_committee(&self, timestamp: u64) -> Result<()> {
-        if let Some(committee_path) = &self.committee_path {
-            if committee_path.exists() {
-                let content = fs::read_to_string(committee_path)?;
-                // Try to load as CommitteeConfig
-                match serde_json::from_str::<CommitteeConfig>(&content) {
-                    Ok(mut config) => {
-                        // Already has epoch_timestamp_ms, no migration needed
-                        if config.epoch_timestamp_ms.is_some() {
-                            return Ok(());
-                        }
-                        // Add epoch_timestamp_ms
-                        config.epoch_timestamp_ms = Some(timestamp);
-                        let updated_json = serde_json::to_string_pretty(&config)?;
-                        fs::write(committee_path, updated_json)?;
-                        info!("✅ Migrated epoch_timestamp to committee.json");
-                    }
-                    Err(_) => {
-                        // Load as plain Committee and add epoch_timestamp_ms
-                        let committee: Committee = serde_json::from_str(&content)?;
-                        let config = CommitteeConfig {
-                            committee,
-                            epoch_timestamp_ms: Some(timestamp),
-                            last_global_exec_index: None, // Preserve existing if any
-                        };
-                        let updated_json = serde_json::to_string_pretty(&config)?;
-                        fs::write(committee_path, updated_json)?;
-                        info!("✅ Migrated epoch_timestamp to committee.json");
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
     
-    /// Save epoch_timestamp to committee.json
-    fn save_epoch_timestamp_to_committee(&self, timestamp: u64) -> Result<()> {
-        if let Some(committee_path) = &self.committee_path {
-            if committee_path.exists() {
-                let content = fs::read_to_string(committee_path)?;
-                // Try to load as CommitteeConfig
-                match serde_json::from_str::<CommitteeConfig>(&content) {
-                    Ok(mut config) => {
-                        // Update epoch_timestamp_ms
-                        config.epoch_timestamp_ms = Some(timestamp);
-                        let updated_json = serde_json::to_string_pretty(&config)?;
-                        fs::write(committee_path, updated_json)?;
-                    }
-                    Err(_) => {
-                        // Load as plain Committee and add epoch_timestamp_ms
-                        let committee: Committee = serde_json::from_str(&content)?;
-                        let config = CommitteeConfig {
-                            committee,
-                            epoch_timestamp_ms: Some(timestamp),
-                            last_global_exec_index: None, // Preserve existing if any
-                        };
-                        let updated_json = serde_json::to_string_pretty(&config)?;
-                        fs::write(committee_path, updated_json)?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 
     pub fn load_protocol_keypair(&self) -> Result<ProtocolKeyPair> {
         if let Some(path) = &self.protocol_key_path {

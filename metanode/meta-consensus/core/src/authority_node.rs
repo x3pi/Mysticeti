@@ -338,6 +338,7 @@ where
             transaction_certifier,
             dag_state.clone(),
             store,
+            None,
         ));
 
         let subscriber = {
@@ -860,5 +861,15 @@ mod tests {
         .await;
 
         (authority, commit_receiver, block_receiver)
+    }
+
+    /// Get network client for sending epoch change messages
+    pub fn network_client(&self) {
+        match self {
+            ConsensusAuthority::WithTonic(node) => {
+                let client = node.network_manager.client();
+                // TODO: return client for epoch change use
+            }
+        }
     }
 }

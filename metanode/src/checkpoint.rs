@@ -24,7 +24,17 @@ pub fn calculate_global_exec_index(
         // Epoch 0: commit_index starts from 1, so global_exec_index starts from 1
         // commit_index=1 → global_exec_index=1 (first block is block 1)
         // commit_index=2 → global_exec_index=2, etc.
-        commit_index as u64
+
+        // SPECIAL CASE: If last_global_exec_index is much higher than commit_index,
+        // it means we're synchronizing with an existing chain state.
+        // Use last_global_exec_index as base to continue from the correct point.
+        if last_global_exec_index > commit_index as u64 * 10 {
+            // Synchronization case: continue from last_global_exec_index
+            last_global_exec_index + commit_index as u64
+        } else {
+            // Normal genesis case: start from commit_index
+            commit_index as u64
+        }
     } else {
         // Epoch N: commit_index starts from 1 → first global_exec_index is last_global_exec_index + 1
         // Example:

@@ -1,10 +1,10 @@
-node_id = 3
-network_address = "127.0.0.1:9003"
-protocol_key_path = "config_new2/node_3_protocol_key.json"
-network_key_path = "config_new2/node_3_network_key.json"
-storage_path = "config_new2/storage/node_3"
+node_id = 0
+network_address = "127.0.0.1:9000"
+protocol_key_path = "config/node_0_protocol_key.json"
+network_key_path = "config/node_0_network_key.json"
+storage_path = "config/storage/node_0"
 enable_metrics = true
-metrics_port = 9103
+metrics_port = 9100
 speed_multiplier = 0.2
 time_based_epoch_change = true
 epoch_duration_seconds = 300
@@ -15,12 +15,13 @@ ntp_servers = [
     "time.google.com",
 ]
 ntp_sync_interval_seconds = 300
-executor_enabled = false
+executor_enabled = true
 commit_sync_batch_size = 200
 commit_sync_parallel_fetches = 16
 commit_sync_batches_ahead = 64
 adaptive_catchup_enabled = true
 adaptive_delay_enabled = true
 adaptive_delay_ms = 50
-enable_lvm_snapshot = false
+enable_lvm_snapshot = true
+lvm_snapshot_bin_path = "/home/abc/chain-n/Mysticeti/metanode/bin/lvm-snap-rsync"
 lvm_snapshot_delay_seconds = 5

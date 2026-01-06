@@ -4,7 +4,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, error, warn};
 
 mod config;
 mod node;
@@ -23,7 +23,6 @@ mod tx_hash;
 
 use config::NodeConfig;
 use node::ConsensusNode;
-use tracing::error;
 use std::sync::Arc;
 use std::net::SocketAddr;
 use tokio::sync::Mutex;
@@ -78,7 +77,6 @@ async fn main() -> Result<()> {
             info!("Network address: {}", node_config.network_address);
 
             // Start metrics server if enabled
-            // We need to create RegistryService first, then use its registry for ConsensusNode
             let registry_service = if node_config.enable_metrics {
                 let metrics_addr = SocketAddr::from(([127, 0, 0, 1], node_config.metrics_port));
                 let registry_service = start_prometheus_server(metrics_addr);
@@ -96,9 +94,10 @@ async fn main() -> Result<()> {
                 prometheus::Registry::new()
             };
 
-            // Pass registry_service to ConsensusNode so it can add new registries on epoch transition
-            // RegistryService uses Arc internally, so we can clone it safely
             let registry_service_arc = registry_service.as_ref().map(|rs| Arc::new(rs.clone()));
+            
+            // Create the ConsensusNode wrapped in a Mutex for safe concurrent access
+            // We use Arc<Mutex<>> because multiple tasks (RPC, UDS) need access to the node
             let node = Arc::new(Mutex::new(
                 ConsensusNode::new_with_registry_and_service(
                     node_config.clone(),
@@ -108,7 +107,7 @@ async fn main() -> Result<()> {
             ));
             
             // Start RPC server for client submissions (HTTP)
-            let rpc_port = node_config.metrics_port + 1000; // RPC port = metrics_port + 1000
+            let rpc_port = node_config.metrics_port + 1000;
             let tx_client = { node.lock().await.transaction_submitter() };
             let node_for_rpc = node.clone();
             let rpc_server = rpc::RpcServer::with_node(tx_client.clone(), rpc_port, node_for_rpc.clone());
@@ -118,7 +117,7 @@ async fn main() -> Result<()> {
                 }
             });
 
-            // Start Unix Domain Socket server for local IPC (faster than HTTP)
+            // Start Unix Domain Socket server for local IPC
             let socket_path = format!("/tmp/metanode-tx-{}.sock", node_config.node_id);
             let tx_client_uds = tx_client.clone();
             let node_for_uds = node.clone();
@@ -133,56 +132,78 @@ async fn main() -> Result<()> {
                 }
             });
             info!("Unix Domain Socket server available at {}", socket_path);
-
-            // Epoch transition coordinator:
-            // If a proposal is quorum-approved AND commit-index barrier is passed,
-            // call node.transition_to_epoch() to persist config + clear state + stop process.
-            let node_for_epoch = node.clone();
-            tokio::spawn(async move {
-                let mut last_triggered: Option<Vec<u8>> = None;
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-                    // Read state without holding lock too long
-                    let (manager, commit_index) = {
-                        let guard = node_for_epoch.lock().await;
-                        (guard.epoch_change_manager(), guard.current_commit_index())
-                    };
-
-                    let manager_guard = manager.read().await;
-                    if let Some(proposal) = manager_guard.get_transition_ready_proposal(commit_index) {
-                        let hash = manager_guard.hash_proposal(&proposal);
-                        // Trigger once per proposal hash
-                        if last_triggered.as_ref() == Some(&hash) {
-                            continue;
-                        }
-                        last_triggered = Some(hash);
-                        drop(manager_guard);
-
-                        // Perform real transition (this will exit process on success)
-                        let mut guard = node_for_epoch.lock().await;
-                        if let Err(e) = guard.transition_to_epoch(&proposal, commit_index).await {
-                            error!("Epoch transition failed: {}", e);
-                        }
-                    }
-                }
-            });
             
             info!("Consensus node started successfully");
             info!("RPC server available at http://127.0.0.1:{}", rpc_port);
             info!("Press Ctrl+C to stop the node");
 
-            // Wait for shutdown signal
-            tokio::signal::ctrl_c().await?;
-            info!("Shutting down node...");
+            // --- MAIN LOOP ---
+            // This loop proactively checks for epoch transition readiness
+            let mut last_processed_proposal_hash: Option<Vec<u8>> = None;
             
-            // If epoch transition already stopped the process, we won't reach here.
-            // Otherwise, shutdown normally.
-            let node = Arc::try_unwrap(node)
-                .ok()
-                .map(|m| m.into_inner());
-            if let Some(node) = node {
-            node.shutdown().await?;
+            loop {
+                // 1. Check for shutdown signal or sleep
+                let sleep = tokio::time::sleep(tokio::time::Duration::from_millis(1000));
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Received Ctrl+C, initiating shutdown...");
+                        break;
+                    }
+                    _ = sleep => {
+                        // Continue to check for epoch transition
+                    }
+                }
+
+                // 2. Check for transition readiness
+                // We lock briefly to get the check, then release lock
+                let (proposal_opt, current_commit_index) = {
+                    let guard = node.lock().await;
+                    let manager = guard.epoch_change_manager();
+                    let manager_guard = manager.read().await;
+                    (
+                        manager_guard.get_transition_ready_proposal(guard.current_commit_index()),
+                        guard.current_commit_index()
+                    )
+                };
+
+                // 3. Execute transition if ready
+                if let Some(proposal) = proposal_opt {
+                    // Double check we haven't processed this already
+                    let proposal_hash = {
+                        let guard = node.lock().await;
+                        guard.epoch_change_manager().read().await.hash_proposal(&proposal)
+                    };
+
+                    if last_processed_proposal_hash.as_ref() != Some(&proposal_hash) {
+                        info!("⚡ MAIN LOOP: Transition ready for epoch {} -> {}. Executing...", 
+                              proposal.new_epoch - 1, proposal.new_epoch);
+                        
+                        // Acquire lock for the actual transition
+                        let mut guard = node.lock().await;
+                        
+                        // Execute the transition
+                        match guard.transition_to_epoch(&proposal, current_commit_index, &node_config).await {
+                            Ok(_) => {
+                                info!("✅ MAIN LOOP: Epoch transition executed successfully!");
+                                last_processed_proposal_hash = Some(proposal_hash);
+                            },
+                            Err(e) => {
+                                error!("❌ MAIN LOOP: Epoch transition failed: {}", e);
+                                // Sleep a bit to avoid rapid retry loops on persistent errors
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- SHUTDOWN CLEANUP ---
+            info!("Shutting down node...");
+            if let Ok(mutex) = Arc::try_unwrap(node) {
+                let node = mutex.into_inner();
+                node.shutdown().await?;
+            } else {
+                warn!("Could not unwrap node Arc, forcing shutdown...");
             }
             info!("Node stopped");
         }
@@ -195,4 +216,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-

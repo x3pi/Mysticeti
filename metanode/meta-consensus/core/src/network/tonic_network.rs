@@ -25,7 +25,7 @@ use meta_tls::AllowPublicKeys;
 use tokio_stream::{Iter, iter};
 use tonic::{Request, Response, Streaming, codec::CompressionEncoding};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::{
     BlockStream, ExtendedSerializedBlock, NetworkClient, NetworkManager, NetworkService,
@@ -44,6 +44,7 @@ use crate::{
         tonic_gen::consensus_service_server::ConsensusServiceServer,
         tonic_tls::certificate_server_name,
     },
+    epoch_change::{EpochChangeProposal, EpochChangeVote},
 };
 
 // Maximum bytes size in a single fetch_blocks()response.
@@ -305,6 +306,48 @@ impl NetworkClient for TonicClient {
         Ok((response.highest_received, response.highest_accepted))
     }
 
+    async fn send_epoch_change_proposal(
+        &self,
+        peer: AuthorityIndex,
+        proposal: &EpochChangeProposal,
+        timeout: Duration,
+    ) -> ConsensusResult<()> {
+        let mut client = self.get_client(peer, timeout).await?;
+        let proposal_bytes = bcs::to_bytes(proposal).map_err(|e| {
+            ConsensusError::NetworkRequest(format!("serialize proposal failed: {e:?}"))
+        })?;
+        let mut request = Request::new(SendEpochChangeProposalRequest {
+            proposal: proposal_bytes.into(),
+        });
+        request.set_timeout(timeout);
+        client
+            .send_epoch_change_proposal(request)
+            .await
+            .map_err(|e| ConsensusError::NetworkRequest(format!("send_epoch_change_proposal failed: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn send_epoch_change_vote(
+        &self,
+        peer: AuthorityIndex,
+        vote: &EpochChangeVote,
+        timeout: Duration,
+    ) -> ConsensusResult<()> {
+        let mut client = self.get_client(peer, timeout).await?;
+        let vote_bytes = bcs::to_bytes(vote).map_err(|e| {
+            ConsensusError::NetworkRequest(format!("serialize vote failed: {e:?}"))
+        })?;
+        let mut request = Request::new(SendEpochChangeVoteRequest {
+            vote: vote_bytes.into(),
+        });
+        request.set_timeout(timeout);
+        client
+            .send_epoch_change_vote(request)
+            .await
+            .map_err(|e| ConsensusError::NetworkRequest(format!("send_epoch_change_vote failed: {e:?}")))?;
+        Ok(())
+    }
+
     #[cfg(test)]
     async fn send_block(
         &self,
@@ -352,7 +395,7 @@ impl ChannelPool {
 
     async fn get_channel(
         &self,
-        network_keypair: NetworkKeyPair,
+        _network_keypair: NetworkKeyPair,
         peer: AuthorityIndex,
         timeout: Duration,
     ) -> ConsensusResult<Channel> {
@@ -662,6 +705,50 @@ impl<S: NetworkService> ConsensusService for TonicServiceProxy<S> {
             highest_accepted,
         }))
     }
+
+    async fn send_epoch_change_proposal(
+        &self,
+        request: Request<SendEpochChangeProposalRequest>,
+    ) -> Result<Response<SendEpochChangeProposalResponse>, tonic::Status> {
+        let peer_index = request
+            .extensions()
+            .get::<PeerInfo>()
+            .map(|p| p.authority_index)
+            .unwrap_or_else(|| {
+                trace!("⚠️ [PEERINFO] PeerInfo missing, using dummy index 0");
+                AuthorityIndex::new_for_test(0)
+            });
+        let proposal_bytes = request.into_inner().proposal;
+        let proposal: EpochChangeProposal = bcs::from_bytes(&proposal_bytes)
+            .map_err(|e| tonic::Status::invalid_argument(format!("deserialize proposal failed: {e:?}")))?;
+        self.service
+            .handle_send_epoch_change_proposal(peer_index, proposal)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("{e:?}")))?;
+        Ok(Response::new(SendEpochChangeProposalResponse {}))
+    }
+
+    async fn send_epoch_change_vote(
+        &self,
+        request: Request<SendEpochChangeVoteRequest>,
+    ) -> Result<Response<SendEpochChangeVoteResponse>, tonic::Status> {
+        let peer_index = request
+            .extensions()
+            .get::<PeerInfo>()
+            .map(|p| p.authority_index)
+            .unwrap_or_else(|| {
+                trace!("⚠️ [PEERINFO] PeerInfo missing, using dummy index 0");
+                AuthorityIndex::new_for_test(0)
+            });
+        let vote_bytes = request.into_inner().vote;
+        let vote: EpochChangeVote = bcs::from_bytes(&vote_bytes)
+            .map_err(|e| tonic::Status::invalid_argument(format!("deserialize vote failed: {e:?}")))?;
+        self.service
+            .handle_send_epoch_change_vote(peer_index, vote)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("{e:?}")))?;
+        Ok(Response::new(SendEpochChangeVoteResponse {}))
+    }
 }
 
 /// Manages the lifecycle of Tonic network client and service. Typical usage during initialization:
@@ -784,7 +871,7 @@ impl<S: NetworkService> NetworkManager<S> for TonicManager {
             .route_layer(layers);
 
         // Check if TLS should be disabled (for local development)
-        let disable_tls = true; // Hardcode for testing
+        let _disable_tls = true; // Hardcode for testing
 
         let tls_server_config = if true { // Hardcode disable TLS for testing
             None
@@ -900,35 +987,6 @@ impl Drop for TonicManager {
     }
 }
 
-// TODO: improve meta-http to allow for providing a MakeService so that this can be done once per
-// connection
-fn peer_info_from_certs(
-    connections_info: &ConnectionsInfo,
-    peer_certificates: &meta_http::PeerCertificates,
-) -> Option<PeerInfo> {
-    let certs = peer_certificates.peer_certs();
-
-    if certs.len() != 1 {
-        trace!(
-            "Unexpected number of certificates from TLS stream: {}",
-            certs.len()
-        );
-        return None;
-    }
-    trace!("Received {} certificates", certs.len());
-    let public_key = meta_tls::public_key_from_certificate(&certs[0])
-        .map_err(|e| {
-            trace!("Failed to extract public key from certificate: {e:?}");
-            e
-        })
-        .ok()?;
-    let client_public_key = NetworkPublicKey::new(public_key);
-    let Some(authority_index) = connections_info.authority_index(&client_public_key) else {
-        error!("Failed to find the authority with public key {client_public_key:?}");
-        return None;
-    };
-    Some(PeerInfo { authority_index })
-}
 
 /// Attempts to convert a multiaddr of the form `/[ip4,ip6,dns]/{}/[udp,tcp]/{port}` into
 /// a host:port string.
@@ -993,10 +1051,12 @@ fn create_socket(address: &SocketAddr) -> tokio::net::TcpSocket {
 ///
 /// TODO: Add connection monitoring, and keep track of connected peers.
 /// TODO: Maybe merge with connection_monitor.rs
+#[allow(dead_code)]
 struct ConnectionsInfo {
     authority_key_to_index: BTreeMap<NetworkPublicKey, AuthorityIndex>,
 }
 
+#[allow(dead_code)]
 impl ConnectionsInfo {
     fn new(context: Arc<Context>) -> Self {
         let authority_key_to_index = context
@@ -1009,6 +1069,7 @@ impl ConnectionsInfo {
         }
     }
 
+    #[allow(dead_code)]
     fn authority_index(&self, key: &NetworkPublicKey) -> Option<AuthorityIndex> {
         self.authority_key_to_index.get(key).copied()
     }
@@ -1164,6 +1225,26 @@ pub(crate) struct GetLatestRoundsResponse {
     #[prost(uint32, repeated, tag = "2")]
     highest_accepted: Vec<u32>,
 }
+
+#[derive(Clone, prost::Message)]
+pub(crate) struct SendEpochChangeProposalRequest {
+    // Serialized EpochChangeProposal.
+    #[prost(bytes = "bytes", tag = "1")]
+    proposal: Bytes,
+}
+
+#[derive(Clone, prost::Message)]
+pub(crate) struct SendEpochChangeProposalResponse {}
+
+#[derive(Clone, prost::Message)]
+pub(crate) struct SendEpochChangeVoteRequest {
+    // Serialized EpochChangeVote.
+    #[prost(bytes = "bytes", tag = "1")]
+    vote: Bytes,
+}
+
+#[derive(Clone, prost::Message)]
+pub(crate) struct SendEpochChangeVoteResponse {}
 
 fn chunk_blocks(blocks: Vec<Bytes>, chunk_limit: usize) -> Vec<Vec<Bytes>> {
     let mut chunks = vec![];

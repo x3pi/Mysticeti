@@ -44,23 +44,17 @@ pub struct ExecutorClient {
 impl ExecutorClient {
     /// Create new executor client
     /// enabled: whether executor is enabled (check config file exists)
-    /// socket_id: socket ID (0 for node 0)
     /// can_commit: whether this node can actually commit transactions (only node 0)
-    pub fn new(enabled: bool, socket_id: usize, can_commit: bool) -> Self {
-        let socket_path = format!("/tmp/executor{}.sock", socket_id);
-        // Node 0 connects to Go Master socket (_2), nodes 1-3 connect to Go Sub socket (_1)
-        let request_socket_path = if socket_id == 0 {
-            "/tmp/rust-go.sock_2".to_string()
-        } else {
-            "/tmp/rust-go.sock_1".to_string()
-        };
+    /// send_socket_path: socket path for sending data to Go executor
+    /// receive_socket_path: socket path for receiving data from Go executor
+    pub fn new(enabled: bool, can_commit: bool, send_socket_path: String, receive_socket_path: String) -> Self {
         Self {
-            socket_path,
+            socket_path: send_socket_path,
             connection: Arc::new(Mutex::new(None)),
+            request_socket_path: receive_socket_path,
+            request_connection: Arc::new(Mutex::new(None)),
             enabled,
             can_commit,
-            request_socket_path,
-            request_connection: Arc::new(Mutex::new(None)),
             send_buffer: Arc::new(Mutex::new(BTreeMap::new())),
             next_expected_index: Arc::new(tokio::sync::Mutex::new(1)), // Start from 1
         }
