@@ -19,7 +19,9 @@ mod epoch_change_hook;
 mod clock_sync;
 mod tx_submitter;
 mod checkpoint;
+mod checkpoint_epoch_transition;
 mod tx_hash;
+mod sui_epoch_transition;
 
 use config::NodeConfig;
 use node::ConsensusNode;
@@ -138,24 +140,23 @@ async fn main() -> Result<()> {
             info!("Press Ctrl+C to stop the node");
 
             // --- MAIN LOOP ---
-            // This loop proactively checks for epoch transition readiness
+            // Simplified: Only monitor reconfiguration completion (epoch transitions now triggered automatically in commit processing)
             let mut last_processed_proposal_hash: Option<Vec<u8>> = None;
-            
+
             loop {
                 // 1. Check for shutdown signal or sleep
-                let sleep = tokio::time::sleep(tokio::time::Duration::from_millis(1000));
+                let sleep = tokio::time::sleep(tokio::time::Duration::from_millis(2000)); // Less frequent checking
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {
                         info!("Received Ctrl+C, initiating shutdown...");
                         break;
                     }
                     _ = sleep => {
-                        // Continue to check for epoch transition
+                        // Continue to monitor reconfiguration status
                     }
                 }
 
-                // 2. Check for transition readiness
-                // We lock briefly to get the check, then release lock
+                // 2. Check for completed reconfiguration (Sui-style: monitor what happened)
                 let (proposal_opt, current_commit_index) = {
                     let guard = node.lock().await;
                     let manager = guard.epoch_change_manager();
@@ -166,7 +167,7 @@ async fn main() -> Result<()> {
                     )
                 };
 
-                // 3. Execute transition if ready
+                // 3. Execute reconfiguration if proposal is ready (triggered automatically from commit processing)
                 if let Some(proposal) = proposal_opt {
                     // Double check we haven't processed this already
                     let proposal_hash = {
@@ -175,22 +176,22 @@ async fn main() -> Result<()> {
                     };
 
                     if last_processed_proposal_hash.as_ref() != Some(&proposal_hash) {
-                        info!("⚡ MAIN LOOP: Transition ready for epoch {} -> {}. Executing...", 
+                        info!("🚀 MAIN LOOP: Executing reconfiguration for epoch {} -> {} (triggered automatically from commit processing)",
                               proposal.new_epoch - 1, proposal.new_epoch);
-                        
+
                         // Acquire lock for the actual transition
                         let mut guard = node.lock().await;
-                        
-                        // Execute the transition
+
+                        // Execute the reconfiguration (Sui-style integrated flow)
                         match guard.transition_to_epoch(&proposal, current_commit_index, &node_config).await {
                             Ok(_) => {
-                                info!("✅ MAIN LOOP: Epoch transition executed successfully!");
+                                info!("✅ MAIN LOOP: Epoch reconfiguration completed successfully!");
                                 last_processed_proposal_hash = Some(proposal_hash);
                             },
                             Err(e) => {
-                                error!("❌ MAIN LOOP: Epoch transition failed: {}", e);
+                                error!("❌ MAIN LOOP: Epoch reconfiguration failed: {}", e);
                                 // Sleep a bit to avoid rapid retry loops on persistent errors
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                             }
                         }
                     }

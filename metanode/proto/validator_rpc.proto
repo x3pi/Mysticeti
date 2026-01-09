@@ -31,6 +31,20 @@ message GetLastBlockNumberRequest {
     // Không cần tham số, lấy từ DB
 }
 
+// Sui-style epoch transition requests
+message GetCurrentEpochRequest {
+    // Empty request - get current epoch from Go state
+}
+
+message GetEpochStartTimestampRequest {
+    uint64 epoch = 1;  // Epoch to query timestamp for
+}
+
+message AdvanceEpochRequest {
+    uint64 new_epoch = 1;  // New epoch number to advance to
+    uint64 epoch_start_timestamp_ms = 2;  // Epoch start timestamp in milliseconds
+}
+
 // Validator info từ Go state - các trường cần thiết cho committee.json + metadata + phí/phần thưởng
 message ValidatorInfo {
     // Các trường cần thiết cho committee.json (tên khớp với committee.json)
@@ -65,6 +79,20 @@ message LastBlockNumberResponse {
     uint64 last_block_number = 1;  // Last block number from Go Master DB
 }
 
+// Sui-style epoch transition responses
+message GetCurrentEpochResponse {
+    uint64 epoch = 1;  // Current epoch from Go state
+}
+
+message GetEpochStartTimestampResponse {
+    uint64 timestamp_ms = 1;  // Epoch start timestamp in milliseconds
+}
+
+message AdvanceEpochResponse {
+    uint64 new_epoch = 1;  // Confirmed new epoch number
+    uint64 epoch_start_timestamp_ms = 2;  // Confirmed epoch start timestamp
+}
+
 // Request message
 // CRITICAL: Field numbers MUST match Go validator.proto for compatibility
 // Go validator.proto field numbers:
@@ -80,6 +108,9 @@ message Request {
         GetActiveValidatorsRequest get_active_validators_request = 3;  // Match Go
         GetValidatorsAtBlockRequest get_validators_at_block_request = 4;  // Match Go (was 2, fixed to 4)
         GetLastBlockNumberRequest get_last_block_number_request = 5;  // New: Get last block number
+        GetCurrentEpochRequest get_current_epoch_request = 6;  // Sui-style: Get current epoch
+        GetEpochStartTimestampRequest get_epoch_start_timestamp_request = 7;  // Sui-style: Get epoch timestamp
+        AdvanceEpochRequest advance_epoch_request = 8;  // Sui-style: Advance epoch
     }
 }
 
@@ -92,6 +123,9 @@ message Response {
         ServerStatus server_status = 3;  // Khớp với Go (không dùng nhưng cần để field numbers đúng)
         string error = 4; // Error message nếu có lỗi - khớp với Go
         LastBlockNumberResponse last_block_number_response = 5;  // New: Last block number response
+        GetCurrentEpochResponse get_current_epoch_response = 6;  // Sui-style: Current epoch response
+        GetEpochStartTimestampResponse get_epoch_start_timestamp_response = 7;  // Sui-style: Epoch timestamp response
+        AdvanceEpochResponse advance_epoch_response = 8;  // Sui-style: Advance epoch response
     }
 }
 

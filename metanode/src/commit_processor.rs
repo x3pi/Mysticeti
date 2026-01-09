@@ -41,6 +41,12 @@ pub struct CommitProcessor {
     /// inside those commits must NOT be lost. We re-queue them here so that `ConsensusNode` can submit
     /// them deterministically after epoch transition.
     pending_transactions_queue: Option<Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>>,
+    /// Sui-style epoch transition manager (integrated into commit processing)
+    epoch_transition_manager: Option<Arc<crate::sui_epoch_transition::SuiEpochTransitionManager>>,
+    /// Block counter for current epoch (for block-based epoch transitions)
+    blocks_in_current_epoch: Arc<std::sync::atomic::AtomicU32>,
+    /// Checkpoint-based epoch transition manager (Sui-style)
+    checkpoint_epoch_transition_manager: Option<Arc<crate::checkpoint_epoch_transition::CheckpointEpochTransitionManager>>,
 }
 
 impl CommitProcessor {
@@ -56,6 +62,9 @@ impl CommitProcessor {
             transition_barrier: None,
             global_exec_index_at_barrier: None,
             pending_transactions_queue: None,
+            epoch_transition_manager: None,
+            blocks_in_current_epoch: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            checkpoint_epoch_transition_manager: None,
         }
     }
 
@@ -103,6 +112,32 @@ impl CommitProcessor {
         pending_transactions_queue: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
     ) -> Self {
         self.pending_transactions_queue = Some(pending_transactions_queue);
+        self
+    }
+
+    /// Provide Sui-style epoch transition manager for integrated epoch transitions
+    pub fn with_epoch_transition_manager(
+        mut self,
+        epoch_transition_manager: Arc<crate::sui_epoch_transition::SuiEpochTransitionManager>,
+    ) -> Self {
+        self.epoch_transition_manager = Some(epoch_transition_manager);
+        self
+    }
+
+    /// Provide checkpoint-based epoch transition manager (Sui-style)
+    pub fn with_checkpoint_epoch_transition_manager(
+        mut self,
+        manager: Arc<crate::checkpoint_epoch_transition::CheckpointEpochTransitionManager>,
+    ) -> Self {
+        self.checkpoint_epoch_transition_manager = Some(manager);
+        self
+    }
+
+    pub fn with_blocks_in_current_epoch(
+        mut self,
+        blocks_in_current_epoch: Arc<std::sync::atomic::AtomicU32>,
+    ) -> Self {
+        self.blocks_in_current_epoch = blocks_in_current_epoch;
         self
     }
 
@@ -219,6 +254,44 @@ impl CommitProcessor {
                         
                         // Process commit normally (not past barrier, already verified above)
                         Self::process_commit(&subdag, global_exec_index, current_epoch, executor_client.clone(), transition_barrier.clone(), global_exec_index_at_barrier.clone(), pending_transactions_queue.clone()).await?;
+
+                        // Sui-style: Check for epoch transition trigger (integrated into commit processing)
+                        if let Some(ref manager) = self.epoch_transition_manager {
+                            manager.check_and_trigger_epoch_transition(commit_index).await?;
+                        }
+
+                        // Checkpoint-based: Check for checkpoint-based epoch transition trigger (Sui-style)
+                        if let Some(ref manager) = self.checkpoint_epoch_transition_manager {
+                            manager.process_commit_and_check_epoch_transition(
+                                &subdag,
+                                commit_index,
+                                global_exec_index,
+                            ).await?;
+                        }
+
+                        // Block-based: Check for block-based epoch transition trigger (legacy, will be removed)
+                        let blocks_count = subdag.blocks.len() as u32;
+                        if blocks_count > 0 {
+                            // Increment block counter
+                            let previous_count = self.blocks_in_current_epoch.fetch_add(blocks_count, Ordering::SeqCst);
+                            let current_count = previous_count + blocks_count;
+
+                            info!("📊 [BLOCK COUNTER] Epoch {}: {} blocks processed (total: {})",
+                                current_epoch, blocks_count, current_count);
+
+                            // Check if we've reached the block threshold for epoch transition
+                            if let Some(ref manager) = self.epoch_transition_manager {
+                                if let Some(blocks_per_epoch) = manager.get_config().blocks_per_epoch {
+                                    if current_count as u64 >= blocks_per_epoch {
+                                        info!("🎯 [BLOCK-BASED EPOCH] Reached {} blocks in epoch {}, triggering transition",
+                                            current_count, current_epoch);
+
+                                        // Trigger block-based epoch transition
+                                        manager.trigger_block_based_epoch_transition(current_count).await?;
+                                    }
+                                }
+                            }
+                        }
                         
                         // Notify commit index update (for epoch transition)
                         if let Some(ref callback) = commit_index_callback {
@@ -497,14 +570,15 @@ impl CommitProcessor {
                     // CRITICAL FORK-SAFETY: If duplicate global_exec_index detected, this is a serious bug
                     // Log error and skip this commit to prevent fork
                     if e.to_string().contains("Duplicate global_exec_index") {
-                        warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! This commit will be skipped to prevent fork. Error: {}", 
+                        warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! This commit will be skipped to prevent fork. Error: {}",
                             send_global_exec_index, e);
+                        return Ok(());
                     } else {
                         warn!("⚠️  [TX FLOW] Failed to send committed subdag to executor: {}", e);
                         // Don't fail commit if executor is unavailable (network issues, etc.)
                     }
                 } else {
-                    info!("✅ [TX FLOW] Successfully sent committed subdag to Go executor: global_exec_index={}, commit_index={}, epoch={}, blocks={}", 
+                    info!("✅ [TX FLOW] Successfully sent committed subdag to Go executor: global_exec_index={}, commit_index={}, epoch={}, blocks={}",
                         send_global_exec_index, commit_index, send_epoch, subdag.blocks.len());
                 }
             } else {
@@ -539,8 +613,9 @@ impl CommitProcessor {
                     // CRITICAL FORK-SAFETY: If duplicate global_exec_index detected, this is a serious bug
                     // Log error and skip this commit to prevent fork
                     if e.to_string().contains("Duplicate global_exec_index") {
-                        warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! This empty commit will be skipped to prevent fork. Error: {}", 
+                        warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! This empty commit will be skipped to prevent fork. Error: {}",
                             send_global_exec_index, e);
+                        return Ok(());
                     } else {
                         warn!("⚠️  Failed to send committed subdag to executor: {}", e);
                         // Don't fail commit if executor is unavailable (network issues, etc.)
@@ -548,7 +623,7 @@ impl CommitProcessor {
                 }
             }
         }
-        
+
         Ok(())
     }
 }

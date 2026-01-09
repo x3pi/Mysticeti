@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
-use tracing::{info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 // Include generated protobuf code
 // Note: prost_build generates all messages from executor.proto into proto.rs
@@ -68,6 +68,131 @@ impl ExecutorClient {
     /// Check if this node can commit transactions (only node 0)
     pub fn can_commit(&self) -> bool {
         self.can_commit
+    }
+
+    /// Send a request to Go executor and receive response
+    async fn send_request(&self, request: Request) -> Result<Response> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Connect to Go request socket if needed
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        // Encode request to protobuf bytes
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        // Send request via UDS
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            // Write 4-byte length prefix (big-endian)
+            let len = request_buf.len() as u32;
+            let len_bytes = len.to_be_bytes();
+            stream.write_all(&len_bytes).await?;
+
+            // Write request data
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+
+            info!("📤 [EXECUTOR-REQ] Sent request to Go (size: {} bytes)", request_buf.len());
+
+            // Read response (4-byte length prefix + response data)
+            use tokio::io::AsyncReadExt;
+            use tokio::time::{timeout, Duration};
+
+            // Set timeout for reading response (5 seconds)
+            let read_timeout = Duration::from_secs(5);
+
+            let mut len_buf = [0u8; 4];
+            timeout(read_timeout, stream.read_exact(&mut len_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response length: {}", e))??;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+
+            if response_len == 0 {
+                return Err(anyhow::anyhow!("Received zero-length response from Go"));
+            }
+
+            let mut response_buf = vec![0u8; response_len];
+            timeout(read_timeout, stream.read_exact(&mut response_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response data: {}", e))??;
+
+            // Decode response
+            let response = Response::decode(&response_buf[..])?;
+
+            info!("📥 [EXECUTOR-REQ] Received response from Go (size: {} bytes)", response_buf.len());
+            Ok(response)
+        } else {
+            Err(anyhow::anyhow!("No connection to Go request socket"))
+        }
+    }
+
+    /// Get current epoch from Go state (Sui-style epoch monitoring)
+    pub async fn get_current_epoch(&self) -> Result<u64> {
+        if !self.enabled {
+            return Err(anyhow::anyhow!("Executor client not enabled"));
+        }
+
+        let request = Request {
+            payload: Some(proto::request::Payload::GetCurrentEpochRequest(
+                proto::GetCurrentEpochRequest {}
+            )),
+        };
+
+        let response = self.send_request(request).await?;
+        match response.payload {
+            Some(proto::response::Payload::GetCurrentEpochResponse(resp)) => {
+                Ok(resp.epoch)
+            }
+            _ => Err(anyhow::anyhow!("Unexpected response type for get_current_epoch")),
+        }
+    }
+
+    /// Get epoch start timestamp for a specific epoch from Go state
+    pub async fn get_epoch_start_timestamp(&self, epoch: u64) -> Result<u64> {
+        if !self.enabled {
+            return Err(anyhow::anyhow!("Executor client not enabled"));
+        }
+
+        let request = Request {
+            payload: Some(proto::request::Payload::GetEpochStartTimestampRequest(
+                proto::GetEpochStartTimestampRequest { epoch }
+            )),
+        };
+
+        let response = self.send_request(request).await?;
+        match response.payload {
+            Some(proto::response::Payload::GetEpochStartTimestampResponse(resp)) => {
+                Ok(resp.timestamp_ms)
+            }
+            _ => Err(anyhow::anyhow!("Unexpected response type for get_epoch_start_timestamp")),
+        }
+    }
+
+    /// Advance epoch in Go state (Sui-style epoch completion)
+    pub async fn advance_epoch(&self, new_epoch: u64, epoch_start_timestamp_ms: u64) -> Result<(u64, u64)> {
+        if !self.enabled {
+            return Err(anyhow::anyhow!("Executor client not enabled"));
+        }
+
+        let request = Request {
+            payload: Some(proto::request::Payload::AdvanceEpochRequest(
+                proto::AdvanceEpochRequest {
+                    new_epoch,
+                    epoch_start_timestamp_ms,
+                }
+            )),
+        };
+
+        let response = self.send_request(request).await?;
+        match response.payload {
+            Some(proto::response::Payload::AdvanceEpochResponse(resp)) => {
+                Ok((resp.new_epoch, resp.epoch_start_timestamp_ms))
+            }
+            _ => Err(anyhow::anyhow!("Unexpected response type for advance_epoch")),
+        }
     }
 
     /// Initialize next_expected_index from Go Master's last block number
@@ -732,6 +857,15 @@ impl ExecutorClient {
                 Some(proto::response::Payload::LastBlockNumberResponse(_)) => {
                     warn!("🔍 [EXECUTOR-REQ] Payload is LastBlockNumberResponse (not expected for GetValidatorsAtBlockRequest)");
                 }
+                Some(proto::response::Payload::GetCurrentEpochResponse(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is GetCurrentEpochResponse (not expected for this request)");
+                }
+                Some(proto::response::Payload::GetEpochStartTimestampResponse(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is GetEpochStartTimestampResponse (not expected for this request)");
+                }
+                Some(proto::response::Payload::AdvanceEpochResponse(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is AdvanceEpochResponse (not expected for this request)");
+                }
                 None => {
                     warn!("🔍 [EXECUTOR-REQ] Payload is None - response structure may be incorrect");
                     warn!("🔍 [EXECUTOR-REQ] Full response debug: {:?}", response);
@@ -770,6 +904,15 @@ impl ExecutorClient {
                 }
                 Some(proto::response::Payload::LastBlockNumberResponse(_)) => {
                     return Err(anyhow::anyhow!("Unexpected LastBlockNumberResponse response (expected ValidatorInfoList)"));
+                }
+                Some(proto::response::Payload::GetCurrentEpochResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected GetCurrentEpochResponse response (expected ValidatorInfoList)"));
+                }
+                Some(proto::response::Payload::GetEpochStartTimestampResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected GetEpochStartTimestampResponse response (expected ValidatorInfoList)"));
+                }
+                Some(proto::response::Payload::AdvanceEpochResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected AdvanceEpochResponse response (expected ValidatorInfoList)"));
                 }
                 None => {
                     return Err(anyhow::anyhow!("Unexpected response type from Go. Response payload: None. Response bytes (hex): {}", hex::encode(&response_buf)));
@@ -861,6 +1004,41 @@ impl ExecutorClient {
             }
         } else {
             return Err(anyhow::anyhow!("Request connection is not available"));
+        }
+    }
+
+    /// Submit checkpoint-based epoch change transaction (Sui-style)
+    /// This replaces voting with deterministic transaction execution
+    pub async fn submit_checkpoint_epoch_change_transaction(
+        &self,
+        epoch_change_data: crate::checkpoint_epoch_transition::CheckpointEpochChangeData,
+    ) -> Result<()> {
+        if !self.enabled {
+            warn!("⚠️  [CHECKPOINT-EPOCH] Executor client not enabled - epoch transition skipped");
+            return Ok(()); // Don't fail if executor is disabled
+        }
+
+        info!("📤 [CHECKPOINT-EPOCH] Submitting epoch change transaction: epoch {} -> {} at checkpoint {}",
+            epoch_change_data.new_epoch - 1, epoch_change_data.new_epoch, epoch_change_data.checkpoint_sequence);
+
+        // For now, reuse existing advance_epoch method
+        // In future, this could use a dedicated checkpoint epoch change transaction
+        match self.advance_epoch(
+            epoch_change_data.new_epoch,
+            epoch_change_data.epoch_start_timestamp_ms,
+        ).await {
+            Ok((new_epoch, epoch_start_ts)) => {
+                info!("✅ [CHECKPOINT-EPOCH] Epoch change transaction executed successfully: epoch={}, timestamp={}",
+                    new_epoch, epoch_start_ts);
+                Ok(())
+            }
+            Err(e) => {
+                // ⚠️  NON-FATAL: Log error but don't fail the transaction submission
+                // This allows consensus to continue even if Go side has issues
+                error!("⚠️  [CHECKPOINT-EPOCH] Epoch change transaction failed (non-fatal): {}", e);
+                error!("🔄 Continuing with blocks despite Go-side epoch transition failure");
+                Ok(()) // Return Ok to prevent consensus shutdown
+            }
         }
     }
 

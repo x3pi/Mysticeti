@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use tracing::{info, error, warn};
 use crate::tx_submitter::TransactionSubmitter;
 use crate::tx_hash::calculate_transaction_hash_hex;
+use serde_json;
 
 /// Simple HTTP RPC server for submitting transactions
 /// Supports both HTTP POST and length-prefixed binary protocols
@@ -92,10 +93,19 @@ impl RpcServer {
                     stream.read_exact(&mut len_buf)
                 ).await;
 
-                // SPECIAL TESTING MODE: If first 4 bytes are "TEST", treat as raw text transaction
+                // Detect protocol type
                 let is_testing_mode = len_buf == [b'T', b'E', b'S', b'T'];
+                let is_http_request = len_buf.starts_with(b"POST") || len_buf.starts_with(b"GET") ||
+                                    (len_buf.len() >= 4 && String::from_utf8_lossy(&len_buf).to_uppercase().starts_with("POST"));
 
-                if is_testing_mode {
+                if is_http_request {
+                    // HTTP REQUEST: Handle HTTP POST/GET requests
+                    info!("🌐 [TX FLOW] Detected HTTP request from {:?}", peer_addr);
+                    if let Err(e) = Self::handle_http_request(&client, &node, &mut stream, &len_buf).await {
+                        error!("❌ [TX FLOW] Failed to handle HTTP request from {:?}: {}", peer_addr, e);
+                    }
+                    return;
+                } else if is_testing_mode {
                     // TESTING MODE: Read the rest as raw transaction data
                     info!("🧪 [TX FLOW] Detected TESTING MODE from {:?}, reading raw transaction data...", peer_addr);
                     let mut tx_data = Vec::new();
@@ -346,18 +356,39 @@ impl RpcServer {
                         error!("❌ [TX FLOW] Failed to decode as Transactions or Transaction protobuf: {}", e);
                         error!("❌ [TX FLOW] Data preview (first 100 bytes): {}", 
                             hex::encode(&tx_data[..tx_data.len().min(100)]));
-                        warn!("⚠️  [TX FLOW] Raw bytes received (not protobuf), this format is deprecated. Please use Transactions or Transaction protobuf.");
-                        
-                        // Backward compatibility: Thử xử lý như raw transaction data
-                        // Tạo một Transaction protobuf từ raw bytes (nếu có thể)
-                        // Hoặc reject với error message rõ ràng
-                        if is_length_prefixed {
-                            Self::send_binary_response(stream, false, "Invalid protobuf format. Expected Transactions or Transaction protobuf.").await?;
-                        } else {
-                            let response = r#"{"success":false,"error":"Invalid protobuf format. Expected Transactions or Transaction protobuf. Please use protobuf encoding."}"#;
-                            Self::send_response(stream, response, false).await?;
+                        info!("📦 [TX FLOW] Raw bytes received, encoding as Transaction protobuf: {} bytes", tx_data.len());
+
+                        // Encode raw bytes as protobuf Transaction
+                        // Raw transaction data goes into the Data field (field 7)
+                        let mut tx = Transaction::default();
+                        tx.data = tx_data.clone();
+                        // Set minimal required fields for a valid transaction
+                        tx.from_address = vec![0u8; 20]; // dummy 20-byte address
+                        tx.to_address = vec![0u8; 20];   // dummy 20-byte address
+                        tx.amount = vec![0u8; 32];      // dummy 32-byte amount (big int)
+                        tx.max_gas = 21000;             // standard gas limit
+                        tx.max_gas_price = 20000000000; // 20 gwei
+                        tx.max_time_use = 300;          // 5 minutes
+                        tx.nonce = vec![0u8; 32];       // dummy nonce
+                        tx.chain_id = 1000;             // chain ID from config
+
+                        let mut buf = Vec::new();
+                        if let Err(e) = tx.encode(&mut buf) {
+                            error!("❌ [TX FLOW] Failed to encode raw bytes as Transaction protobuf: {}", e);
+                            if is_length_prefixed {
+                                Self::send_binary_response(stream, false, &format!("Failed to encode transaction: {}", e)).await?;
+                            } else {
+                                let response = format!(r#"{{"success":false,"error":"Failed to encode transaction: {}"}}"#,
+                                    e.to_string().replace('"', "\\\""));
+                                Self::send_response(stream, &response, false).await?;
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
+
+                        info!("📦 [TX FLOW] Encoded transaction: original_size={} bytes, protobuf_size={} bytes, hash={}",
+                            tx_data.len(), buf.len(), hex::encode(&buf[..buf.len().min(16)]));
+
+                        vec![buf]
                     }
                 }
             }
@@ -544,7 +575,105 @@ impl RpcServer {
         }
         
         info!("📤 [TX FLOW] Sent binary response: success={}, message={}, message_len={}", success, message, message_len);
-        
+
+        Ok(())
+    }
+
+    /// Handle HTTP POST requests for transaction submission
+    async fn handle_http_request(
+        client: &Arc<dyn TransactionSubmitter>,
+        node: &Option<Arc<Mutex<crate::node::ConsensusNode>>>,
+        stream: &mut tokio::net::TcpStream,
+        initial_buf: &[u8],
+    ) -> Result<()> {
+        use std::io::Write;
+
+        // Read the full HTTP request
+        let mut request_data = initial_buf.to_vec();
+        let mut buf = [0u8; 1024];
+
+        // Read until we get a complete HTTP request (double CRLF)
+        let mut request_complete = false;
+        while !request_complete {
+            match stream.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    request_data.extend_from_slice(&buf[..n]);
+                    // Check for end of HTTP headers (double CRLF)
+                    if request_data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        request_complete = true;
+                    }
+                }
+                Err(e) => {
+                    error!("❌ [HTTP] Failed to read HTTP request: {}", e);
+                    return Err(e.into());
+                }
+            }
+        }
+
+        let request_str = String::from_utf8_lossy(&request_data);
+
+        // Simple HTTP parsing - extract body from POST request
+        if request_str.starts_with("POST /submit ") {
+            // Find body start (after double CRLF)
+            if let Some(body_start) = request_data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let body_start = body_start + 4;
+                if request_data.len() > body_start {
+                    let body = &request_data[body_start..];
+
+                    // Try to parse as JSON first: {"data":"hex_string"}
+                    let tx_data = if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(body) {
+                        if let Some(data_hex) = json_value.get("data").and_then(|d| d.as_str()) {
+                            // Decode hex string to bytes
+                            match hex::decode(data_hex) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    error!("❌ [HTTP] Failed to decode hex data: {}", e);
+                                    let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 43\r\n\r\n{\"status\":\"error\",\"message\":\"invalid hex\"}";
+                                    stream.write_all(response.as_bytes()).await?;
+                                    return Ok(());
+                                }
+                            }
+                        } else {
+                            // Invalid JSON format
+                            let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 45\r\n\r\n{\"status\":\"error\",\"message\":\"invalid format\"}";
+                            stream.write_all(response.as_bytes()).await?;
+                            return Ok(());
+                        }
+                    } else {
+                        // Not JSON, treat as raw binary data (for metanode-client compatibility)
+                        info!("📥 [HTTP] Received raw binary transaction: {} bytes", body.len());
+                        body.to_vec()
+                    };
+
+                    info!("📥 [HTTP] Processing transaction: {} bytes", tx_data.len());
+
+                    // Submit transaction
+                    match client.submit(vec![tx_data]).await {
+                        Ok(_) => {
+                            info!("✅ [HTTP] Transaction submitted successfully");
+                            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 42\r\n\r\n{\"status\":\"success\",\"message\":\"submitted\"}";
+                            stream.write_all(response.as_bytes()).await?;
+                        }
+                        Err(e) => {
+                            error!("❌ [HTTP] Failed to submit transaction: {}", e);
+                            let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"status\":\"error\",\"message\":\"failed\"}";
+                            stream.write_all(response.as_bytes()).await?;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
+            // No body found
+            let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 43\r\n\r\n{\"status\":\"error\",\"message\":\"no body\"}";
+            stream.write_all(response.as_bytes()).await?;
+        } else {
+            // Method not allowed
+            let response = "HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Type: application/json\r\nContent-Length: 49\r\n\r\n{\"status\":\"error\",\"message\":\"method not allowed\"}";
+            stream.write_all(response.as_bytes()).await?;
+        }
+
         Ok(())
     }
 }

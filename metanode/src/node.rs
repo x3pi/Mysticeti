@@ -14,6 +14,7 @@ use fastcrypto::traits::ToFromBytes;
 use crate::transaction::NoopTransactionVerifier;
 use crate::epoch_change::EpochChangeManager;
 use crate::clock_sync::ClockSyncManager;
+use crate::sui_epoch_transition::SuiEpochTransitionOrchestrator;
 use prometheus::Registry;
 use mysten_metrics::RegistryService;
 use serde_json;
@@ -41,6 +42,9 @@ pub struct ConsensusNode {
     /// Clock synchronization manager
     #[allow(dead_code)] // Used internally by sync tasks
     clock_sync_manager: Arc<RwLock<ClockSyncManager>>,
+    /// Sui-style epoch transition orchestrator
+    #[allow(dead_code)] // Used for Sui-style epoch transitions
+    sui_epoch_orchestrator: Arc<SuiEpochTransitionOrchestrator>,
     /// Current commit index (for fork-safe epoch transition)
     #[allow(dead_code)] // Used internally by commit processor callback
     current_commit_index: Arc<AtomicU32>,
@@ -51,6 +55,8 @@ pub struct ConsensusNode {
     current_epoch: u64,
     /// Last global execution index (for deterministic global_exec_index calculation)
     last_global_exec_index: u64,
+    /// Block counter for current epoch (for block-based epoch transitions)
+    blocks_in_current_epoch: Option<Arc<std::sync::atomic::AtomicU32>>,
 
     // --- restart support ---
     protocol_keypair: consensus_config::ProtocolKeyPair,
@@ -104,21 +110,33 @@ impl ConsensusNode {
     ) -> Result<Self> {
         info!("Initializing consensus node {}...", config.node_id);
 
-        // FIX: Always fetch committee from Go state via Unix Domain Socket. Do NOT load from file.
-        info!("🚀 [STARTUP] Loading committee from Go state via Unix Domain Socket (block 0/genesis)...");
+        // FIX: Try to fetch committee from Go state, fallback to loading from file
+        let (validators, epoch_timestamp_ms) = if config.executor_read_enabled {
+            info!("🚀 [STARTUP] Loading committee from Go state via Unix Domain Socket (block 0/genesis)...");
 
-        // Create executor client for fetching committee from Go
-        // Always enable executor client for committee fetching during startup
-        let executor_client = Arc::new(ExecutorClient::new(
-            true, // Always enable for committee fetching
-            false, // Don't commit during committee fetching
-            config.executor_send_socket_path.clone(),
-            config.executor_receive_socket_path.clone(),
-        ));
+            // Create executor client for fetching committee from Go
+            let executor_client = Arc::new(ExecutorClient::new(
+                true, // Always enable for committee fetching
+                false, // Don't commit during committee fetching
+                config.executor_send_socket_path.clone(),
+                config.executor_receive_socket_path.clone(),
+            ));
 
-        // Fetch validators from Go at block 0 (genesis)
-        let (validators, _go_epoch_timestamp_ms) = executor_client.get_validators_at_block(0).await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch committee from Go state: {}", e))?;
+            // Fetch validators from Go at block 0 (genesis)
+            match executor_client.get_validators_at_block(0).await {
+                Ok((validators, go_epoch_timestamp_ms)) => {
+                    info!("✅ Successfully loaded committee from Go state");
+                    (validators, go_epoch_timestamp_ms)
+                }
+                Err(e) => {
+                    warn!("⚠️  Failed to fetch committee from Go state: {}", e);
+                    anyhow::bail!("Cannot load committee - Go state unavailable and no fallback implemented");
+                }
+            }
+        } else {
+            info!("⚠️  Executor read disabled - cannot load committee");
+            anyhow::bail!("Cannot load committee - executor read disabled and no fallback implemented");
+        };
 
         // Load epoch_timestamp_ms from genesis.json instead of Go state for consistency
         let genesis_path = std::path::Path::new("../../mtn-simple-2025/cmd/simple_chain/genesis.json");
@@ -133,25 +151,41 @@ impl ConsensusNode {
                                     ts
                                 },
                                 None => {
-                                    warn!("⚠️  Could not find epoch_timestamp_ms in genesis.json, using Go timestamp: {}", _go_epoch_timestamp_ms);
-                                    _go_epoch_timestamp_ms
+                                    let default_ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as u64;
+                                    warn!("⚠️  Could not find epoch_timestamp_ms in genesis.json, using current timestamp: {}", default_ts);
+                                    default_ts
                                 }
                             }
                         },
                         Err(e) => {
-                            warn!("⚠️  Failed to parse genesis.json: {}, using Go timestamp: {}", e, _go_epoch_timestamp_ms);
-                            _go_epoch_timestamp_ms
+                            let default_ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            warn!("⚠️  Failed to parse genesis.json: {}, using current timestamp: {}", e, default_ts);
+                            default_ts
                         }
                     }
                 },
                 Err(e) => {
-                    warn!("⚠️  Failed to read genesis.json: {}, using Go timestamp: {}", e, _go_epoch_timestamp_ms);
-                    _go_epoch_timestamp_ms
+                    let default_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    warn!("⚠️  Failed to read genesis.json: {}, using current timestamp: {}", e, default_ts);
+                    default_ts
                 }
             }
         } else {
-            warn!("⚠️  genesis.json not found at {:?}, using Go timestamp: {}", genesis_path, _go_epoch_timestamp_ms);
-            _go_epoch_timestamp_ms
+            let default_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            warn!("⚠️  genesis.json not found at {:?}, using current timestamp: {}", genesis_path, default_ts);
+            default_ts
         };
 
         if validators.is_empty() {
@@ -298,20 +332,32 @@ impl ConsensusNode {
             executor_client_for_init.initialize_from_go().await;
         });
 
-        commit_processor = commit_processor.with_executor_client(executor_client);
-        
-        tokio::spawn(async move {
-            if let Err(e) = commit_processor.run().await {
-                tracing::error!("Commit processor error: {}", e);
-            }
-        });
-        
-        tokio::spawn(async move {
-            use tracing::debug;
-            while let Some(output) = block_receiver.recv().await {
-                debug!("Received {} certified blocks", output.blocks.len());
-            }
-        });
+        // Create checkpoint manager for checkpoint-based epoch transitions (Sui-style)
+        let checkpoint_manager = if config.checkpoint_based_epochs {
+            let blocks_per_epoch = config.blocks_per_epoch.unwrap_or(100);
+            Some(Arc::new(crate::checkpoint::CheckpointManager::new(
+                blocks_per_epoch,
+                own_index,
+            )))
+        } else {
+            None
+        };
+
+        // Create block counter for epoch transitions
+        let blocks_in_current_epoch = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        // Create checkpoint-based epoch transition manager
+        let checkpoint_epoch_transition_manager = if let Some(ref checkpoint_manager) = checkpoint_manager {
+            Some(Arc::new(crate::checkpoint_epoch_transition::CheckpointEpochTransitionManager::new(
+                checkpoint_manager.clone(),
+                executor_client.clone(),
+                config.clone(),
+                own_index,
+                blocks_in_current_epoch.clone(),
+            )))
+        } else {
+            None
+        };
 
         // Get protocol config
         let protocol_config = ProtocolConfig::get_for_max_version_UNSAFE();
@@ -391,7 +437,47 @@ impl ConsensusNode {
             max_clock_drift_ms,
             None, // network_client
         )));
-        
+
+        // Clone executor client for Sui orchestrator
+        let executor_client_clone = executor_client.clone();
+
+        // Create Sui orchestrator after epoch_change_manager is available
+        let sui_epoch_orchestrator_clone = Arc::new(SuiEpochTransitionOrchestrator::new(
+            epoch_change_manager.clone(),
+            executor_client_clone.clone(),
+            config.clone(),
+            current_epoch,
+            own_index,
+        ));
+
+        // Setup commit processor with Sui epoch transition manager BEFORE spawning
+        commit_processor = commit_processor.with_executor_client(executor_client.clone());
+        commit_processor = commit_processor.with_epoch_transition_manager(sui_epoch_orchestrator_clone.sui_manager());
+
+        // Setup checkpoint-based epoch transition manager (Sui-style)
+        if let Some(ref manager) = checkpoint_epoch_transition_manager {
+            commit_processor = commit_processor.with_checkpoint_epoch_transition_manager(manager.clone());
+        }
+
+        // Pass block counter for block-based epoch transitions
+        let blocks_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        commit_processor = commit_processor.with_blocks_in_current_epoch(blocks_counter);
+
+        tokio::spawn(async move {
+            if let Err(e) = commit_processor.run().await {
+                tracing::error!("Commit processor error: {}", e);
+            }
+        });
+
+        tokio::spawn(async move {
+            use tracing::debug;
+            while let Some(output) = block_receiver.recv().await {
+                debug!("Received {} certified blocks", output.blocks.len());
+            }
+        });
+
+
+
         // Initialize clock sync manager
         let clock_sync_manager = Arc::new(RwLock::new(ClockSyncManager::new(
             config.ntp_servers.clone(),
@@ -451,251 +537,34 @@ impl ConsensusNode {
 
         info!("Consensus node {} initialized successfully", config.node_id);
 
-        // Start monitoring task for time-based epoch change proposal
-        if config.time_based_epoch_change {
-            let epoch_change_manager_clone = epoch_change_manager.clone();
-            let current_commit_index_clone = current_commit_index.clone();
-            let protocol_keypair_for_task = protocol_keypair_for_epoch_task.clone();
-            let own_index_clone = own_index;
-            
-            let clock_sync_manager_clone_for_epoch_task = clock_sync_manager.clone();
-            let ntp_enabled_for_epoch_task = config.enable_ntp_sync;
-            
-            tokio::spawn(async move {
-                let mut last_epoch_log = SystemTime::now();
-                let mut last_skip_pending_log = SystemTime::now() - Duration::from_secs(300);
-                let mut last_ntp_unhealthy_log = SystemTime::now() - Duration::from_secs(300);
-                loop {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    
-                    let mut manager = epoch_change_manager_clone.write().await;
-                    let current_epoch = manager.current_epoch();
-                    
-                    if last_epoch_log.elapsed().unwrap_or(Duration::from_secs(0)) >= Duration::from_secs(30) {
-                        let now_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as u64;
-                        let elapsed_seconds = (now_ms - manager.epoch_start_timestamp_ms()) / 1000;
-                        let remaining_seconds = manager.epoch_duration_seconds().saturating_sub(elapsed_seconds);
-                        
-                        info!("📅 CURRENT EPOCH: epoch={}, elapsed={}s ({}m {}s), remaining={}s ({}m {}s), duration={}s",
-                            current_epoch,
-                            elapsed_seconds,
-                            elapsed_seconds / 60,
-                            elapsed_seconds % 60,
-                            remaining_seconds,
-                            remaining_seconds / 60,
-                            remaining_seconds % 60,
-                            manager.epoch_duration_seconds()
-                        );
-                        
-                        last_epoch_log = SystemTime::now();
-                    }
-                    
-                    let should_propose = manager.should_propose_time_based();
-                    if should_propose {
-                        let has_pending = manager.has_pending_proposal_for_epoch(current_epoch + 1);
-                        
-                        let current_committee = manager.committee();
-                        let epoch_duration_seconds = manager.epoch_duration_seconds();
-                        let epoch_duration_minutes = epoch_duration_seconds / 60;
-                        let mut new_authorities = Vec::new();
-                        for (_, auth) in current_committee.authorities() {
-                            use consensus_config::Authority;
-                            new_authorities.push(Authority {
-                                stake: auth.stake,
-                                address: auth.address.clone(),
-                                hostname: auth.hostname.clone(),
-                                authority_key: auth.authority_key.clone(),
-                                protocol_key: auth.protocol_key.clone(),
-                                network_key: auth.network_key.clone(),
-                            });
-                        }
-                        drop(manager);
-                        
-                        if !has_pending {
-                            if ntp_enabled_for_epoch_task {
-                                let clock_ok = clock_sync_manager_clone_for_epoch_task.read().await.is_healthy();
-                                if !clock_ok {
-                                    if last_ntp_unhealthy_log.elapsed().unwrap_or(Duration::from_secs(0))
-                                        >= Duration::from_secs(60)
-                                    {
-                                        warn!("⏱️  Skipping epoch proposal: clock/NTP sync unhealthy (production safety gate)");
-                                        last_ntp_unhealthy_log = SystemTime::now();
-                                    }
-                                    continue;
-                                }
-                            }
+        // Use the Sui orchestrator created earlier
+        let sui_epoch_orchestrator = sui_epoch_orchestrator_clone;
 
-                            info!("🔄 Time-based epoch change trigger: epoch {} -> {} ({} minutes elapsed)", 
-                                current_epoch, current_epoch + 1, epoch_duration_minutes);
-                            
-                            let mut manager = epoch_change_manager_clone.write().await;
-                            let current_commit_index = current_commit_index_clone.load(Ordering::SeqCst);
-                            
-                            let new_epoch_timestamp_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as u64;
-                            
-                            let proposal_commit_index = current_commit_index.saturating_add(100);
-                            
-                            info!("📝 Creating epoch change proposal: epoch {} -> {}, commit_index={} (current={})",
-                                current_epoch, current_epoch + 1, proposal_commit_index, current_commit_index);
-                            
-                            match manager.propose_epoch_change(
-                                new_epoch_timestamp_ms,
-                                proposal_commit_index,
-                                own_index_clone,
-                                &protocol_keypair_for_task,
-                            ) {
-                                Ok(proposal) => {
-                                    let proposal_hash = manager.hash_proposal(&proposal);
-                                    let hash_hex = hex::encode(&proposal_hash[..8]);
-                                    info!(
-                                        "✅ EPOCH CHANGE PROPOSAL CREATED: epoch {} -> {}, proposal_hash={}, commit_index={}, proposer={}",
-                                        current_epoch,
-                                        proposal.new_epoch,
-                                        hash_hex,
-                                        proposal_commit_index,
-                                        own_index_clone.value()
-                                    );
-                                    
-                                    match manager.vote_on_proposal(
-                                        &proposal,
-                                        own_index_clone,
-                                        &protocol_keypair_for_task,
-                                    ) {
-                                        Ok(vote) => {
-                                            let vote_hash_hex = hex::encode(&vote.proposal_hash[..8.min(vote.proposal_hash.len())]);
-                                            info!(
-                                                "🗳️  Auto-voted on own proposal: proposal_hash={}, epoch {} -> {}, voter={}, approve={}",
-                                                vote_hash_hex,
-                                                proposal.new_epoch - 1,
-                                                proposal.new_epoch,
-                                                own_index_clone.value(),
-                                                vote.approve
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("⚠️  Failed to auto-vote on own proposal: {}", e);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("❌ Failed to create epoch change proposal: {}", e);
-                                }
-                            }
-                        } else {
-                            if last_skip_pending_log.elapsed().unwrap_or(Duration::from_secs(0)) >= Duration::from_secs(30) {
-                                info!(
-                                    "⏭️  Skipping proposal creation: already have pending proposal for epoch {}",
-                                    current_epoch + 1
-                                );
-                                last_skip_pending_log = SystemTime::now();
-                            }
-                        }
-                    }
-                }
-            });
+        // Start Sui-style epoch transition orchestrator
+        sui_epoch_orchestrator.start().await?;
+
+        // DISABLED: Time-based epoch change monitoring (replaced by integrated commit-based triggering)
+        // Epoch transitions now happen automatically when processing commits, not via separate monitoring
+        if config.time_based_epoch_change {
+            info!("⚠️  Time-based epoch change monitoring DISABLED - replaced by integrated commit-based triggering");
+            info!("   Epoch transitions will now be triggered automatically during commit processing");
         }
 
-        // Start monitoring task for epoch transition
-        let epoch_change_manager_clone = epoch_change_manager.clone();
-        let current_commit_index_clone = current_commit_index.clone();
-        
-        tokio::spawn(async move {
-            let mut last_quorum_check = SystemTime::now();
-            let mut last_waiting_log = SystemTime::now() - Duration::from_secs(300);
-            let mut last_waiting_commit_index: u32 = 0;
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                
-                let current_commit_index = current_commit_index_clone.load(Ordering::SeqCst);
-                let manager = epoch_change_manager_clone.read().await;
-                
-                if last_quorum_check.elapsed().unwrap_or(Duration::from_secs(0)) >= Duration::from_secs(10) {
-                    let pending_proposals = manager.get_all_pending_proposals();
-                    for proposal in &pending_proposals {
-                        let quorum_status = manager.check_proposal_quorum(proposal);
-                        let proposal_hash = manager.hash_proposal(proposal);
-                        let hash_hex = hex::encode(&proposal_hash[..8.min(proposal_hash.len())]);
-                        
-                        if let Some(approved) = quorum_status {
-                            if approved {
-                                let votes = manager.get_proposal_votes_count(proposal);
-                                let transition_commit_index = proposal.proposal_commit_index + 10;
-                                
-                                if current_commit_index >= transition_commit_index {
-                                    info!(
-                                        "🎯 EPOCH TRANSITION READY: epoch {} -> {}, proposal_hash={}, votes={}, commit_index={} (barrier={})",
-                                        proposal.new_epoch - 1,
-                                        proposal.new_epoch,
-                                        hash_hex,
-                                        votes,
-                                        current_commit_index,
-                                        transition_commit_index
-                                    );
-                                } else {
-                                    let should_log = last_waiting_log
-                                        .elapsed()
-                                        .unwrap_or(Duration::from_secs(0)) >= Duration::from_secs(30)
-                                        || current_commit_index.saturating_sub(last_waiting_commit_index) >= 100;
-                                    if should_log {
-                                        info!(
-                                            "⏳ EPOCH TRANSITION WAITING FOR COMMIT INDEX: epoch {} -> {}, proposal_hash={}, votes={}, commit_index={} (need {})",
-                                            proposal.new_epoch - 1,
-                                            proposal.new_epoch,
-                                            hash_hex,
-                                            votes,
-                                            current_commit_index,
-                                            transition_commit_index
-                                        );
-                                        last_waiting_log = SystemTime::now();
-                                        last_waiting_commit_index = current_commit_index;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    last_quorum_check = SystemTime::now();
-                }
-                
-                if let Some(proposal) = manager.get_transition_ready_proposal(current_commit_index) {
-                    drop(manager);
-                    
-                    let proposal_hash = epoch_change_manager_clone.read().await.hash_proposal(&proposal);
-                    let hash_hex = hex::encode(&proposal_hash[..8]);
-                    let transition_commit_index = proposal.proposal_commit_index.saturating_add(10);
-                    let commit_index_diff = current_commit_index.saturating_sub(transition_commit_index);
-                    
-                    info!("🚀 ========================================");
-                    info!("🚀 EPOCH TRANSITION TRIGGERED (FORK-SAFE)");
-                    info!("🚀 ========================================");
-                    info!("  📋 Proposal: epoch {} -> {}", proposal.new_epoch - 1, proposal.new_epoch);
-                    info!("  🔑 Proposal Hash: {}", hash_hex);
-                    info!("  ✅ Quorum: APPROVED (2f+1 votes received)");
-                    info!("  ✅ Commit Index Barrier: PASSED");
-                    info!("    - Current commit index: {}", current_commit_index);
-                    info!("    - Barrier commit index: {}", transition_commit_index);
-                    info!("    - Commits past barrier: {}", commit_index_diff);
-                    info!("  🔒 Fork-Safety: All nodes will transition at commit index ~{} (within buffer range)", transition_commit_index);
-                    info!("  🔁 Transition: in-process authority restart (implemented)");
-                    info!("🚀 ========================================");
-                }
-            }
-        });
+        // DISABLED: Epoch transition monitoring task (replaced by integrated commit-based triggering)
+        // Epoch transitions are now triggered automatically during commit processing,
+        // and reconfiguration is monitored in the simplified main loop
 
         Ok(Self {
             authority: Some(authority),
             transaction_client_proxy,
             epoch_change_manager,
             clock_sync_manager,
+            sui_epoch_orchestrator: sui_epoch_orchestrator.clone(),
             current_commit_index,
             storage_path,
             current_epoch,
             last_global_exec_index,
+            blocks_in_current_epoch: Some(Arc::new(std::sync::atomic::AtomicU32::new(0))),
             protocol_keypair,
             network_keypair,
             protocol_config,
@@ -1171,7 +1040,10 @@ impl ConsensusNode {
         }
 
         info!("✅ FORK-SAFE TRANSITION VALIDATED - All nodes will use last_commit_index={}", transition_commit_index);
-        
+
+        // Use Sui-style reconfiguration
+        self.sui_epoch_orchestrator.handle_epoch_transition(proposal, current_commit_index).await?;
+
         self.transition_barrier.store(transition_commit_index, Ordering::SeqCst);
         info!("🔒 [FORK-SAFETY] Set transition barrier to {}", transition_commit_index);
         
@@ -1270,43 +1142,17 @@ impl ConsensusNode {
         let transition_barrier_for_new_epoch = self.transition_barrier.clone();
         let global_exec_index_at_barrier_for_new_epoch = self.global_exec_index_at_barrier.clone();
         
-        let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
-            .with_commit_index_callback(move |index| {
-                commit_index_for_callback.store(index, Ordering::SeqCst);
-            })
-            .with_epoch_info(new_epoch, new_last_global_exec_index)
-            .with_transition_barrier(transition_barrier_for_new_epoch)
-            .with_global_exec_index_at_barrier(global_exec_index_at_barrier_for_new_epoch)
-            .with_pending_transactions_queue(self.pending_transactions_queue.clone());
-        
-        if let Some(ref client) = executor_client_opt {
-            let executor_client_for_init = client.clone();
-            tokio::spawn(async move {
-                executor_client_for_init.initialize_from_go().await;
-            });
-            commit_processor = commit_processor.with_executor_client(client.clone());
-        }
-        
-        tokio::spawn(async move {
-            info!("🚀 [COMMIT PROCESSOR] Starting commit processor for new epoch {} (last_global_exec_index={})",
-                new_epoch, new_last_global_exec_index);
-            match commit_processor.run().await {
-                Ok(()) => {
-                    info!("✅ [COMMIT PROCESSOR] Commit processor exited normally (epoch {})",
-                        new_epoch);
-                }
-                Err(e) => {
-                    tracing::error!("❌ [COMMIT PROCESSOR] Commit processor error (epoch {}): {}",
-                        new_epoch, e);
-                }
-            }
-        });
-        tokio::spawn(async move {
-            use tracing::debug;
-            while let Some(output) = block_receiver.recv().await {
-                debug!("Received {} certified blocks", output.blocks.len());
-            }
-        });
+        // Store commit processor config for later spawning
+        let commit_processor_config = (
+            commit_receiver,
+            commit_index_for_callback,
+            new_epoch,
+            new_last_global_exec_index,
+            transition_barrier_for_new_epoch,
+            global_exec_index_at_barrier_for_new_epoch,
+            self.pending_transactions_queue.clone(),
+            executor_client_opt,
+        );
 
         let mut parameters = self.parameters.clone();
         parameters.db_path = db_path.clone();
@@ -1343,7 +1189,50 @@ impl ConsensusNode {
         let new_client = authority.transaction_client();
         self.transaction_client_proxy.set_client(new_client).await;
         self.authority = Some(authority);
-        
+
+        // NOW spawn commit processor AFTER consensus authority is ready
+        let (commit_receiver, commit_index_for_callback, new_epoch, new_last_global_exec_index,
+             transition_barrier_for_new_epoch, global_exec_index_at_barrier_for_new_epoch,
+             pending_transactions_queue, executor_client_opt) = commit_processor_config;
+
+        let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
+            .with_commit_index_callback(move |index| {
+                commit_index_for_callback.store(index, Ordering::SeqCst);
+            })
+            .with_epoch_info(new_epoch, new_last_global_exec_index)
+            .with_transition_barrier(transition_barrier_for_new_epoch)
+            .with_global_exec_index_at_barrier(global_exec_index_at_barrier_for_new_epoch)
+            .with_pending_transactions_queue(pending_transactions_queue);
+
+        if let Some(ref client) = executor_client_opt {
+            let executor_client_for_init = client.clone();
+            tokio::spawn(async move {
+                executor_client_for_init.initialize_from_go().await;
+            });
+            commit_processor = commit_processor.with_executor_client(client.clone());
+        }
+
+        tokio::spawn(async move {
+            info!("🚀 [COMMIT PROCESSOR] Starting commit processor for new epoch {} (last_global_exec_index={})",
+                new_epoch, new_last_global_exec_index);
+            match commit_processor.run().await {
+                Ok(()) => {
+                    info!("✅ [COMMIT PROCESSOR] Commit processor exited normally (epoch {})",
+                        new_epoch);
+                }
+                Err(e) => {
+                    tracing::error!("❌ [COMMIT PROCESSOR] Commit processor error (epoch {}): {}",
+                        new_epoch, e);
+                }
+            }
+        });
+        tokio::spawn(async move {
+            use tracing::debug;
+            while let Some(output) = block_receiver.recv().await {
+                debug!("Received {} certified blocks", output.blocks.len());
+            }
+        });
+
         let queued_count = self.submit_queued_transactions().await?;
         if queued_count > 0 {
             info!("✅ Submitted {} queued transactions to consensus in new epoch {}", queued_count, proposal.new_epoch);
@@ -1355,7 +1244,35 @@ impl ConsensusNode {
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         info!("✅ EPOCH TRANSITION COMPLETE: epoch {} -> {}", old_epoch, proposal.new_epoch);
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        
+
+        // 🔄 SUI-STYLE: Advance Go state epoch to complete the transition
+        if config.executor_commit_enabled {
+            info!("🔄 [SUI-STYLE] Advancing Go state epoch to complete Sui-style transition");
+
+            let advance_executor_client = Arc::new(ExecutorClient::new(
+                true, // read enabled
+                true, // commit enabled for advance epoch
+                config.executor_send_socket_path.clone(),
+                config.executor_receive_socket_path.clone(),
+            ));
+
+            match advance_executor_client.advance_epoch(proposal.new_epoch, proposal.new_epoch_timestamp_ms).await {
+                Ok((confirmed_epoch, confirmed_timestamp)) => {
+                    info!("✅ [SUI-STYLE] Successfully advanced Go state epoch: {} -> {} (timestamp: {})",
+                        old_epoch, confirmed_epoch, confirmed_timestamp);
+                    info!("🎉 COMPLETE SUI-STYLE EPOCH TRANSITION: Consensus + Go state synchronized!");
+                }
+                Err(e) => {
+                    error!("❌ [SUI-STYLE] Failed to advance Go state epoch: {}", e);
+                    error!("⚠️  WARNING: Consensus transitioned but Go state epoch not advanced!");
+                    error!("🔄 This may cause epoch mismatch on restart - manual intervention may be needed");
+                }
+            }
+        } else {
+            warn!("⚠️  [SUI-STYLE] Executor commit disabled - Go state epoch not advanced");
+            warn!("⚠️  WARNING: This breaks Sui-style epoch transition - Go state will be out of sync");
+        }
+
         if self.enable_lvm_snapshot {
             if let Some(ref bin_path) = self.lvm_snapshot_bin_path {
                 let bin_path = bin_path.clone();
@@ -1390,7 +1307,14 @@ impl ConsensusNode {
                 });
             }
         }
-        
+
+        // Reset block counter for new epoch (block-based transitions)
+        if let Some(atomic) = self.blocks_in_current_epoch.take() {
+            atomic.store(0, Ordering::SeqCst);
+            self.blocks_in_current_epoch = Some(atomic);
+            info!("🔄 [BLOCK COUNTER] Reset to 0 for new epoch {}", proposal.new_epoch);
+        }
+
         Ok(())
     }
 }

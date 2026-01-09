@@ -62,6 +62,18 @@ pub struct NodeConfig {
     /// Epoch duration in seconds (None = disabled, Some(86400) = 24h)
     #[serde(default)]
     pub epoch_duration_seconds: Option<u64>,
+    /// Block-based epoch change configuration
+    #[serde(default)]
+    pub block_based_epoch_change: bool,
+    /// Number of blocks per epoch (None = disabled, Some(1000) = 1000 blocks per epoch)
+    #[serde(default = "default_blocks_per_epoch")]
+    pub blocks_per_epoch: Option<u64>,
+    /// Checkpoint-based epoch change configuration (Sui-style)
+    #[serde(default)]
+    pub checkpoint_based_epochs: bool,
+    /// Number of checkpoints per epoch (None = disabled, Some(1000) = 1000 checkpoints per epoch)
+    #[serde(default = "default_checkpoints_per_epoch")]
+    pub checkpoints_per_epoch: Option<u64>,
     /// Max allowed clock drift in seconds (default: 5)
     #[serde(default = "default_max_clock_drift_seconds")]
     pub max_clock_drift_seconds: u64,
@@ -166,6 +178,14 @@ fn default_lvm_snapshot_delay_seconds() -> u64 {
     5 // Default delay: 5 seconds
 }
 
+fn default_blocks_per_epoch() -> Option<u64> {
+    Some(100) // Default: 100 blocks per epoch (reduced for faster testing)
+}
+
+fn default_checkpoints_per_epoch() -> Option<u64> {
+    Some(1000) // Default: 1000 checkpoints per epoch (Sui-style)
+}
+
 impl NodeConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
@@ -215,8 +235,12 @@ impl NodeConfig {
                 speed_multiplier: 0.2, // Default: 5x slower (0.2 = 1/5 speed)
                 leader_timeout_ms: None,
                 min_round_delay_ms: None,
-                time_based_epoch_change: true, // Enabled by default
-                epoch_duration_seconds: Some(180), // Default: 3 minutes (3 * 60 seconds)
+                time_based_epoch_change: false, // Disabled (using checkpoint-based)
+                epoch_duration_seconds: None, // Disabled (using checkpoint-based)
+                block_based_epoch_change: false, // Disabled (using checkpoint-based)
+                blocks_per_epoch: Some(100), // Default: 100 blocks per epoch
+                checkpoint_based_epochs: true, // Enabled by default (Sui-style)
+                checkpoints_per_epoch: None, // Not used (using blocks_per_epoch)
                 max_clock_drift_seconds: 5,
                 enable_ntp_sync: false, // Disabled by default (enable for production)
                 ntp_servers: default_ntp_servers(),

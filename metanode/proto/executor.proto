@@ -28,3 +28,5 @@ message CommittedEpochData {
     uint32 commit_index = 3;
 }
 
+// Sui-style epoch transition messages are defined in validator_rpc.proto
+

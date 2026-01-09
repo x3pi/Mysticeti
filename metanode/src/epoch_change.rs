@@ -472,6 +472,67 @@ impl EpochChangeManager {
         Ok(proposal)
     }
 
+    /// Propose epoch change to a specific target epoch (Sui-style: triggered by Go state changes)
+    pub fn propose_epoch_change_to_target_epoch(
+        &mut self,
+        target_epoch: u64,
+        new_epoch_timestamp_ms: u64,
+        proposal_commit_index: u32,
+        proposer: AuthorityIndex,
+        proposer_keypair: &ProtocolKeyPair,
+    ) -> Result<EpochChangeProposal> {
+        // Rate limiting removed - can be re-added if needed
+
+        // Validate target epoch
+        if target_epoch <= self.current_epoch {
+            return Err(anyhow::anyhow!("Target epoch {} must be greater than current epoch {}", target_epoch, self.current_epoch));
+        }
+
+        // Create proposal message to sign
+        let proposal_message = format!(
+            "epoch_change:{}:{}:{}:{}",
+            target_epoch,
+            new_epoch_timestamp_ms,
+            proposal_commit_index,
+            proposer.value()
+        );
+
+        // Sign proposal
+        let signature = proposer_keypair.sign(proposal_message.as_bytes());
+
+        let proposal = EpochChangeProposal::new(
+            target_epoch,
+            new_epoch_timestamp_ms,
+            proposal_commit_index,
+            proposer,
+            signature,
+        );
+
+        // Check for duplicate
+        let proposal_hash = self.hash_proposal(&proposal);
+        if self.seen_proposals.contains(&proposal_hash) {
+            return Err(EpochChangeError::DuplicateProposal.into());
+        }
+
+        // Store proposal
+        self.pending_proposals.insert(proposal_hash.clone(), proposal.clone());
+        self.seen_proposals.insert(proposal_hash.clone());
+        self.proposal_history.push(proposal.clone());
+
+        let hash_hex = hex::encode(&proposal_hash[..8]);
+        info!(
+            "📝 Sui-style epoch change proposal created: epoch {} -> {}, proposal_hash={}, proposer={}, commit_index={}, timestamp={} (triggered_by_go_state)",
+            self.current_epoch,
+            target_epoch,
+            hash_hex,
+            proposer.value(),
+            proposal_commit_index,
+            new_epoch_timestamp_ms
+        );
+
+        Ok(proposal)
+    }
+
     /// Get epoch start timestamp
     pub fn epoch_start_timestamp_ms(&self) -> u64 {
         self.epoch_start_timestamp_ms
