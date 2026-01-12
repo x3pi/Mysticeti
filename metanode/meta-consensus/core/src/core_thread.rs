@@ -491,6 +491,8 @@ mod test {
             dag_state.clone(),
             false,
             round_tracker,
+            None, // adaptive_delay_state - not used in tests
+            None, // system_transaction_provider - not used in tests
         );
 
         let (core_dispatcher, handle) =

@@ -22,6 +22,7 @@ use crate::{
     block::{BlockAPI, Slot, VerifiedBlock},
     leader_scoring::ReputationScores,
     storage::Store,
+    system_transaction::{SystemTransaction, extract_system_transaction},
 };
 
 /// Index of a commit among all consensus commits.
@@ -399,6 +400,37 @@ impl CommittedSubDag {
             reputation_scores_desc: vec![],
             rejected_transactions_by_block: BTreeMap::new(),
         }
+    }
+
+    /// Extract all system transactions from blocks in this committed sub-dag
+    /// Returns a vector of (block_ref, system_transaction) tuples
+    pub fn extract_system_transactions(&self) -> Vec<(BlockRef, SystemTransaction)> {
+        let mut system_txs = Vec::new();
+        
+        for block in &self.blocks {
+            for tx in block.transactions() {
+                if let Some(system_tx) = extract_system_transaction(tx.data()) {
+                    system_txs.push((block.reference(), system_tx));
+                }
+            }
+        }
+        
+        system_txs
+    }
+
+    /// Extract EndOfEpoch system transactions from this committed sub-dag
+    /// Returns the first EndOfEpoch transaction found (there should be at most one per commit)
+    pub fn extract_end_of_epoch_transaction(&self) -> Option<(BlockRef, SystemTransaction)> {
+        for block in &self.blocks {
+            for tx in block.transactions() {
+                if let Some(system_tx) = extract_system_transaction(tx.data()) {
+                    if system_tx.is_end_of_epoch() {
+                        return Some((block.reference(), system_tx));
+                    }
+                }
+            }
+        }
+        None
     }
 }
 

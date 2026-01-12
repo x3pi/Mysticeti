@@ -284,6 +284,7 @@ where
             sync_last_known_own_block,
             round_tracker.clone(),
             Some(adaptive_delay_state.clone()),
+            None, // system_transaction_provider - can be set later if needed
         );
 
         let (core_dispatcher, core_thread_handle) =

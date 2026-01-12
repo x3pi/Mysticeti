@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use consensus_core::{CommittedSubDag, BlockAPI};
+use consensus_core::{CommittedSubDag, BlockAPI, SystemTransaction};
 use mysten_metrics::monitored_mpsc::UnboundedReceiver;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -41,6 +41,12 @@ pub struct CommitProcessor {
     /// inside those commits must NOT be lost. We re-queue them here so that `ConsensusNode` can submit
     /// them deterministically after epoch transition.
     pending_transactions_queue: Option<Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>>,
+    /// Optional callback to handle EndOfEpoch system transactions
+    /// Called when an EndOfEpoch system transaction is detected in a committed sub-dag
+    epoch_transition_callback: Option<Arc<dyn Fn(u64, u64, u32) -> Result<()> + Send + Sync>>,
+    /// Track detected EndOfEpoch system transactions (commit_index -> (new_epoch, timestamp, transition_commit_index))
+    /// This allows us to trigger transition at the correct commit_index
+    pending_epoch_transitions: BTreeMap<u32, (u64, u64, u32)>,
 }
 
 impl CommitProcessor {
@@ -56,6 +62,8 @@ impl CommitProcessor {
             transition_barrier: None,
             global_exec_index_at_barrier: None,
             pending_transactions_queue: None,
+            epoch_transition_callback: None,
+            pending_epoch_transitions: BTreeMap::new(),
         }
     }
 
@@ -106,6 +114,16 @@ impl CommitProcessor {
         self
     }
 
+    /// Set callback to handle EndOfEpoch system transactions
+    /// The callback receives (new_epoch, new_epoch_timestamp_ms, transition_commit_index)
+    pub fn with_epoch_transition_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(u64, u64, u32) -> Result<()> + Send + Sync + 'static,
+    {
+        self.epoch_transition_callback = Some(Arc::new(callback));
+        self
+    }
+
     /// Process commits in order
     pub async fn run(self) -> Result<()> {
         let mut receiver = self.receiver;
@@ -118,6 +136,8 @@ impl CommitProcessor {
         let transition_barrier = self.transition_barrier;
         let global_exec_index_at_barrier = self.global_exec_index_at_barrier;
         let pending_transactions_queue = self.pending_transactions_queue;
+        let epoch_transition_callback = self.epoch_transition_callback;
+        let mut pending_epoch_transitions = self.pending_epoch_transitions;
         
         // Buffer for commits past barrier (will be sent as one block)
         // Track the last non-zero barrier we observed. This avoids a race where epoch transition
@@ -216,6 +236,80 @@ impl CommitProcessor {
                             commit_index,
                             last_global_exec_index,
                         );
+                        
+                        // Check for EndOfEpoch system transactions BEFORE processing commit
+                        // FORK-SAFETY: Store system transaction info and trigger transition at deterministic commit_index
+                        if let Some((_block_ref, system_tx)) = subdag.extract_end_of_epoch_transaction() {
+                            if let Some((new_epoch, new_epoch_timestamp_ms, _transition_commit_index_from_tx)) = system_tx.as_end_of_epoch() {
+                                info!(
+                                    "🎯 [SYSTEM TX] EndOfEpoch transaction detected in commit {}: epoch {} -> {}, transition_commit_index_from_tx={}",
+                                    commit_index, current_epoch, new_epoch, _transition_commit_index_from_tx
+                                );
+                                
+                                // FORK-SAFETY FIX: Use commit_index from the committed block (deterministic)
+                                // All nodes will see the same commit_index for this committed block
+                                // Add buffer to ensure all nodes have processed the system transaction
+                                // 
+                                // BUFFER SAFETY: Increased from 10 to 100 commits for high commit rate systems.
+                                // With commit rate 200 commits/s:
+                                // - 10 commits = 50ms (not safe for network propagation)
+                                // - 100 commits = 500ms (safer, allows network delay and processing time)
+                                // 
+                                // SAFETY: Use checked_add to handle overflow explicitly
+                                // If commit_index is too large (near u32::MAX), we use u32::MAX - 1 to ensure
+                                // transition can still be triggered, but log a warning.
+                                const COMMIT_INDEX_BUFFER: u32 = 100; // Increased from 10 for high commit rate safety
+                                let transition_commit_index = commit_index
+                                    .checked_add(COMMIT_INDEX_BUFFER)
+                                    .unwrap_or_else(|| {
+                                        warn!(
+                                            "⚠️ [FORK-SAFETY] commit_index {} từ committed block quá lớn (gần u32::MAX), \
+                                             không thể cộng buffer {}. Sử dụng u32::MAX - 1 làm transition_commit_index. \
+                                             Điều này có thể gây vấn đề nếu commit_index tiếp tục tăng.",
+                                            commit_index, COMMIT_INDEX_BUFFER
+                                        );
+                                        u32::MAX - 1
+                                    });
+                                
+                                info!(
+                                    "📊 [FORK-SAFETY] Storing EndOfEpoch transition: commit_index={}, transition_commit_index={} (commit_index + {}), new_epoch={}",
+                                    commit_index, transition_commit_index, COMMIT_INDEX_BUFFER, new_epoch
+                                );
+                                
+                                // Store for later transition
+                                pending_epoch_transitions.insert(commit_index, (new_epoch, new_epoch_timestamp_ms, transition_commit_index));
+                            }
+                        }
+                        
+                        // Check if we should trigger any pending epoch transitions
+                        // FORK-SAFETY: Trigger transition when commit_index >= transition_commit_index
+                        // This ensures all nodes transition at the same commit_index
+                        if let Some(ref callback) = epoch_transition_callback {
+                            // Check all pending transitions
+                            let transitions_to_trigger: Vec<(u32, u64, u64, u32)> = pending_epoch_transitions
+                                .iter()
+                                .filter(|(detected_commit_index, (_new_epoch, _timestamp, transition_commit_index))| {
+                                    commit_index >= *transition_commit_index
+                                })
+                                .map(|(detected_commit_index, (new_epoch, timestamp, transition_commit_index))| {
+                                    (*detected_commit_index, *new_epoch, *timestamp, *transition_commit_index)
+                                })
+                                .collect();
+                            
+                            for (detected_commit_index, new_epoch, new_epoch_timestamp_ms, transition_commit_index) in transitions_to_trigger {
+                                info!(
+                                    "🚀 [EPOCH TRANSITION] Triggering epoch transition from system transaction: detected_at={}, current_commit={}, transition_commit_index={}, new_epoch={}",
+                                    detected_commit_index, commit_index, transition_commit_index, new_epoch
+                                );
+                                
+                                if let Err(e) = callback(new_epoch, new_epoch_timestamp_ms, transition_commit_index) {
+                                    warn!("❌ Failed to trigger epoch transition from system transaction: {}", e);
+                                } else {
+                                    // Remove from pending after successful trigger
+                                    pending_epoch_transitions.remove(&detected_commit_index);
+                                }
+                            }
+                        }
                         
                         // Process commit normally (not past barrier, already verified above)
                         Self::process_commit(&subdag, global_exec_index, current_epoch, executor_client.clone(), transition_barrier.clone(), global_exec_index_at_barrier.clone(), pending_transactions_queue.clone()).await?;

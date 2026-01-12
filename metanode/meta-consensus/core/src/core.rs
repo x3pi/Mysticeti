@@ -48,6 +48,7 @@ use crate::{
     leader_schedule::LeaderSchedule,
     round_tracker::PeerRoundTracker,
     stake_aggregator::{QuorumThreshold, StakeAggregator},
+    system_transaction_provider::SystemTransactionProvider,
     transaction::TransactionConsumer,
     transaction_certifier::TransactionCertifier,
     universal_committer::{
@@ -116,6 +117,9 @@ pub(crate) struct Core {
     round_tracker: Arc<RwLock<PeerRoundTracker>>,
     /// Adaptive delay state for automatically adjusting node speed based on network average
     adaptive_delay_state: Option<Arc<AdaptiveDelayState>>,
+    /// System transaction provider (for EndOfEpoch transactions)
+    /// None if using legacy Proposal/Vote/Quorum mechanism
+    system_transaction_provider: Option<Arc<dyn SystemTransactionProvider>>,
 }
 
 impl Core {
@@ -132,6 +136,7 @@ impl Core {
         sync_last_known_own_block: bool,
         round_tracker: Arc<RwLock<PeerRoundTracker>>,
         adaptive_delay_state: Option<Arc<AdaptiveDelayState>>,
+        system_transaction_provider: Option<Arc<dyn SystemTransactionProvider>>,
     ) -> Self {
         let last_decided_leader = dag_state.read().last_commit_leader();
         let number_of_leaders = context
@@ -199,6 +204,7 @@ impl Core {
             ancestor_state_manager,
             round_tracker,
             adaptive_delay_state,
+            system_transaction_provider,
         }
         .recover()
     }
@@ -636,7 +642,58 @@ impl Core {
 
         // Consume the next transactions to be included. Do not drop the guards yet as this would acknowledge
         // the inclusion of transactions. Just let this be done in the end of the method.
-        let (transactions, ack_transactions, _limit_reached) = self.transaction_consumer.next();
+        let (mut transactions, ack_transactions, _limit_reached) = self.transaction_consumer.next();
+        
+        // Inject system transactions (e.g., EndOfEpoch) if provider is available
+        // FORK-SAFETY: Only inject system transactions when this node is the leader
+        // This ensures only one node creates the system transaction, preventing forks
+        // from multiple nodes creating different system transactions
+        if let Some(provider) = &self.system_transaction_provider {
+            // CRITICAL FORK-SAFETY: Only leader should inject system transactions
+            // Check if this node is the leader for this round
+            let leader_for_round = self.first_leader(clock_round);
+            let is_leader = leader_for_round == self.context.own_index;
+            
+            if is_leader {
+                let current_epoch = self.context.committee.epoch();
+                // Get current commit index from dag_state
+                let current_commit_index = self.dag_state.read().last_commit_index();
+                
+                if let Some(system_txs) = provider.get_system_transactions(current_epoch, current_commit_index) {
+                    // Convert system transactions to regular transactions
+                    let system_transactions: Vec<crate::block::Transaction> = system_txs
+                        .into_iter()
+                        .filter_map(|stx| {
+                            stx.to_bytes()
+                                .map(|bytes| crate::block::Transaction::new(bytes))
+                                .ok()
+                        })
+                        .collect();
+                    
+                    if !system_transactions.is_empty() {
+                        tracing::info!(
+                            "📝 Injecting {} system transaction(s) into block (epoch={}, commit_index={})",
+                            system_transactions.len(),
+                            current_epoch,
+                            current_commit_index
+                        );
+                        // Insert system transactions at the beginning
+                        let mut all_transactions = system_transactions;
+                        all_transactions.extend(transactions);
+                        transactions = all_transactions;
+                    }
+                }
+            } else {
+                // Not leader - don't inject system transactions
+                // Other nodes will receive the system transaction from the leader's block
+                tracing::debug!(
+                    "⏭️ Skipping system transaction injection: not leader for round {} (leader={})",
+                    clock_round,
+                    leader_for_round.value()
+                );
+            }
+        }
+        
         self.context
             .metrics
             .node_metrics

@@ -37,6 +37,8 @@ pub mod storage;
 mod subscriber;
 mod synchronizer;
 mod threshold_clock;
+mod system_transaction;
+mod system_transaction_provider;
 mod transaction;
 mod transaction_certifier;
 mod universal_committer;
@@ -62,6 +64,8 @@ pub use epoch_change_provider::EpochChangeProcessor;
 /// Exported API for testing and tools.
 pub use block::{TestBlock, Transaction, VerifiedBlock};
 pub use commit::{CommitAPI, CommitDigest, CommitIndex, CommitRange, CommitRef, CommittedSubDag};
+pub use system_transaction::{SystemTransaction, SystemTransactionKind};
+pub use system_transaction_provider::{SystemTransactionProvider, DefaultSystemTransactionProvider};
 pub use commit_consumer::{CommitConsumerArgs, CommitConsumerMonitor};
 pub use context::Clock;
 pub use metrics::Metrics;
