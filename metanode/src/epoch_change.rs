@@ -1074,12 +1074,27 @@ impl EpochChangeManager {
         }
         // #endregion
 
-        // SIMPLE CATCH-UP LOGIC: Nếu node lag quá xa (epoch khác > current_epoch + 2),
+        // SIMPLE CATCH-UP LOGIC: Nếu node lag quá xa (epoch khác >= current_epoch + 1),
         // cho phép transition mà không cần quorum để catch-up nhanh
         // Điều này đảm bảo node không bị stuck khi các nodes khác đã tiến xa
+        // FIX: Lowered threshold from > 2 to >= 1 to allow catch-up when even 1 epoch behind
         let epoch_lag = proposal.new_epoch.saturating_sub(self.current_epoch);
-        const MAX_EPOCH_LAG_FOR_QUORUM: u64 = 2; // Nếu lag > 2 epochs, không cần quorum
-        let is_catchup_mode = epoch_lag > MAX_EPOCH_LAG_FOR_QUORUM;
+        const MAX_EPOCH_LAG_FOR_QUORUM: u64 = 1; // Nếu lag >= 1 epoch, không cần quorum (lowered from 2)
+        let is_catchup_by_epoch_lag = epoch_lag >= MAX_EPOCH_LAG_FOR_QUORUM;
+        
+        // Also enable catch-up if quorum is None and proposal is old (indicates we're behind)
+        // This handles the case where we can't get votes because other nodes have moved on
+        let now_seconds_for_catchup = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let proposal_age_seconds_for_catchup = now_seconds_for_catchup.saturating_sub(proposal.created_at_seconds);
+        const CATCHUP_TIMEOUT_SECONDS: u64 = 120; // 2 minutes - if no quorum for this long, likely behind
+        let is_catchup_by_timeout = quorum_status.is_none() 
+            && proposal_age_seconds_for_catchup >= CATCHUP_TIMEOUT_SECONDS
+            && epoch_lag >= 1;
+        
+        let is_catchup_mode = is_catchup_by_epoch_lag || is_catchup_by_timeout;
 
         // #region agent log
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
@@ -1126,17 +1141,32 @@ impl EpochChangeManager {
         
         // CATCH-UP MODE: Log khi cho phép transition mà không cần quorum
         if is_catchup_mode && !quorum_reached {
-            tracing::warn!(
-                "🚀 CATCH-UP MODE: Allowing transition without quorum - epoch {} -> {} (lag={} epochs, max_lag={})",
-                proposal.new_epoch - 1,
-                proposal.new_epoch,
-                epoch_lag,
-                MAX_EPOCH_LAG_FOR_QUORUM
-            );
-            tracing::warn!(
-                "   ⚠️  Node is lagging behind - other nodes are at epoch {} or higher",
-                proposal.new_epoch
-            );
+            if is_catchup_by_timeout {
+                tracing::warn!(
+                    "🚀 CATCH-UP MODE (TIMEOUT): Allowing transition without quorum - epoch {} -> {} (lag={} epochs, proposal_age={}s, no quorum for {}s)",
+                    proposal.new_epoch - 1,
+                    proposal.new_epoch,
+                    epoch_lag,
+                    proposal_age_seconds_for_catchup,
+                    CATCHUP_TIMEOUT_SECONDS
+                );
+                tracing::warn!(
+                    "   ⚠️  Node is lagging behind - no quorum votes received (other nodes likely at epoch {} or higher)",
+                    proposal.new_epoch
+                );
+            } else {
+                tracing::warn!(
+                    "🚀 CATCH-UP MODE: Allowing transition without quorum - epoch {} -> {} (lag={} epochs, max_lag={})",
+                    proposal.new_epoch - 1,
+                    proposal.new_epoch,
+                    epoch_lag,
+                    MAX_EPOCH_LAG_FOR_QUORUM
+                );
+                tracing::warn!(
+                    "   ⚠️  Node is lagging behind - other nodes are at epoch {} or higher",
+                    proposal.new_epoch
+                );
+            }
             tracing::warn!(
                 "   ✅ Allowing transition to catch up (fork-safe: using commit index barrier)"
             );
