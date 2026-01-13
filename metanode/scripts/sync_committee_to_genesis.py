@@ -136,6 +136,28 @@ def sync_committee_to_genesis(committee_path: str, genesis_path: str):
     else:
         print(f"  ⚠️  No stake found, keeping existing values")
 
+    # CRITICAL: Update epoch_timestamp_ms với current time nếu chưa có hoặc quá cũ
+    # Điều này đảm bảo epoch duration được tính từ thời điểm hiện tại
+    import time
+    current_timestamp_ms = int(time.time() * 1000)
+    
+    if 'config' not in final_genesis:
+        final_genesis['config'] = {}
+    
+    existing_timestamp = final_genesis['config'].get('epoch_timestamp_ms')
+    if existing_timestamp is None:
+        # Chưa có timestamp - set current time
+        final_genesis['config']['epoch_timestamp_ms'] = current_timestamp_ms
+        print(f"  📅 Set epoch_timestamp_ms: {current_timestamp_ms} (was not set)")
+    else:
+        # Có timestamp - check nếu quá cũ (hơn 1 giờ)
+        elapsed_seconds = (current_timestamp_ms - existing_timestamp) / 1000
+        if elapsed_seconds > 3600:  # Hơn 1 giờ
+            print(f"  ⚠️  Existing epoch_timestamp_ms is {elapsed_seconds:.0f}s old, updating to current time")
+            final_genesis['config']['epoch_timestamp_ms'] = current_timestamp_ms
+        else:
+            print(f"  📅 Keeping existing epoch_timestamp_ms: {existing_timestamp} (elapsed: {elapsed_seconds:.0f}s)")
+    
     # ĐẢM BẢO các trường khác được giữ nguyên
     # alloc, config, etc. đã được copy từ genesis gốc
 

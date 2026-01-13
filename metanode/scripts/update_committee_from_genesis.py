@@ -72,12 +72,31 @@ def update_committee_from_genesis():
     with open(committee_file, 'w') as f:
         json.dump(committee, f, indent=2)
 
-    # Update genesis.json với epoch_timestamp_ms từ committee.json nếu cần
-    if genesis.get('config', {}).get('epoch_timestamp_ms') is None:
-        genesis['config']['epoch_timestamp_ms'] = committee.get('epoch_timestamp_ms', int(time.time() * 1000))
+    # CRITICAL: Update epoch_timestamp_ms trong genesis.json với current time
+    # Điều này đảm bảo epoch duration được tính từ thời điểm hiện tại, không phải timestamp cũ
+    current_timestamp_ms = int(time.time() * 1000)
+    
+    if 'config' not in genesis:
+        genesis['config'] = {}
+    
+    existing_timestamp = genesis['config'].get('epoch_timestamp_ms')
+    if existing_timestamp is None:
+        # Chưa có timestamp - set current time
+        genesis['config']['epoch_timestamp_ms'] = current_timestamp_ms
+        print(f"✅ Set epoch_timestamp_ms: {current_timestamp_ms} (was not set)")
         with open(genesis_file, 'w') as f:
             json.dump(genesis, f, indent=2)
-        print(f"✅ Updated genesis.json với epoch_timestamp_ms: {genesis['config']['epoch_timestamp_ms']}")
+    else:
+        # Có timestamp - check nếu quá cũ (hơn 1 giờ) thì update
+        elapsed_seconds = (current_timestamp_ms - existing_timestamp) / 1000
+        if elapsed_seconds > 3600:  # Hơn 1 giờ
+            print(f"⚠️  Existing epoch_timestamp_ms is {elapsed_seconds:.0f}s old, updating to current time")
+            genesis['config']['epoch_timestamp_ms'] = current_timestamp_ms
+            with open(genesis_file, 'w') as f:
+                json.dump(genesis, f, indent=2)
+            print(f"✅ Updated epoch_timestamp_ms: {existing_timestamp} -> {current_timestamp_ms}")
+        else:
+            print(f"📅 Keeping existing epoch_timestamp_ms: {existing_timestamp} (elapsed: {elapsed_seconds:.0f}s)")
 
     print("✅ Updated committee.json và genesis.json với stake từ delegator_stakes")
     return True

@@ -753,18 +753,58 @@ impl ConsensusNode {
         queue.clear();
         drop(queue);
         
+        // Submit transactions with retry mechanism
+        // Retry failed submissions with exponential backoff to handle fast epoch transitions
+        // Submit transactions with retry mechanism
+        // Retry failed submissions with exponential backoff to handle fast epoch transitions
+        const MAX_RETRIES: u32 = 5;
+        const INITIAL_RETRY_DELAY_MS: u64 = 100;
+        let mut successful_count = 0;
+        let mut requeued_count = 0;
+        
         for tx_data in transactions {
-            let transactions_vec = vec![tx_data];
-            if let Err(e) = self.transaction_client_proxy.submit(transactions_vec).await {
-                warn!("❌ [TX FLOW] Failed to submit queued transaction: {}", e);
+            let transactions_vec = vec![tx_data.clone()];
+            let mut retry_count = 0;
+            
+            while retry_count < MAX_RETRIES {
+                match self.transaction_client_proxy.submit(transactions_vec.clone()).await {
+                    Ok(_) => {
+                        successful_count += 1;
+                        break;
+                    },
+                    Err(e) => {
+                        retry_count += 1;
+                        if retry_count < MAX_RETRIES {
+                            let delay_ms = INITIAL_RETRY_DELAY_MS * (1 << (retry_count - 1)); // Exponential backoff
+                            warn!("⚠️ [TX FLOW] Failed to submit queued transaction (attempt {}/{}): {}. Retrying in {}ms...", 
+                                retry_count, MAX_RETRIES, e, delay_ms);
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        } else {
+                            error!("❌ [TX FLOW] Failed to submit queued transaction after {} retries: {}", MAX_RETRIES, e);
+                            // Transaction failed after all retries - put it back in queue for next attempt
+                            let mut queue = self.pending_transactions_queue.lock().await;
+                            queue.push(tx_data.clone());
+                            requeued_count += 1;
+                            break; // Exit retry loop since we've exhausted all retries
+                        }
+                    }
+                }
             }
         }
         
-        info!(
-            "✅ [TX FLOW] Submitted {} queued transactions to consensus in deterministic order",
-            unique_count
-        );
-        Ok(unique_count)
+        if successful_count > 0 {
+            info!(
+                "✅ [TX FLOW] Successfully submitted {}/{} queued transactions to consensus in deterministic order",
+                successful_count, unique_count
+            );
+        }
+        
+        if requeued_count > 0 {
+            warn!("⚠️ [TX FLOW] {} transactions failed to submit after {} retries. They have been re-queued for next epoch transition.", 
+                requeued_count, MAX_RETRIES);
+        }
+        
+        Ok(successful_count)
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -1054,7 +1094,7 @@ impl ConsensusNode {
             }
             
             if elapsed >= MAX_WAIT_FOR_END_OF_EPOCH_SECS {
-                warn!("  ⚠️ [EPOCH TRANSITION] Timeout waiting for commit processor to reach EndOfEpoch commit_index={} (current={}, waited {}s). Using current commit_index for last_global_exec_index calculation.", 
+                warn!("  ⚠️ [EPOCH TRANSITION] Timeout waiting for commit processor to reach EndOfEpoch commit_index={} (current={}, waited {}s). Using commit_index from EndOfEpoch transaction for deterministic last_global_exec_index calculation.", 
                     commit_index, current, MAX_WAIT_FOR_END_OF_EPOCH_SECS);
                 break;
             }
@@ -1062,9 +1102,16 @@ impl ConsensusNode {
             tokio::time::sleep(Duration::from_millis(100)).await; // Reduced from 200ms to 100ms for faster check
         }
         
-        // CRITICAL FIX: Use the actual commit_index that commit processor has processed,
-        // not the EndOfEpoch commit_index. This ensures last_global_exec_index is accurate.
+        // CRITICAL FIX: Use commit_index from EndOfEpoch transaction (deterministic)
+        // NOT actual_processed_commit_index which may differ between nodes if commit processor
+        // runs at different speeds. All nodes will see the same commit_index from the committed
+        // block containing EndOfEpoch transaction, ensuring deterministic last_global_exec_index.
+        // 
+        // Note: We wait for commit processor to catch up above, but even if it doesn't fully
+        // catch up (timeout), we still use commit_index from EndOfEpoch transaction to ensure
+        // all nodes calculate the same last_global_exec_index_at_transition.
         let actual_processed_commit_index = self.current_commit_index.load(Ordering::SeqCst);
+        
         // #region agent log
         {
             use std::io::Write;
@@ -1077,25 +1124,29 @@ impl ConsensusNode {
             }
         }
         // #endregion
+        
+        // FORK-SAFETY: Use commit_index from EndOfEpoch transaction (deterministic across all nodes)
+        // This ensures all nodes calculate the same last_global_exec_index_at_transition
         let last_global_exec_index_at_transition = calculate_global_exec_index(
             old_epoch,
-            actual_processed_commit_index,
+            commit_index,  // ✅ Use commit_index from EndOfEpoch transaction (deterministic)
             self.last_global_exec_index,
         );
+        
         // #region agent log
         {
             use std::io::Write;
             let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"node.rs:1009","message":"AFTER calculate last_global_exec_index_at_transition","data":{{"old_epoch":{},"actual_processed_commit_index":{},"last_global_exec_index_at_transition":{},"hypothesisId":"D"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"node.rs:1009","message":"AFTER calculate last_global_exec_index_at_transition","data":{{"old_epoch":{},"commit_index_from_endofepoch":{},"last_global_exec_index_at_transition":{},"hypothesisId":"D"}},"sessionId":"debug-session","runId":"run1"}}"#, 
                     ts.as_secs(), ts.as_nanos() % 1000000,
                     ts.as_millis(),
-                    old_epoch, actual_processed_commit_index, last_global_exec_index_at_transition);
+                    old_epoch, commit_index, last_global_exec_index_at_transition);
             }
         }
         // #endregion
-        info!("📊 [SNAPSHOT] Last block of epoch {}: actual_processed_commit_index={}, global_exec_index={}", 
-            old_epoch, actual_processed_commit_index, last_global_exec_index_at_transition);
+        info!("📊 [SNAPSHOT] Last block of epoch {}: commit_index={} (from EndOfEpoch), actual_processed={}, global_exec_index={}", 
+            old_epoch, commit_index, actual_processed_commit_index, last_global_exec_index_at_transition);
         
         // OPTIMIZED: Reduced graceful shutdown time for faster transition
         // Just a brief pause to ensure clean shutdown
@@ -1340,8 +1391,17 @@ impl ConsensusNode {
         self.transaction_client_proxy.set_client(new_client).await;
         self.authority = Some(authority);
         
-        // CRITICAL: Submit queued transactions IMMEDIATELY after new authority is ready
-        // This ensures transactions are not stuck in queue and can be processed right away
+        // CRITICAL: Wait a short time to ensure new authority is fully ready before submitting transactions
+        // This prevents transactions from being lost if epoch transition is too fast
+        // Authority needs time to initialize network connections, start consensus, etc.
+        const AUTHORITY_READY_DELAY_MS: u64 = 500; // 500ms delay to ensure authority is ready
+        info!("⏳ [EPOCH TRANSITION] Waiting {}ms for new authority to be fully ready before submitting queued transactions...", 
+            AUTHORITY_READY_DELAY_MS);
+        tokio::time::sleep(Duration::from_millis(AUTHORITY_READY_DELAY_MS)).await;
+        info!("✅ [EPOCH TRANSITION] Authority should be ready now, submitting queued transactions...");
+        
+        // CRITICAL: Submit queued transactions with retry mechanism
+        // This ensures transactions are not lost even if authority is not immediately ready
         let queue_size_before = {
             let queue = self.pending_transactions_queue.lock().await;
             queue.len()
@@ -1349,10 +1409,11 @@ impl ConsensusNode {
         info!("📦 [EPOCH TRANSITION] Queue size before submitting: {}", queue_size_before);
         
         if queue_size_before > 0 {
-            info!("🚀 [EPOCH TRANSITION] Submitting {} queued transactions immediately to new epoch {}...", 
+            info!("🚀 [EPOCH TRANSITION] Submitting {} queued transactions to new epoch {}...", 
                 queue_size_before, new_epoch);
         }
         
+        // Submit with retry mechanism to handle cases where authority is not immediately ready
         let queued_count = self.submit_queued_transactions().await?;
         if queued_count > 0 {
             info!("✅ [EPOCH TRANSITION] Submitted {} queued transactions to consensus in new epoch {} (transactions are now being processed)", 

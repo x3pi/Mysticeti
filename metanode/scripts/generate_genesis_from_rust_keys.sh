@@ -50,12 +50,16 @@ generate_bls_authority_key() {
     esac
 }
 
-# Start genesis.json
-cat > "$OUTPUT_FILE" << 'EOF'
+# Get current timestamp in milliseconds for epoch_timestamp_ms
+CURRENT_TIMESTAMP_MS=$(python3 -c "import time; print(int(time.time() * 1000))" 2>/dev/null || echo "$(date +%s)000")
+
+# Start genesis.json with current epoch_timestamp_ms
+cat > "$OUTPUT_FILE" << EOF
 {
   "config": {
     "chainId": 991,
-    "epoch": 0
+    "epoch": 0,
+    "epoch_timestamp_ms": ${CURRENT_TIMESTAMP_MS}
   },
   "validators": [
 EOF

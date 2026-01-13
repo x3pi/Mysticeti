@@ -100,11 +100,44 @@ impl DefaultSystemTransactionProvider {
     }
 
     /// Update current epoch (called after epoch transition)
+    /// CRITICAL: Ensure epoch_start_timestamp_ms is not in the past
+    /// If new_timestamp_ms is in the past (due to consensus delay), use current time instead
     pub async fn update_epoch(&self, new_epoch: Epoch, new_timestamp_ms: u64) {
         // Use blocking write from async context (safe - we're not blocking the runtime thread)
         *self.current_epoch.write().unwrap() = new_epoch;
-        *self.epoch_start_timestamp_ms.write().unwrap() = new_timestamp_ms;
+        
+        // CRITICAL FIX: If new_timestamp_ms is in the past (due to consensus delay),
+        // use current time instead to prevent immediate epoch transition
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        // If new_timestamp_ms is more than 1 second in the past, use current time
+        // This prevents rapid epoch transitions when consensus has delays
+        let adjusted_timestamp_ms = if new_timestamp_ms < now_ms.saturating_sub(1000) {
+            warn!(
+                "⚠️  [EPOCH TIMING] SystemTransactionProvider::update_epoch: new_timestamp_ms {}ms is in the past (now={}ms, diff={}ms). \
+                 Using current time instead to prevent immediate epoch transition.",
+                new_timestamp_ms,
+                now_ms,
+                now_ms.saturating_sub(new_timestamp_ms)
+            );
+            now_ms
+        } else {
+            new_timestamp_ms
+        };
+        
+        *self.epoch_start_timestamp_ms.write().unwrap() = adjusted_timestamp_ms;
         *self.last_checked_commit_index.write().unwrap() = 0;
+        
+        info!(
+            "📅 SystemTransactionProvider::update_epoch: epoch={}, epoch_start_timestamp_ms={}ms (from new_timestamp_ms={}ms, now={}ms)",
+            new_epoch,
+            adjusted_timestamp_ms,
+            new_timestamp_ms,
+            now_ms
+        );
     }
 
     /// Check if epoch transition should be triggered
@@ -221,29 +254,29 @@ impl SystemTransactionProvider for DefaultSystemTransactionProvider {
         // FORK-SAFETY FIX: Use deterministic timestamp calculation
         // Instead of SystemTime::now(), use epoch_start + epoch_duration
         // This ensures all nodes calculate the same timestamp
-        // BUT: If epoch_start is too old, use current time to prevent rapid transitions
+        // CRITICAL: Always use deterministic calculation to prevent fork
+        // If epoch_start is too old, we still use deterministic calculation
+        // (rapid transitions are acceptable if epoch_start is incorrect)
         let epoch_start = *self.epoch_start_timestamp_ms.read().unwrap();
+        
+        // Calculate expected timestamp (deterministic)
+        let new_epoch_timestamp_ms = epoch_start + (self.epoch_duration_seconds * 1000);
+        
+        // Log warning if timestamp seems incorrect (but still use deterministic value)
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
         
-        // Calculate expected timestamp
-        let expected_timestamp = epoch_start + (self.epoch_duration_seconds * 1000);
-        
-        // If expected timestamp is in the past (more than 1 second), use current time
-        // This prevents rapid epoch transitions when system starts with old timestamp
-        let new_epoch_timestamp_ms = if expected_timestamp < now_ms.saturating_sub(1000) {
+        if new_epoch_timestamp_ms < now_ms.saturating_sub(1000) {
             warn!(
-                "⚠️  SystemTransactionProvider: Expected timestamp {}ms is in the past (now={}ms, diff={}ms). Using current time to prevent rapid transitions.",
-                expected_timestamp,
+                "⚠️  [FORK-SAFETY] SystemTransactionProvider: Expected timestamp {}ms is in the past (now={}ms, diff={}ms). \
+                 Using deterministic timestamp anyway to prevent fork. If epoch_start is incorrect, epoch transitions may be rapid.",
+                new_epoch_timestamp_ms,
                 now_ms,
-                now_ms.saturating_sub(expected_timestamp)
+                now_ms.saturating_sub(new_epoch_timestamp_ms)
             );
-            now_ms
-        } else {
-            expected_timestamp
-        };
+        }
 
         // FORK-SAFETY WARNING: transition_commit_index may differ between nodes
         // if they have different current_commit_index values.

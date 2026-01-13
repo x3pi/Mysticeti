@@ -441,6 +441,59 @@ fi
 
 print_info "✅ Đã tạo keys, node configs và genesis.json đồng bộ"
 
+# Step 4.0.3: CRITICAL - Update epoch_timestamp_ms trong genesis.json với current time
+# Điều này đảm bảo epoch duration được tính từ thời điểm hiện tại, không phải timestamp cũ
+print_step "Bước 4.0.3: Cập nhật epoch_timestamp_ms trong genesis.json với current time..."
+
+GENESIS_TARGET="$GO_PROJECT_ROOT/cmd/simple_chain/genesis.json"
+if [ -f "$GENESIS_TARGET" ]; then
+    # Get current timestamp in milliseconds
+    CURRENT_TIMESTAMP_MS=$(python3 -c "import time; print(int(time.time() * 1000))")
+    
+    print_info "📅 Cập nhật epoch_timestamp_ms = $CURRENT_TIMESTAMP_MS (current time) trong genesis.json..."
+    
+    # Update epoch_timestamp_ms using Python (more reliable than sed for JSON)
+    python3 << EOF
+import json
+import sys
+
+genesis_path = "$GENESIS_TARGET"
+current_timestamp_ms = $CURRENT_TIMESTAMP_MS
+
+try:
+    with open(genesis_path, 'r') as f:
+        genesis = json.load(f)
+    
+    # Ensure config section exists
+    if 'config' not in genesis:
+        genesis['config'] = {}
+    
+    old_timestamp = genesis['config'].get('epoch_timestamp_ms')
+    genesis['config']['epoch_timestamp_ms'] = current_timestamp_ms
+    
+    with open(genesis_path, 'w') as f:
+        json.dump(genesis, f, indent=2)
+    
+    if old_timestamp:
+        print(f"✅ Updated epoch_timestamp_ms: {old_timestamp} -> {current_timestamp_ms}")
+    else:
+        print(f"✅ Set epoch_timestamp_ms: {current_timestamp_ms} (was not set)")
+    
+except Exception as e:
+    print(f"❌ Error updating epoch_timestamp_ms: {e}", file=sys.stderr)
+    sys.exit(1)
+EOF
+    
+    if [ $? -eq 0 ]; then
+        print_info "✅ Đã cập nhật epoch_timestamp_ms trong genesis.json"
+        print_info "   💡 Epoch duration sẽ được tính từ thời điểm này, không phải timestamp cũ"
+    else
+        print_warn "⚠️  Không thể cập nhật epoch_timestamp_ms, nhưng sẽ tiếp tục..."
+    fi
+else
+    print_warn "⚠️  Genesis.json chưa tồn tại, bỏ qua cập nhật epoch_timestamp_ms"
+fi
+
 # Step 4.0.5: Configure LVM snapshot - chỉ node 0 tạo snapshot, các node khác không tạo
 print_info "📸 Cấu hình LVM snapshot: chỉ node 0 tạo snapshot, các node khác không tạo..."
 
