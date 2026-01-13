@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::fmt;
+use std::io::Write;
 use tracing::{info, warn};
 use thiserror::Error;
 use bcs;
@@ -590,6 +591,14 @@ impl EpochChangeManager {
                 );
             }
             
+            // #region agent log
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"epoch_change.rs:check_proposal_quorum:no_votes","message":"No votes found for proposal","data":{{"proposal_hash":"{}","total_proposals":{}}},"timestamp":{}}}"#, 
+                    proposal_hash_hex, self.proposal_votes.len(), ts);
+            }
+            // #endregion
+            
             return None;
         }
         
@@ -623,6 +632,14 @@ impl EpochChangeManager {
             .sum();
 
         let quorum_threshold = self.committee.quorum_threshold();
+
+        // #region agent log
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"epoch_change.rs:check_proposal_quorum:vote_count","message":"Vote counting","data":{{"approve_stake":{},"reject_stake":{},"quorum_threshold":{},"total_stake":{},"committee_size":{},"vote_count":{}}},"timestamp":{}}}"#, 
+                approve_stake, reject_stake, quorum_threshold, self.committee.total_stake(), self.committee.size(), votes.len(), ts);
+        }
+        // #endregion
 
         // Check quorum approve
         if approve_stake >= quorum_threshold {
@@ -1017,9 +1034,24 @@ impl EpochChangeManager {
         proposal: &EpochChangeProposal,
         current_commit_index: u32,
     ) -> bool {
+        // #region agent log
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"epoch_change.rs:should_transition:entry","message":"should_transition called","data":{{"current_epoch":{},"proposal_new_epoch":{},"current_commit_index":{},"proposal_commit_index":{}}},"timestamp":{}}}"#, 
+                self.current_epoch, proposal.new_epoch, current_commit_index, proposal.proposal_commit_index, ts);
+        }
+        // #endregion
 
         // SINGLE NODE BYPASS: For local development, allow single node to transition
         let is_single_node = std::env::var("SINGLE_NODE").unwrap_or_default() == "1";
+        // #region agent log
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"epoch_change.rs:should_transition:single_node_check","message":"SINGLE_NODE env check","data":{{"is_single_node":{}}},"timestamp":{}}}"#, 
+                is_single_node, ts);
+        }
+        // #endregion
         if is_single_node {
             tracing::warn!("🔸 SINGLE_NODE=1 detected - Single node mode: bypassing all safety checks");
             tracing::warn!("⚠️  WARNING: This should NEVER be used in production - can cause forks!");
@@ -1033,6 +1065,15 @@ impl EpochChangeManager {
             .map(|approved| approved)
             .unwrap_or(false);
 
+        // #region agent log
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let qs = format!("{:?}", quorum_status);
+            let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"epoch_change.rs:should_transition:quorum_check","message":"Quorum status check","data":{{"quorum_status":"{}","quorum_reached":{},"committee_size":{},"total_stake":{},"quorum_threshold":{}}},"timestamp":{}}}"#, 
+                qs, quorum_reached, self.committee.size(), self.committee.total_stake(), self.committee.quorum_threshold(), ts);
+        }
+        // #endregion
+
         // SIMPLE CATCH-UP LOGIC: Nếu node lag quá xa (epoch khác > current_epoch + 2),
         // cho phép transition mà không cần quorum để catch-up nhanh
         // Điều này đảm bảo node không bị stuck khi các nodes khác đã tiến xa
@@ -1040,8 +1081,23 @@ impl EpochChangeManager {
         const MAX_EPOCH_LAG_FOR_QUORUM: u64 = 2; // Nếu lag > 2 epochs, không cần quorum
         let is_catchup_mode = epoch_lag > MAX_EPOCH_LAG_FOR_QUORUM;
 
+        // #region agent log
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"epoch_change.rs:should_transition:catchup_check","message":"Catch-up mode check","data":{{"epoch_lag":{},"max_epoch_lag_for_quorum":{},"is_catchup_mode":{}}},"timestamp":{}}}"#, 
+                epoch_lag, MAX_EPOCH_LAG_FOR_QUORUM, is_catchup_mode, ts);
+        }
+        // #endregion
+
         // TEMPORARY FIX: Bypass quorum for localhost testing (single node setup)
         let is_localhost_testing = std::env::var("LOCALHOST_TESTING").unwrap_or_default() == "1";
+        // #region agent log
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"epoch_change.rs:should_transition:localhost_check","message":"LOCALHOST_TESTING env check","data":{{"is_localhost_testing":{}}},"timestamp":{}}}"#, 
+                is_localhost_testing, ts);
+        }
+        // #endregion
         if is_localhost_testing {
             tracing::warn!("🧪 LOCALHOST_TESTING=1 detected - FORCE TRANSITION ENABLED for development ONLY");
             tracing::warn!("⚠️  WARNING: This should NEVER be used in production - can cause forks!");
@@ -1100,6 +1156,14 @@ impl EpochChangeManager {
         // Small differences in commit index between nodes are acceptable
         // as long as they're all >= transition_commit_index
         let barrier_reached = current_commit_index >= transition_commit_index;
+
+        // #region agent log
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"epoch_change.rs:should_transition:barrier_check","message":"Barrier check","data":{{"current_commit_index":{},"proposal_commit_index":{},"transition_commit_index":{},"barrier_reached":{}}},"timestamp":{}}}"#, 
+                current_commit_index, proposal.proposal_commit_index, transition_commit_index, barrier_reached, ts);
+        }
+        // #endregion
         
         // ✅ Điều kiện 3: Timeout mechanism để tránh deadlock
         // Nếu quorum đã đạt nhưng commit index không tăng trong 5 phút,
@@ -1120,6 +1184,14 @@ impl EpochChangeManager {
         // 4. Localhost testing: bypass all checks for development
         // CRITICAL: Catch-up mode vẫn cần barrier để đảm bảo fork-safety
         let ready = barrier_reached || (timeout_reached && quorum_reached) || (is_catchup_mode && barrier_reached) || is_localhost_testing;
+
+        // #region agent log
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"E","location":"epoch_change.rs:should_transition:final_decision","message":"Final transition decision","data":{{"ready":{},"barrier_reached":{},"timeout_reached":{},"quorum_reached":{},"is_catchup_mode":{},"is_localhost_testing":{},"proposal_age_seconds":{}}},"timestamp":{}}}"#, 
+                ready, barrier_reached, timeout_reached, quorum_reached, is_catchup_mode, is_localhost_testing, proposal_age_seconds, ts);
+        }
+        // #endregion
 
         if is_localhost_testing && ready {
             tracing::info!("✅ Transition ready (LOCALHOST BYPASS): epoch {} -> {}, quorum_bypassed={}, barrier_bypassed={}",
