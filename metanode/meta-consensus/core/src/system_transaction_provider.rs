@@ -3,8 +3,7 @@
 
 use crate::system_transaction::SystemTransaction;
 use consensus_config::Epoch;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
 /// Provider for system transactions (similar to Sui's EndOfEpochTransaction provider)
@@ -66,6 +65,30 @@ impl DefaultSystemTransactionProvider {
         time_based_enabled: bool,
         commit_index_buffer: u32,
     ) -> Self {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let elapsed_seconds = (now_ms.saturating_sub(epoch_start_timestamp_ms)) / 1000;
+        
+        info!(
+            "📅 SystemTransactionProvider initialized: epoch={}, epoch_start={}ms, now={}ms, elapsed={}s, duration={}s, time_based_enabled={}",
+            current_epoch,
+            epoch_start_timestamp_ms,
+            now_ms,
+            elapsed_seconds,
+            epoch_duration_seconds,
+            time_based_enabled
+        );
+        
+        if time_based_enabled && elapsed_seconds >= epoch_duration_seconds {
+            warn!(
+                "⚠️  SystemTransactionProvider: Epoch start timestamp is {}s old (>= duration {}s). System transaction should be created on next leader round.",
+                elapsed_seconds,
+                epoch_duration_seconds
+            );
+        }
+        
         Self {
             current_epoch: Arc::new(RwLock::new(current_epoch)),
             epoch_duration_seconds,
@@ -78,20 +101,27 @@ impl DefaultSystemTransactionProvider {
 
     /// Update current epoch (called after epoch transition)
     pub async fn update_epoch(&self, new_epoch: Epoch, new_timestamp_ms: u64) {
-        *self.current_epoch.write().await = new_epoch;
-        *self.epoch_start_timestamp_ms.write().await = new_timestamp_ms;
-        *self.last_checked_commit_index.write().await = 0;
+        // Use blocking write from async context (safe - we're not blocking the runtime thread)
+        *self.current_epoch.write().unwrap() = new_epoch;
+        *self.epoch_start_timestamp_ms.write().unwrap() = new_timestamp_ms;
+        *self.last_checked_commit_index.write().unwrap() = 0;
     }
 
     /// Check if epoch transition should be triggered
     fn should_trigger_epoch_change(&self, current_commit_index: u32) -> bool {
         if !self.time_based_enabled {
+            tracing::debug!("⏰ SystemTransactionProvider: time_based_enabled=false, skipping epoch change check");
             return false;
         }
 
         // Only check once per commit index to avoid spam
-        let last_checked = *self.last_checked_commit_index.blocking_read();
+        let last_checked = *self.last_checked_commit_index.read().unwrap();
         if current_commit_index <= last_checked {
+            tracing::debug!(
+                "⏰ SystemTransactionProvider: Already checked commit_index {} (last_checked={}), skipping",
+                current_commit_index,
+                last_checked
+            );
             return false;
         }
 
@@ -101,19 +131,54 @@ impl DefaultSystemTransactionProvider {
             .unwrap()
             .as_millis() as u64;
         
-        let epoch_start = *self.epoch_start_timestamp_ms.blocking_read();
+        let epoch_start = *self.epoch_start_timestamp_ms.read().unwrap();
         let elapsed_seconds = (now_ms - epoch_start) / 1000;
+        
+        // Log epoch start timestamp for debugging
+        tracing::debug!(
+            "⏰ SystemTransactionProvider: Time check - epoch_start={}ms, now={}ms, elapsed={}s, duration={}s, remaining={}s",
+            epoch_start,
+            now_ms,
+            elapsed_seconds,
+            self.epoch_duration_seconds,
+            self.epoch_duration_seconds.saturating_sub(elapsed_seconds)
+        );
         
         let should_trigger = elapsed_seconds >= self.epoch_duration_seconds;
         
+        // Log every check (throttled by commit index check above)
         if should_trigger {
             info!(
                 "⏰ SystemTransactionProvider: Epoch change triggered - epoch={}, elapsed={}s, duration={}s, commit_index={}",
-                *self.current_epoch.blocking_read(),
+                *self.current_epoch.read().unwrap(),
                 elapsed_seconds,
                 self.epoch_duration_seconds,
                 current_commit_index
             );
+        } else {
+            // Log periodically when close to threshold (every 10 seconds of elapsed time) or when past threshold
+            if elapsed_seconds % 10 == 0 || elapsed_seconds >= self.epoch_duration_seconds.saturating_sub(30) {
+                // Use info level when past threshold to make it more visible
+                if elapsed_seconds >= self.epoch_duration_seconds {
+                    tracing::info!(
+                        "⏰ SystemTransactionProvider: Epoch change check - epoch={}, elapsed={}s, duration={}s, remaining={}s, commit_index={} (PAST THRESHOLD!)",
+                        *self.current_epoch.read().unwrap(),
+                        elapsed_seconds,
+                        self.epoch_duration_seconds,
+                        self.epoch_duration_seconds.saturating_sub(elapsed_seconds),
+                        current_commit_index
+                    );
+                } else {
+                    tracing::debug!(
+                        "⏰ SystemTransactionProvider: Epoch change check - epoch={}, elapsed={}s, duration={}s, remaining={}s, commit_index={}",
+                        *self.current_epoch.read().unwrap(),
+                        elapsed_seconds,
+                        self.epoch_duration_seconds,
+                        self.epoch_duration_seconds.saturating_sub(elapsed_seconds),
+                        current_commit_index
+                    );
+                }
+            }
         }
         
         should_trigger
@@ -122,16 +187,27 @@ impl DefaultSystemTransactionProvider {
 
 impl SystemTransactionProvider for DefaultSystemTransactionProvider {
     fn get_system_transactions(&self, current_epoch: Epoch, current_commit_index: u32) -> Option<Vec<SystemTransaction>> {
-        // Update last checked commit index
+        tracing::debug!(
+            "🔍 SystemTransactionProvider::get_system_transactions called: epoch={}, commit_index={}, time_based_enabled={}",
+            current_epoch,
+            current_commit_index,
+            self.time_based_enabled
+        );
+
+        // Check if epoch transition should be triggered FIRST (before updating last_checked)
+        // This ensures we don't skip the check if commit_index hasn't increased
+        let should_trigger = self.should_trigger_epoch_change(current_commit_index);
+        
+        // Only update last_checked if we actually checked (not skipped due to already checked)
+        // This allows re-checking if commit_index increases
         {
-            let mut last_checked = self.last_checked_commit_index.blocking_write();
+            let mut last_checked = self.last_checked_commit_index.write().unwrap();
             if current_commit_index > *last_checked {
                 *last_checked = current_commit_index;
             }
         }
 
-        // Check if epoch transition should be triggered
-        if !self.should_trigger_epoch_change(current_commit_index) {
+        if !should_trigger {
             return None;
         }
 
@@ -145,8 +221,29 @@ impl SystemTransactionProvider for DefaultSystemTransactionProvider {
         // FORK-SAFETY FIX: Use deterministic timestamp calculation
         // Instead of SystemTime::now(), use epoch_start + epoch_duration
         // This ensures all nodes calculate the same timestamp
-        let epoch_start = *self.epoch_start_timestamp_ms.blocking_read();
-        let new_epoch_timestamp_ms = epoch_start + (self.epoch_duration_seconds * 1000);
+        // BUT: If epoch_start is too old, use current time to prevent rapid transitions
+        let epoch_start = *self.epoch_start_timestamp_ms.read().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        // Calculate expected timestamp
+        let expected_timestamp = epoch_start + (self.epoch_duration_seconds * 1000);
+        
+        // If expected timestamp is in the past (more than 1 second), use current time
+        // This prevents rapid epoch transitions when system starts with old timestamp
+        let new_epoch_timestamp_ms = if expected_timestamp < now_ms.saturating_sub(1000) {
+            warn!(
+                "⚠️  SystemTransactionProvider: Expected timestamp {}ms is in the past (now={}ms, diff={}ms). Using current time to prevent rapid transitions.",
+                expected_timestamp,
+                now_ms,
+                now_ms.saturating_sub(expected_timestamp)
+            );
+            now_ms
+        } else {
+            expected_timestamp
+        };
 
         // FORK-SAFETY WARNING: transition_commit_index may differ between nodes
         // if they have different current_commit_index values.

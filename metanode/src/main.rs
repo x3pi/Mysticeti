@@ -13,9 +13,6 @@ mod rpc;
 mod tx_socket_server;
 mod executor_client;
 mod commit_processor;
-mod epoch_change;
-mod epoch_change_bridge;
-mod epoch_change_hook;
 mod clock_sync;
 mod tx_submitter;
 mod checkpoint;
@@ -106,6 +103,10 @@ async fn main() -> Result<()> {
                 ).await?
             ));
             
+            // Register node in global registry for transition handler access
+            // This allows transition handler task to call transition function
+            crate::node::set_transition_handler_node(node.clone()).await;
+            
             // Start RPC server for client submissions (HTTP)
             let rpc_port = node_config.metrics_port + 1000;
             let tx_client = { node.lock().await.transaction_submitter() };
@@ -138,61 +139,25 @@ async fn main() -> Result<()> {
             info!("Press Ctrl+C to stop the node");
 
             // --- MAIN LOOP ---
-            // This loop proactively checks for epoch transition readiness
-            let mut last_processed_proposal_hash: Option<Vec<u8>> = None;
-            
+            // REMOVED: Proposal/Vote mechanism - using SystemTransactionProvider instead
+            // Epoch transitions are now handled via EndOfEpoch system transactions.
+            // The transition flow is:
+            // 1. SystemTransactionProvider creates EndOfEpoch transaction when epoch duration expires
+            // 2. EndOfEpoch transaction is included in a block and committed
+            // 3. CommitProcessor detects EndOfEpoch transaction and calls epoch_transition_callback
+            // 4. Callback sends transition request via channel to transition handler task in node.rs
+            // 5. Transition handler calls transition_to_epoch_from_system_tx()
+            //
+            // Simple loop that only handles shutdown signal
+            // Epoch transitions are handled automatically via SystemTransactionProvider
             loop {
-                // 1. Check for shutdown signal or sleep
-                let sleep = tokio::time::sleep(tokio::time::Duration::from_millis(1000));
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {
                         info!("Received Ctrl+C, initiating shutdown...");
                         break;
                     }
-                    _ = sleep => {
-                        // Continue to check for epoch transition
-                    }
-                }
-
-                // 2. Check for transition readiness
-                // We lock briefly to get the check, then release lock
-                let (proposal_opt, current_commit_index) = {
-                    let guard = node.lock().await;
-                    let manager = guard.epoch_change_manager();
-                    let manager_guard = manager.read().await;
-                    (
-                        manager_guard.get_transition_ready_proposal(guard.current_commit_index()),
-                        guard.current_commit_index()
-                    )
-                };
-
-                // 3. Execute transition if ready
-                if let Some(proposal) = proposal_opt {
-                    // Double check we haven't processed this already
-                    let proposal_hash = {
-                        let guard = node.lock().await;
-                        guard.epoch_change_manager().read().await.hash_proposal(&proposal)
-                    };
-
-                    if last_processed_proposal_hash.as_ref() != Some(&proposal_hash) {
-                        info!("⚡ MAIN LOOP: Transition ready for epoch {} -> {}. Executing...", 
-                              proposal.new_epoch - 1, proposal.new_epoch);
-                        
-                        // Acquire lock for the actual transition
-                        let mut guard = node.lock().await;
-                        
-                        // Execute the transition
-                        match guard.transition_to_epoch(&proposal, current_commit_index, &node_config).await {
-                            Ok(_) => {
-                                info!("✅ MAIN LOOP: Epoch transition executed successfully!");
-                                last_processed_proposal_hash = Some(proposal_hash);
-                            },
-                            Err(e) => {
-                                error!("❌ MAIN LOOP: Epoch transition failed: {}", e);
-                                // Sleep a bit to avoid rapid retry loops on persistent errors
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                            }
-                        }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
+                        // Just keep the loop alive - epoch transitions are handled via SystemTransactionProvider
                     }
                 }
             }

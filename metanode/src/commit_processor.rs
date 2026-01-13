@@ -6,8 +6,9 @@ use consensus_core::{CommittedSubDag, BlockAPI};
 use mysten_metrics::monitored_mpsc::UnboundedReceiver;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use tracing::{info, warn};
+use std::sync::atomic::AtomicBool;
+use tracing::{info, warn, error};
+use hex;
 
 use crate::checkpoint::calculate_global_exec_index;
 use crate::executor_client::ExecutorClient;
@@ -26,20 +27,10 @@ pub struct CommitProcessor {
     last_global_exec_index: u64,
     /// Optional executor client to send blocks to Go executor
     executor_client: Option<Arc<ExecutorClient>>,
-    /// Transition barrier commit index (for preventing duplicate global_exec_index)
-    /// If set, commits with commit_index > transition_barrier will be recalculated with new epoch
-    /// This prevents duplicate global_exec_index between epochs
-    /// Uses AtomicU32 for thread-safe access (can be set from epoch transition while CommitProcessor is running)
-    transition_barrier: Option<Arc<AtomicU32>>,
-    /// Global exec index at barrier (for commits past barrier)
-    /// If set, commits past barrier will use: global_exec_index_at_barrier + (commit_index - barrier_value)
-    /// Uses AtomicU64 for thread-safe access
-    global_exec_index_at_barrier: Option<Arc<AtomicU64>>,
-    /// Queue for transactions that must be retried in the next epoch.
-    ///
-    /// When we skip commits past barrier (to avoid duplicate `global_exec_index`), any transactions found
-    /// inside those commits must NOT be lost. We re-queue them here so that `ConsensusNode` can submit
-    /// them deterministically after epoch transition.
+    /// Flag indicating if epoch transition is in progress
+    /// When true, we're transitioning to a new epoch
+    is_transitioning: Option<Arc<AtomicBool>>,
+    /// Queue for transactions that must be retried in the next epoch
     pending_transactions_queue: Option<Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>>,
     /// Optional callback to handle EndOfEpoch system transactions
     /// Called immediately when an EndOfEpoch system transaction is detected in a committed sub-dag
@@ -57,8 +48,7 @@ impl CommitProcessor {
             current_epoch: 0,
             last_global_exec_index: 0,
             executor_client: None,
-            transition_barrier: None,
-            global_exec_index_at_barrier: None,
+            is_transitioning: None,
             pending_transactions_queue: None,
             epoch_transition_callback: None,
         }
@@ -86,19 +76,9 @@ impl CommitProcessor {
         self
     }
 
-    /// Set transition barrier to prevent sending commits past barrier to Go Master
-    /// This prevents duplicate global_exec_index between epochs
-    /// Uses Arc<AtomicU32> so barrier can be set dynamically during epoch transition
-    pub fn with_transition_barrier(mut self, barrier: Arc<AtomicU32>) -> Self {
-        self.transition_barrier = Some(barrier);
-        self
-    }
-
-    /// Set global exec index at barrier for commits past barrier
-    /// Commits past barrier will be sent as one block with global_exec_index = barrier_global_exec_index + 1
-    /// Uses Arc<AtomicU64> for thread-safe access
-    pub fn with_global_exec_index_at_barrier(mut self, global_exec_index_at_barrier: Arc<AtomicU64>) -> Self {
-        self.global_exec_index_at_barrier = Some(global_exec_index_at_barrier);
+    /// Set is_transitioning flag to track epoch transition state
+    pub fn with_is_transitioning(mut self, is_transitioning: Arc<AtomicBool>) -> Self {
+        self.is_transitioning = Some(is_transitioning);
         self
     }
 
@@ -131,16 +111,23 @@ impl CommitProcessor {
         let current_epoch = self.current_epoch;
         let last_global_exec_index = self.last_global_exec_index;
         let executor_client = self.executor_client;
-        let transition_barrier = self.transition_barrier;
-        let global_exec_index_at_barrier = self.global_exec_index_at_barrier;
         let pending_transactions_queue = self.pending_transactions_queue;
         let epoch_transition_callback = self.epoch_transition_callback;
         
-        // Buffer for commits past barrier (will be sent as one block)
-        // Track the last non-zero barrier we observed. This avoids a race where epoch transition
-        // resets barrier back to 0 while the old CommitProcessor is still draining its receiver.
-        // Without this, the old processor could start sending old-epoch commits again.
-        let mut barrier_snapshot: u32 = 0;
+        // #region agent log
+        {
+            use std::io::Write;
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:124","message":"COMMIT PROCESSOR STARTED","data":{{"current_epoch":{},"last_global_exec_index":{},"next_expected_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                    ts.as_secs(), ts.as_nanos() % 1000000,
+                    ts.as_millis(),
+                    current_epoch, last_global_exec_index, next_expected_index);
+            }
+        }
+        // #endregion
+        info!("🚀 [COMMIT PROCESSOR] Started processing commits for epoch {} (last_global_exec_index={}, next_expected_index={})",
+            current_epoch, last_global_exec_index, next_expected_index);
         
         // Heartbeat monitoring: Log every 1000 commits to detect if processor is stuck
         let mut last_heartbeat_commit = 0u32;
@@ -148,101 +135,63 @@ impl CommitProcessor {
         const HEARTBEAT_INTERVAL: u32 = 1000; // Log every 1000 commits
         const HEARTBEAT_TIMEOUT_SECS: u64 = 300; // 5 minutes timeout
         
+        info!("📡 [COMMIT PROCESSOR] Waiting for commits from consensus...");
+        
         loop {
             match receiver.recv().await {
                 Some(subdag) => {
                     let commit_index: u32 = subdag.commit_ref.index;
+                    info!("📥 [COMMIT PROCESSOR] Received committed subdag: commit_index={}, leader={:?}, blocks={}",
+                        commit_index, subdag.leader, subdag.blocks.len());
                     
                     // If this is the next expected commit, process it immediately
                     if commit_index == next_expected_index {
-                        // CRITICAL FIX: Check barrier BEFORE calculating global_exec_index
-                        // This prevents commits past barrier from being processed and sent
-                        // Commits past barrier should be skipped entirely (not sent to Go Master)
-                        let (is_past_barrier, barrier_value) = if let Some(barrier) = transition_barrier.as_ref() {
-                            let barrier_val = barrier.load(Ordering::Relaxed);
-                            if barrier_val > 0 {
-                                barrier_snapshot = barrier_val;
+                        // #region agent log
+                        {
+                            use std::io::Write;
+                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:147","message":"BEFORE calculate global_exec_index","data":{{"current_epoch":{},"commit_index":{},"last_global_exec_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                                    ts.as_secs(), ts.as_nanos() % 1000000,
+                                    ts.as_millis(),
+                                    current_epoch, commit_index, last_global_exec_index);
                             }
-                            let effective_barrier = if barrier_val > 0 { barrier_val } else { barrier_snapshot };
-                            (effective_barrier > 0 && commit_index > effective_barrier, effective_barrier)
-                        } else {
-                            (false, 0)
-                        };
-                        
-                        if is_past_barrier {
-                            // Commit past barrier → skip entirely, don't calculate global_exec_index
-                            // Re-queue transactions for next epoch
-                            let total_txs = subdag.blocks.iter().map(|b| b.transactions().len()).sum::<usize>();
-                            
-                            let mut lost_tx_hashes = Vec::new();
-                            let mut lost_tx_data: Vec<Vec<u8>> = Vec::new();
-                            for block in &subdag.blocks {
-                                for tx in block.transactions() {
-                                    let tx_data = tx.data();
-                                    let tx_hash_hex = calculate_transaction_hash_hex(tx_data);
-                                    lost_tx_hashes.push(tx_hash_hex);
-                                    lost_tx_data.push(tx_data.to_vec());
-                                }
-                            }
-                            
-                            if !lost_tx_hashes.is_empty() {
-                                warn!(
-                                    "⚠️ [TX FLOW] Commit past barrier detected BEFORE processing (commit_index={} > barrier={}): {} transactions detected. Re-queuing for next epoch. tx_hashes={:?}",
-                                    commit_index, barrier_value, total_txs, lost_tx_hashes
-                                );
-                            }
-                            
-                            if !lost_tx_data.is_empty() {
-                                match pending_transactions_queue.as_ref() {
-                                    Some(queue) => {
-                                        let mut q = queue.lock().await;
-                                        let before = q.len();
-                                        q.extend(lost_tx_data);
-                                        let after = q.len();
-                                        info!(
-                                            "📦 [TX FLOW] Re-queued {} transaction(s) from commit past barrier (before processing) for next epoch: queue_size {} -> {}",
-                                            total_txs, before, after
-                                        );
-                                    }
-                                    None => {
-                                        warn!(
-                                            "⚠️ [TX FLOW] Commit past barrier contained {} transaction(s) but pending_transactions_queue is not configured. Transactions must be retried by client.",
-                                            total_txs
-                                        );
-                                    }
-                                }
-                            }
-                            
-                            warn!(
-                                "⏭️ [FORK-SAFETY] Skipping commit past barrier BEFORE processing (commit_index={} > barrier={}): not calculating global_exec_index to prevent duplicate",
-                                commit_index, barrier_value
-                            );
-                            
-                            // Still advance next_expected_index to allow processing next commit
-                            if let Some(ref callback) = commit_index_callback {
-                                callback(commit_index);
-                            }
-                            next_expected_index += 1;
-                            continue; // Skip this commit entirely
                         }
-                        
-                        // Calculate deterministic global_exec_index only if commit is not past barrier
-                        // (We already checked barrier above and skipped if past barrier with continue)
+                        // #endregion
                         let global_exec_index = calculate_global_exec_index(
                             current_epoch,
                             commit_index,
                             last_global_exec_index,
                         );
                         
+                        // CRITICAL: Log global_exec_index calculation for duplicate detection
+                        info!("📊 [GLOBAL_EXEC_INDEX] Calculated: global_exec_index={}, epoch={}, commit_index={}, last_global_exec_index={}", 
+                            global_exec_index, current_epoch, commit_index, last_global_exec_index);
+                        
+                        // #region agent log
+                        {
+                            use std::io::Write;
+                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:151","message":"AFTER calculate global_exec_index","data":{{"current_epoch":{},"commit_index":{},"last_global_exec_index":{},"calculated_global_exec_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                                    ts.as_secs(), ts.as_nanos() % 1000000,
+                                    ts.as_millis(),
+                                    current_epoch, commit_index, last_global_exec_index, global_exec_index);
+                            }
+                        }
+                        // #endregion
+                        
                         // Check for EndOfEpoch system transactions BEFORE processing commit
                         // FORK-SAFETY: Use commit finalization approach (like Sui) - trigger transition immediately
                         // Sequential processing ensures all nodes process commits in the same order,
                         // so no buffer is needed. All nodes will trigger transition at the same commit_index.
+                        let total_txs_in_commit = subdag.blocks.iter().map(|b| b.transactions().len()).sum::<usize>();
+                        
                         if let Some((_block_ref, system_tx)) = subdag.extract_end_of_epoch_transaction() {
                             if let Some((new_epoch, new_epoch_timestamp_ms, _commit_index_from_tx)) = system_tx.as_end_of_epoch() {
                                 info!(
-                                    "🎯 [SYSTEM TX] EndOfEpoch transaction detected in commit {}: epoch {} -> {}",
-                                    commit_index, current_epoch, new_epoch
+                                    "🎯 [SYSTEM TX] EndOfEpoch transaction detected in commit {}: epoch {} -> {}, total_txs_in_commit={} (including EndOfEpoch system tx)",
+                                    commit_index, current_epoch, new_epoch, total_txs_in_commit
                                 );
                                 
                                 // COMMIT FINALIZATION APPROACH: Trigger transition immediately
@@ -250,16 +199,16 @@ impl CommitProcessor {
                                 // No buffer needed - consensus guarantees commit order
                                 if let Some(ref callback) = epoch_transition_callback {
                                     info!(
-                                        "🚀 [EPOCH TRANSITION] Triggering epoch transition immediately (commit finalization): commit_index={}, new_epoch={}",
-                                        commit_index, new_epoch
+                                        "🚀 [EPOCH TRANSITION] Triggering epoch transition immediately (commit finalization): commit_index={}, new_epoch={}, total_txs_in_commit={}",
+                                        commit_index, new_epoch, total_txs_in_commit
                                     );
                                     
                                     if let Err(e) = callback(new_epoch, new_epoch_timestamp_ms, commit_index) {
                                         warn!("❌ Failed to trigger epoch transition from system transaction: {}", e);
                                     } else {
                                         info!(
-                                            "✅ [EPOCH TRANSITION] Successfully triggered epoch transition: commit_index={}, new_epoch={}",
-                                            commit_index, new_epoch
+                                            "✅ [EPOCH TRANSITION] Successfully triggered epoch transition: commit_index={}, new_epoch={}, total_txs_in_commit={}",
+                                            commit_index, new_epoch, total_txs_in_commit
                                         );
                                     }
                                 } else {
@@ -271,8 +220,16 @@ impl CommitProcessor {
                             }
                         }
                         
-                        // Process commit normally (not past barrier, already verified above)
-                        Self::process_commit(&subdag, global_exec_index, current_epoch, executor_client.clone(), transition_barrier.clone(), global_exec_index_at_barrier.clone(), pending_transactions_queue.clone()).await?;
+                        // Process commit normally
+                        // IMPORTANT: Commit containing EndOfEpoch transaction will be processed normally
+                        // All transactions in this commit (including regular transactions) will be sent to executor
+                        // Note: extract_end_of_epoch_transaction() does NOT remove the transaction from the commit,
+                        // so all transactions (including EndOfEpoch system transaction) will be sent to executor
+                        info!(
+                            "📦 [TX FLOW] Processing commit {} with {} total transactions (will be sent to executor including all transactions)",
+                            commit_index, total_txs_in_commit
+                        );
+                        Self::process_commit(&subdag, global_exec_index, current_epoch, executor_client.clone(), pending_transactions_queue.clone()).await?;
                         
                         // Notify commit index update (for epoch transition)
                         if let Some(ref callback) = commit_index_callback {
@@ -302,81 +259,14 @@ impl CommitProcessor {
                         while let Some(pending) = pending_commits.remove(&next_expected_index) {
                             let pending_commit_index = next_expected_index;
                             
-                            // CRITICAL FIX: Check barrier BEFORE calculating global_exec_index for pending commit
-                            let (is_past_barrier, barrier_value) = if let Some(barrier) = transition_barrier.as_ref() {
-                                let barrier_val = barrier.load(Ordering::Relaxed);
-                                if barrier_val > 0 {
-                                    barrier_snapshot = barrier_val;
-                                }
-                                let effective_barrier = if barrier_val > 0 { barrier_val } else { barrier_snapshot };
-                                (effective_barrier > 0 && pending_commit_index > effective_barrier, effective_barrier)
-                            } else {
-                                (false, 0)
-                            };
-                            
-                            if is_past_barrier {
-                                let total_txs = pending.blocks.iter().map(|b| b.transactions().len()).sum::<usize>();
-
-                                let mut lost_tx_hashes = Vec::new();
-                                let mut lost_tx_data: Vec<Vec<u8>> = Vec::new();
-                                for block in &pending.blocks {
-                                    for tx in block.transactions() {
-                                        let tx_data = tx.data();
-                                        let tx_hash_hex = calculate_transaction_hash_hex(tx_data);
-                                        lost_tx_hashes.push(tx_hash_hex);
-                                        lost_tx_data.push(tx_data.to_vec());
-                                    }
-                                }
-
-                                if !lost_tx_hashes.is_empty() {
-                                    warn!(
-                                        "⚠️ [TX FLOW] Pending commit past barrier detected BEFORE processing (commit_index={} > barrier={}): {} transactions detected. Re-queuing for next epoch. tx_hashes={:?}",
-                                        pending_commit_index, barrier_value, total_txs, lost_tx_hashes
-                                    );
-                                }
-                                if !lost_tx_data.is_empty() {
-                                    match pending_transactions_queue.as_ref() {
-                                        Some(queue) => {
-                                            let mut q = queue.lock().await;
-                                            let before = q.len();
-                                            q.extend(lost_tx_data);
-                                            let after = q.len();
-                                            info!(
-                                                "📦 [TX FLOW] Re-queued {} transaction(s) from pending commit past barrier (before processing) for next epoch: queue_size {} -> {}",
-                                                total_txs, before, after
-                                            );
-                                        }
-                                        None => {
-                                            warn!(
-                                                "⚠️ [TX FLOW] Pending commit past barrier contained {} transaction(s) but pending_transactions_queue is not configured. Transactions must be retried by client.",
-                                                total_txs
-                                            );
-                                        }
-                                    }
-                                }
-
-                                warn!(
-                                    "⏭️ [FORK-SAFETY] Skipping pending commit past barrier BEFORE processing (commit_index={} > barrier={}): not calculating global_exec_index to prevent duplicate",
-                                    pending_commit_index, barrier_value
-                                );
-                                
-                                // Still advance next_expected_index
-                                if let Some(ref callback) = commit_index_callback {
-                                    callback(pending_commit_index);
-                                }
-                                next_expected_index += 1;
-                                continue; // Skip this pending commit entirely
-                            }
-                            
-                            // Calculate deterministic global_exec_index only if commit is not past barrier
                             let global_exec_index = calculate_global_exec_index(
                                 current_epoch,
                                 pending_commit_index,
                                 last_global_exec_index,
                             );
                             
-                            // Process commit normally (not past barrier, already verified above)
-                            Self::process_commit(&pending, global_exec_index, current_epoch, executor_client.clone(), transition_barrier.clone(), global_exec_index_at_barrier.clone(), pending_transactions_queue.clone()).await?;
+                            // Process commit normally
+                            Self::process_commit(&pending, global_exec_index, current_epoch, executor_client.clone(), pending_transactions_queue.clone()).await?;
                             
                             // Notify commit index update
                             if let Some(ref callback) = commit_index_callback {
@@ -416,82 +306,10 @@ impl CommitProcessor {
         global_exec_index: u64,
         epoch: u64,
         executor_client: Option<Arc<ExecutorClient>>,
-        transition_barrier: Option<Arc<AtomicU32>>,
-        _global_exec_index_at_barrier: Option<Arc<AtomicU64>>,
-        pending_transactions_queue: Option<Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>>,
+        _pending_transactions_queue: Option<Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>>,
     ) -> Result<()> {
         let commit_index = subdag.commit_ref.index;
         
-        // CRITICAL RACE CONDITION FIX: Double-check barrier RIGHT BEFORE sending
-        // This prevents race condition where commit is processed before barrier is set,
-        // but barrier gets set before commit is sent → commit should be skipped
-        // Example timeline:
-        // 1. Commit #1212 processed (barrier not set yet)
-        // 2. Barrier set = 1209 (commit #1212 > barrier → past barrier)
-        // 3. Commit #1212 about to be sent → should be skipped!
-        // 
-        // IMPORTANT: Always check current barrier value, don't use snapshot here
-        // because barrier_snapshot in run() loop may be different from barrier when this commit is sent
-        let (is_past_barrier_now, barrier_value_now) = if let Some(barrier) = transition_barrier.as_ref() {
-            let barrier_val = barrier.load(Ordering::Relaxed);
-            // If barrier is set (barrier_val > 0) and commit_index > barrier, then commit is past barrier
-            (barrier_val > 0 && commit_index > barrier_val, barrier_val)
-        } else {
-            (false, 0)
-        };
-        
-        if is_past_barrier_now {
-            // Barrier was set between processing and sending → skip send and re-queue transactions
-            let total_txs = subdag.blocks.iter().map(|b| b.transactions().len()).sum::<usize>();
-            
-            let mut lost_tx_hashes = Vec::new();
-            let mut lost_tx_data: Vec<Vec<u8>> = Vec::new();
-            for block in &subdag.blocks {
-                for tx in block.transactions() {
-                    let tx_data = tx.data();
-                    let tx_hash_hex = calculate_transaction_hash_hex(tx_data);
-                    lost_tx_hashes.push(tx_hash_hex);
-                    lost_tx_data.push(tx_data.to_vec());
-                }
-            }
-            
-            if !lost_tx_hashes.is_empty() {
-                warn!(
-                    "⚠️ [TX FLOW] RACE CONDITION: Commit past barrier detected RIGHT BEFORE SEND (commit_index={} > barrier={}): {} transactions detected. Re-queuing for next epoch. tx_hashes={:?}",
-                    commit_index, barrier_value_now, total_txs, lost_tx_hashes
-                );
-            }
-            
-            // Re-queue transactions if queue is available
-            if !lost_tx_data.is_empty() {
-                match pending_transactions_queue.as_ref() {
-                    Some(queue) => {
-                        let mut q = queue.lock().await;
-                        let before = q.len();
-                        q.extend(lost_tx_data);
-                        let after = q.len();
-                        info!(
-                            "📦 [TX FLOW] Re-queued {} transaction(s) from race condition commit past barrier for next epoch: queue_size {} -> {}",
-                            total_txs, before, after
-                        );
-                    }
-                    None => {
-                        warn!(
-                            "⚠️ [TX FLOW] RACE CONDITION: Commit past barrier contained {} transaction(s) but pending_transactions_queue is not configured. Transactions must be retried by client.",
-                            total_txs
-                        );
-                    }
-                }
-            }
-            
-            warn!(
-                "⏭️ [FORK-SAFETY] RACE CONDITION: Skipping commit past barrier RIGHT BEFORE SEND (commit_index={} > barrier={}): not sending to Go executor to prevent duplicate global_exec_index (global_exec_index={})",
-                commit_index, barrier_value_now, global_exec_index
-            );
-            
-            // Return early - don't send commit
-            return Ok(());
-        }
         let mut total_transactions = 0;
         let mut transaction_hashes = Vec::new();
         let mut block_details = Vec::new();
@@ -502,11 +320,43 @@ impl CommitProcessor {
             let block_tx_count = transactions.len();
             total_transactions += block_tx_count;
             
+            // #region agent log
+            {
+                use std::io::Write;
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:328","message":"PROCESSING BLOCK IN COMMIT - counting all transactions","data":{{"global_exec_index":{},"commit_index":{},"block_idx":{},"block_tx_count":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                        ts.as_secs(), ts.as_nanos() % 1000000,
+                        ts.as_millis(),
+                        global_exec_index, commit_index, block_idx, block_tx_count);
+                }
+            }
+            // #endregion
+            
             // Calculate official transaction hashes (Keccak256 from TransactionHashData)
             let mut block_tx_hashes = Vec::new();
-            for tx in transactions {
+            
+            for (tx_idx, tx) in transactions.iter().enumerate() {
                 let tx_data = tx.data();
                 let tx_hash_hex = calculate_transaction_hash_hex(tx_data);
+                
+                // Calculate full hash for general tracking
+                use crate::tx_hash::calculate_transaction_hash;
+                let tx_hash_full = calculate_transaction_hash(tx_data);
+                let tx_hash_full_hex = hex::encode(&tx_hash_full);
+                
+                // #region agent log - General transaction tracking
+                {
+                    use std::io::Write;
+                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:336","message":"TX IN COMMIT - before conversion","data":{{"global_exec_index":{},"commit_index":{},"block_idx":{},"tx_idx":{},"tx_hash":"{}","tx_hash_full":"{}","size":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                            ts.as_secs(), ts.as_nanos() % 1000000,
+                            ts.as_millis(),
+                            global_exec_index, commit_index, block_idx, tx_idx, tx_hash_hex, tx_hash_full_hex, tx_data.len());
+                    }
+                }
+                // #endregion
                 transaction_hashes.push(tx_hash_hex.clone());
                 block_tx_hashes.push(tx_hash_hex);
             }
@@ -539,18 +389,62 @@ impl CommitProcessor {
             
             // Send committed subdag to Go executor if enabled
             // CRITICAL FORK-SAFETY: Include global_exec_index to ensure deterministic execution order
-            // Note: Commits past barrier are already buffered and sent as one block, so this function
-            // only processes commits at or before barrier
             let send_epoch = epoch;
             let send_global_exec_index = global_exec_index;
             
             if let Some(ref client) = executor_client {
                 info!("📤 [TX FLOW] Sending committed subdag to Go executor: global_exec_index={}, commit_index={}, epoch={}, blocks={}, total_tx={}", 
                     send_global_exec_index, commit_index, send_epoch, subdag.blocks.len(), total_transactions);
+                // #region agent log
+                {
+                    use std::io::Write;
+                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:338","message":"BEFORE send_committed_subdag","data":{{"global_exec_index":{},"commit_index":{},"total_tx":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                            ts.as_secs(), ts.as_nanos() % 1000000,
+                            ts.as_millis(),
+                            send_global_exec_index, commit_index, total_transactions);
+                    }
+                }
+                // #endregion
                 if let Err(e) = client.send_committed_subdag(subdag, send_epoch, send_global_exec_index).await {
+                    // #region agent log - General transaction tracking
+                    {
+                        use std::io::Write;
+                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                            let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:340","message":"SEND FAILED - transactions may be lost","data":{{"global_exec_index":{},"commit_index":{},"total_tx":{},"error":"{}","hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                                ts.as_secs(), ts.as_nanos() % 1000000,
+                                ts.as_millis(),
+                                send_global_exec_index, commit_index, total_transactions, e.to_string().replace("\"", "\\\""));
+                        }
+                    }
+                    // #endregion
                     // CRITICAL FORK-SAFETY: If duplicate global_exec_index detected, this is a serious bug
                     // Log error and skip this commit to prevent fork
                     if e.to_string().contains("Duplicate global_exec_index") {
+                        error!("🚨 [DUPLICATE GLOBAL_EXEC_INDEX] Duplicate global_exec_index={} detected in commit processor! This commit will be skipped to prevent fork.", 
+                            send_global_exec_index);
+                        error!("   📊 Commit details: commit_index={}, epoch={}, total_tx={}", commit_index, send_epoch, total_transactions);
+                        error!("   🔍 This indicates a serious bug - same global_exec_index calculated for different commits");
+                        error!("   🔍 Possible causes:");
+                        error!("      1. global_exec_index calculation is wrong (check calculate_global_exec_index function)");
+                        error!("      2. last_global_exec_index was not updated correctly after epoch transition");
+                        error!("      3. Commit processor sent same commit twice");
+                        error!("      4. Buffer state was not reset properly after restart");
+                        
+                        // #region agent log
+                        {
+                            use std::io::Write;
+                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:367","message":"DUPLICATE GLOBAL_EXEC_INDEX - commit skipped","data":{{"global_exec_index":{},"commit_index":{},"total_tx":{},"epoch":{},"hypothesisId":"E"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                                    ts.as_secs(), ts.as_nanos() % 1000000,
+                                    ts.as_millis(),
+                                    send_global_exec_index, commit_index, total_transactions, send_epoch);
+                            }
+                        }
+                        // #endregion
                         warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! This commit will be skipped to prevent fork. Error: {}", 
                             send_global_exec_index, e);
                     } else {
@@ -558,6 +452,18 @@ impl CommitProcessor {
                         // Don't fail commit if executor is unavailable (network issues, etc.)
                     }
                 } else {
+                    // #region agent log
+                    {
+                        use std::io::Write;
+                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                            let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:351","message":"SEND SUCCESS","data":{{"global_exec_index":{},"commit_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                                ts.as_secs(), ts.as_nanos() % 1000000,
+                                ts.as_millis(),
+                                send_global_exec_index, commit_index);
+                        }
+                    }
+                    // #endregion
                     info!("✅ [TX FLOW] Successfully sent committed subdag to Go executor: global_exec_index={}, commit_index={}, epoch={}, blocks={}", 
                         send_global_exec_index, commit_index, send_epoch, subdag.blocks.len());
                 }
@@ -583,8 +489,6 @@ impl CommitProcessor {
             
             // Send committed subdag to Go executor if enabled (even for empty commits)
             // CRITICAL FORK-SAFETY: Include global_exec_index to ensure deterministic execution order
-            // Note: Commits past barrier are already buffered and sent as one block, so this function
-            // only processes commits at or before barrier
             let send_epoch = epoch;
             let send_global_exec_index = global_exec_index;
             
@@ -593,6 +497,18 @@ impl CommitProcessor {
                     // CRITICAL FORK-SAFETY: If duplicate global_exec_index detected, this is a serious bug
                     // Log error and skip this commit to prevent fork
                     if e.to_string().contains("Duplicate global_exec_index") {
+                        // #region agent log
+                        {
+                            use std::io::Write;
+                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:419","message":"DUPLICATE GLOBAL_EXEC_INDEX - empty commit skipped","data":{{"global_exec_index":{},"commit_index":{},"hypothesisId":"E"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                                    ts.as_secs(), ts.as_nanos() % 1000000,
+                                    ts.as_millis(),
+                                    send_global_exec_index, commit_index);
+                            }
+                        }
+                        // #endregion
                         warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! This empty commit will be skipped to prevent fork. Error: {}", 
                             send_global_exec_index, e);
                     } else {

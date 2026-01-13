@@ -226,7 +226,7 @@ impl TxSocketServer {
             info!("🔍 [DEBUG] Initial check result: should_accept={}, should_queue={}, reason={}", should_accept, should_queue, reason);
 
             if should_queue {
-                // Queue transactions for next epoch (barrier phase)
+                // Queue transactions for next epoch
                 info!("📦 [TX FLOW] Queueing {} transactions for next epoch: {}", transactions_to_submit.len(), reason);
                 for tx_data in &transactions_to_submit {
                     let tx_hash = crate::tx_hash::calculate_transaction_hash_hex(tx_data);
@@ -303,13 +303,8 @@ impl TxSocketServer {
             "unknown".to_string()
         };
         
-        // CRITICAL: Double-check barrier RIGHT BEFORE submitting to consensus
-        // This prevents race condition where barrier is set between initial check and submission
-        // Race condition scenario:
-        // 1. Transaction received, barrier check passes (barrier not set yet)
-        // 2. Barrier gets set (epoch transition starts)
-        // 3. Transaction gets submitted to consensus
-        // 4. Commit happens with commit_index > barrier → transaction lost
+        // CRITICAL: Double-check transaction acceptance RIGHT BEFORE submitting to consensus
+        // This prevents race condition where epoch transition starts between initial check and submission
         let should_queue_final = if let Some(ref node) = node {
             let node_guard = node.lock().await;
             let (should_accept_final, should_queue_final, reason_final) = node_guard.check_transaction_acceptance().await;
@@ -317,8 +312,8 @@ impl TxSocketServer {
             info!("🔍 [DEBUG] Final check result: should_accept_final={}, should_queue_final={}, reason_final={}", should_accept_final, should_queue_final, reason_final);
             info!("🔍 [DEBUG] Final check: should_queue_final={}", should_queue_final);
         if should_queue_final {
-                // Barrier was set between initial check and submission - queue transaction instead
-                warn!("⚠️ [RACE CONDITION] Barrier was set between initial check and submission - queueing transaction instead: {}", reason_final);
+                // Epoch transition started between initial check and submission - queue transaction instead
+                warn!("⚠️ [RACE CONDITION] Epoch transition started between initial check and submission - queueing transaction instead: {}", reason_final);
                 // Queue all transactions (node_guard is still held)
                 for tx_data in &transactions_to_submit {
                     if let Err(e) = node_guard.queue_transaction_for_next_epoch(tx_data.clone()).await {
@@ -328,7 +323,7 @@ impl TxSocketServer {
                 drop(node_guard);
                 // Send success response (transaction is queued)
                 let success_response = format!(
-                    r#"{{"success":true,"queued":true,"message":"Transaction queued due to barrier race condition: {}"}}"#,
+                    r#"{{"success":true,"queued":true,"message":"Transaction queued due to epoch transition: {}"}}"#,
                     reason_final.replace('"', "\\\"")
                 );
                 if let Err(e) = Self::send_response_string(&mut stream, &success_response).await {

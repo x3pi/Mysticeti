@@ -659,6 +659,12 @@ impl Core {
                 // Get current commit index from dag_state
                 let current_commit_index = self.dag_state.read().last_commit_index();
                 
+                tracing::debug!(
+                    "🔍 Leader checking for system transactions: epoch={}, commit_index={}",
+                    current_epoch,
+                    current_commit_index
+                );
+                
                 if let Some(system_txs) = provider.get_system_transactions(current_epoch, current_commit_index) {
                     // Convert system transactions to regular transactions
                     let system_transactions: Vec<crate::block::Transaction> = system_txs

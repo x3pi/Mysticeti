@@ -35,6 +35,7 @@ use crate::{
     storage::rocksdb_store::RocksDBStore,
     subscriber::Subscriber,
     synchronizer::{Synchronizer, SynchronizerHandle},
+    system_transaction_provider::SystemTransactionProvider,
     transaction::{TransactionClient, TransactionConsumer, TransactionVerifier},
     transaction_certifier::TransactionCertifier,
 };
@@ -65,6 +66,7 @@ impl ConsensusAuthority {
         // make decisions on whether amnesia recovery should run or not. When `boot_counter` is 0, then `ConsensusAuthority`
         // will initiate the process of amnesia recovery if that's enabled in the parameters.
         boot_counter: u64,
+        system_transaction_provider: Option<Arc<dyn SystemTransactionProvider>>,
     ) -> Self {
         match network_type {
             NetworkType::Tonic => {
@@ -81,6 +83,7 @@ impl ConsensusAuthority {
                     commit_consumer,
                     registry,
                     boot_counter,
+                    system_transaction_provider,
                 )
                 .await;
                 Self::WithTonic(authority)
@@ -150,6 +153,7 @@ where
         commit_consumer: CommitConsumerArgs,
         registry: Registry,
         boot_counter: u64,
+        system_transaction_provider: Option<Arc<dyn SystemTransactionProvider>>,
     ) -> Self {
         assert!(
             committee.is_valid_index(own_index),
@@ -284,7 +288,7 @@ where
             sync_last_known_own_block,
             round_tracker.clone(),
             Some(adaptive_delay_state.clone()),
-            None, // system_transaction_provider - can be set later if needed
+            system_transaction_provider, // System transaction provider for Sui-style epoch transition
         );
 
         let (core_dispatcher, core_thread_handle) =

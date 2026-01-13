@@ -99,13 +99,77 @@ pub fn calculate_transaction_hash_hex(tx_data: &[u8]) -> String {
 /// This is used to ensure data integrity from Go sub node
 pub fn verify_transaction_protobuf(tx_data: &[u8]) -> bool {
     // Try to parse as Transactions (multiple transactions)
-    if Transactions::decode(tx_data).is_ok() {
-        return true;
+    match Transactions::decode(tx_data) {
+        Ok(_) => {
+            // #region agent log
+            {
+                use std::io::Write;
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                    let preview_len = tx_data.len().min(32);
+                    let preview_hex = hex::encode(&tx_data[..preview_len]);
+                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"tx_hash.rs:102","message":"VERIFY SUCCESS - decoded as Transactions","data":{{"size":{},"preview_hex":"{}","hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                        ts.as_secs(), ts.as_nanos() % 1000000,
+                        ts.as_millis(),
+                        tx_data.len(), preview_hex);
+                }
+            }
+            // #endregion
+            return true;
+        }
+        Err(e) => {
+            // #region agent log
+            {
+                use std::io::Write;
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                    let preview_len = tx_data.len().min(32);
+                    let preview_hex = hex::encode(&tx_data[..preview_len]);
+                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"tx_hash.rs:102","message":"VERIFY FAILED - not Transactions","data":{{"size":{},"preview_hex":"{}","error":"{}","hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                        ts.as_secs(), ts.as_nanos() % 1000000,
+                        ts.as_millis(),
+                        tx_data.len(), preview_hex, e);
+                }
+            }
+            // #endregion
+        }
     }
     
     // Try to parse as single Transaction
-    if Transaction::decode(tx_data).is_ok() {
-        return true;
+    match Transaction::decode(tx_data) {
+        Ok(_) => {
+            // #region agent log
+            {
+                use std::io::Write;
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                    let preview_len = tx_data.len().min(32);
+                    let preview_hex = hex::encode(&tx_data[..preview_len]);
+                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"tx_hash.rs:107","message":"VERIFY SUCCESS - decoded as Transaction","data":{{"size":{},"preview_hex":"{}","hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                        ts.as_secs(), ts.as_nanos() % 1000000,
+                        ts.as_millis(),
+                        tx_data.len(), preview_hex);
+                }
+            }
+            // #endregion
+            return true;
+        }
+        Err(e) => {
+            // #region agent log
+            {
+                use std::io::Write;
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                    let preview_len = tx_data.len().min(32);
+                    let preview_hex = hex::encode(&tx_data[..preview_len]);
+                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"tx_hash.rs:107","message":"VERIFY FAILED - not Transaction","data":{{"size":{},"preview_hex":"{}","error":"{}","hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                        ts.as_secs(), ts.as_nanos() % 1000000,
+                        ts.as_millis(),
+                        tx_data.len(), preview_hex, e);
+                }
+            }
+            // #endregion
+        }
     }
     
     // Not valid protobuf
