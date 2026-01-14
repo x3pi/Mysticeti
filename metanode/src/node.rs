@@ -24,6 +24,7 @@ use tracing::{info, warn, error};
 use tokio::sync::RwLock;
 use hex;
 use base64::{Engine as _, engine::general_purpose};
+use tracing::trace;
 
 use crate::config::NodeConfig;
 use crate::tx_submitter::{TransactionClientProxy, TransactionSubmitter};
@@ -395,7 +396,19 @@ impl ConsensusNode {
         let is_transitioning_for_processor = is_transitioning.clone();
         
         // Create pending transactions queue for epoch transition
-        let pending_transactions_queue = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        // Load persisted transaction queue if exists
+        let persisted_queue = Self::load_transaction_queue_static(&storage_path).await
+            .unwrap_or_else(|e| {
+                warn!("⚠️ [TX PERSISTENCE] Failed to load persisted queue: {}", e);
+                Vec::new()
+            });
+
+        let queue_size = persisted_queue.len();
+        let pending_transactions_queue = Arc::new(tokio::sync::Mutex::new(persisted_queue));
+
+        if queue_size > 0 {
+            info!("💾 [TX PERSISTENCE] Loaded {} persisted transactions into queue", queue_size);
+        }
         
         // Create channel for epoch transition requests from system transactions
         let (epoch_tx_sender, epoch_tx_receiver) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, u32)>();
@@ -752,20 +765,6 @@ impl ConsensusNode {
 
 
 
-    pub async fn is_ready_for_transactions(&self) -> (bool, String) {
-        if self.authority.is_none() {
-            return (false, "Node is still initializing".to_string());
-        }
-
-        if self.last_transition_hash.is_some() {
-            return (false, format!(
-                "Epoch transition in progress: epoch {} -> {} (waiting for new authority to start)",
-                self.current_epoch, self.current_epoch + 1
-            ));
-        }
-        
-        (true, "Node is ready".to_string())
-    }
     
     pub async fn check_transaction_acceptance(&self) -> (bool, bool, String) {
         if self.authority.is_none() {
@@ -778,28 +777,101 @@ impl ConsensusNode {
                 self.current_epoch, self.current_epoch + 1
             ));
         }
-        
+
         let is_transitioning = self.is_transitioning.load(Ordering::SeqCst);
-        
+
         if is_transitioning {
             let current_commit_index = self.current_commit_index.load(Ordering::SeqCst);
-            info!("🔄 [EPOCH TRANSITION] Queueing transaction - is_transitioning=true (current_commit={}): transaction will be queued for next epoch", 
+            info!("🔄 [EPOCH TRANSITION] Queueing transaction - is_transitioning=true (current_commit={}): transaction will be queued for next epoch",
                 current_commit_index);
             return (false, true, format!(
                 "Epoch transition in progress - transaction will be queued for next epoch (current_commit={})",
                 current_commit_index
             ));
         }
-        
+
+        // Check reconfiguration state - if reconfiguration is in progress, queue transactions
+        if !self.should_accept_tx().await {
+            let reconfig_state = self.get_reconfig_state().await;
+            let reason = match reconfig_state.status() {
+                consensus_core::ReconfigCertStatus::RejectUserCerts => "Gradual shutdown: rejecting user certificates",
+                consensus_core::ReconfigCertStatus::RejectAllCerts => "Gradual shutdown: rejecting all certificates",
+                consensus_core::ReconfigCertStatus::RejectAllTx => "Gradual shutdown: rejecting all transactions",
+                _ => "Reconfiguration in progress",
+            };
+            info!("🔄 [GRADUAL SHUTDOWN] Queueing transaction - reconfiguration state: {:?} ({})", reconfig_state.status(), reason);
+            return (false, true, format!("{} - transaction will be queued for next epoch", reason));
+        }
+
         (true, false, "Node is ready".to_string())
     }
     
     pub async fn queue_transaction_for_next_epoch(&self, tx_data: Vec<u8>) -> Result<()> {
         let mut queue = self.pending_transactions_queue.lock().await;
-        queue.push(tx_data);
+        queue.push(tx_data.clone());
         info!("📦 [TX FLOW] Queued transaction for next epoch: queue_size={}", queue.len());
+
+        // Persist queue to disk to survive node crashes
+        if let Err(e) = self.persist_transaction_queue(&queue).await {
+            warn!("⚠️ [TX PERSISTENCE] Failed to persist transaction queue: {}", e);
+        }
+
         Ok(())
     }
+
+    async fn persist_transaction_queue(&self, queue: &[Vec<u8>]) -> Result<()> {
+        use std::io::Write;
+
+        let queue_path = self.storage_path.join("transaction_queue.bin");
+        let mut file = std::fs::File::create(&queue_path)?;
+
+        // Write number of transactions first
+        let count = queue.len() as u32;
+        file.write_all(&count.to_le_bytes())?;
+
+        // Write each transaction with its length prefix
+        for tx_data in queue {
+            let len = tx_data.len() as u32;
+            file.write_all(&len.to_le_bytes())?;
+            file.write_all(tx_data)?;
+        }
+
+        file.flush()?;
+        trace!("💾 [TX PERSISTENCE] Persisted {} transactions to {}", queue.len(), queue_path.display());
+        Ok(())
+    }
+
+    async fn load_transaction_queue_static(storage_path: &std::path::Path) -> Result<Vec<Vec<u8>>> {
+        use std::io::Read;
+
+        let queue_path = storage_path.join("transaction_queue.bin");
+        if !queue_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut file = std::fs::File::open(&queue_path)?;
+        let mut queue = Vec::new();
+
+        // Read number of transactions
+        let mut count_buf = [0u8; 4];
+        file.read_exact(&mut count_buf)?;
+        let count = u32::from_le_bytes(count_buf);
+
+        // Read each transaction
+        for _ in 0..count {
+            let mut len_buf = [0u8; 4];
+            file.read_exact(&mut len_buf)?;
+            let len = u32::from_le_bytes(len_buf) as usize;
+
+            let mut tx_data = vec![0u8; len];
+            file.read_exact(&mut tx_data)?;
+            queue.push(tx_data);
+        }
+
+        info!("💾 [TX PERSISTENCE] Loaded {} persisted transactions from {}", queue.len(), queue_path.display());
+        Ok(queue)
+    }
+
     
     pub async fn submit_queued_transactions(&mut self) -> Result<usize> {
         let mut queue = self.pending_transactions_queue.lock().await;
@@ -851,10 +923,8 @@ impl ConsensusNode {
         drop(queue);
         
         // Submit transactions with retry mechanism
-        // Retry failed submissions with exponential backoff to handle fast epoch transitions
-        // Submit transactions with retry mechanism
-        // Retry failed submissions with exponential backoff to handle fast epoch transitions
-        const MAX_RETRIES: u32 = 5;
+        // Retry failed submissions with exponential backoff to handle consensus startup delays
+        const MAX_RETRIES: u32 = 10; // Increased from 5 to 10 for better epoch transition reliability
         const INITIAL_RETRY_DELAY_MS: u64 = 100;
         let mut successful_count = 0;
         let mut requeued_count = 0;
@@ -897,10 +967,27 @@ impl ConsensusNode {
         }
         
         if requeued_count > 0 {
-            warn!("⚠️ [TX FLOW] {} transactions failed to submit after {} retries. They have been re-queued for next epoch transition.", 
+            warn!("⚠️ [TX FLOW] {} transactions failed to submit after {} retries. They have been re-queued for next epoch transition.",
                 requeued_count, MAX_RETRIES);
+            // Persist remaining queue for next attempt
+            // Note: We need to get the queue again since the previous one was dropped
+            let remaining_queue = self.pending_transactions_queue.lock().await;
+            if let Err(e) = self.persist_transaction_queue(&remaining_queue).await {
+                warn!("⚠️ [TX PERSISTENCE] Failed to persist remaining transaction queue: {}", e);
+            }
+            drop(remaining_queue);
+        } else if successful_count > 0 {
+            // All transactions submitted successfully - clear persisted queue
+            let queue_path = self.storage_path.join("transaction_queue.bin");
+            if queue_path.exists() {
+                if let Err(e) = std::fs::remove_file(&queue_path) {
+                    warn!("⚠️ [TX PERSISTENCE] Failed to remove persisted queue file: {}", e);
+                } else {
+                    info!("💾 [TX PERSISTENCE] Cleared persisted transaction queue after successful submission");
+                }
+            }
         }
-        
+
         Ok(successful_count)
     }
 
@@ -1154,10 +1241,14 @@ impl ConsensusNode {
         };
         
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        info!("🔄 SUI-STYLE EPOCH TRANSITION: epoch {} -> {} (from system transaction)", 
+        info!("🔄 SUI-STYLE EPOCH TRANSITION: epoch {} -> {} (from system transaction)",
             self.current_epoch, new_epoch);
         info!("  📊 Transition triggered at commit_index={}", commit_index);
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+        // CRITICAL: Start reconfiguration immediately to queue transactions during transition
+        // This prevents transactions from being rejected instead of queued
+        self.close_user_certs().await;
         
         // Validate epoch increment
         if new_epoch != self.current_epoch + 1 {
@@ -1364,12 +1455,6 @@ impl ConsensusNode {
             authority.stop().await;
         }
         
-        // CRITICAL OPTIMIZATION: Reset is_transitioning flag EARLY to allow new transactions
-        // This allows transactions to be queued for the new epoch while we're still setting up
-        // The new authority will be ready soon, and transactions can be submitted immediately
-        self.is_transitioning.store(false, Ordering::SeqCst);
-        info!("✅ [EPOCH TRANSITION] is_transitioning flag reset - new transactions can now be queued for epoch {}", new_epoch);
-        
         // Update state
         self.current_epoch = new_epoch;
         self.last_global_exec_index = new_last_global_exec_index;
@@ -1528,15 +1613,28 @@ impl ConsensusNode {
         // This prevents transactions from being lost if epoch transition is too fast
         // Authority needs time to initialize network connections, start consensus, etc.
         let authority_ready_delay_ms = match config.epoch_transition_optimization.as_str() {
-            "fast" => 50,    // Aggressive: 50ms for fastest transaction submission
-            "safe" => 500,   // Conservative: 500ms for maximum safety
-            _ => 100,        // Balanced: 100ms default
+            "fast" => 100,   // Aggressive: 100ms minimum for consensus startup
+            "safe" => 2000,  // Conservative: 2s for maximum safety, allows consensus to fully sync
+            _ => 500,        // Balanced: 500ms reasonable delay for consensus startup
         };
 
         info!("⏳ [EPOCH TRANSITION] Using {} optimization - waiting {}ms for new authority to be fully ready before submitting queued transactions...",
             config.epoch_transition_optimization, authority_ready_delay_ms);
         tokio::time::sleep(Duration::from_millis(authority_ready_delay_ms)).await;
-        info!("✅ [EPOCH TRANSITION] Authority should be ready now, submitting queued transactions...");
+
+        // ADDITIONAL SAFETY: Test consensus readiness with a dummy transaction before submitting queue
+        // This ensures consensus is actually ready to accept transactions, not just authority is created
+        let consensus_ready = self.test_consensus_readiness().await;
+        if consensus_ready {
+            info!("✅ [EPOCH TRANSITION] Consensus is ready - proceeding to submit queued transactions");
+        } else {
+            warn!("⚠️ [EPOCH TRANSITION] Consensus may not be fully ready yet, but proceeding anyway (retry mechanism will handle failures)");
+        }
+
+        // CRITICAL FIX: Reset is_transitioning flag AFTER authority is fully ready
+        // This prevents transactions from being accepted before consensus is actually running
+        self.is_transitioning.store(false, Ordering::SeqCst);
+        info!("✅ [EPOCH TRANSITION] is_transitioning flag reset - new transactions can now be accepted by ready authority in epoch {}", new_epoch);
         
         // CRITICAL: Submit queued transactions with retry mechanism
         // This ensures transactions are not lost even if authority is not immediately ready
@@ -1572,29 +1670,37 @@ impl ConsensusNode {
         Ok(())
     }
 
-    /// Acquire execution lock for signing operations
-    /// This prevents reconfiguration from starting during transaction signing
-    pub fn execution_lock_for_signing(&self) -> Result<tokio::sync::RwLockReadGuard<'_, u64>> {
-        match self.execution_lock.try_read() {
-            Ok(guard) => Ok(guard),
-            Err(_) => Err(anyhow::anyhow!("Validator halted at epoch end")),
-        }
-    }
-
     /// Acquire execution lock for reconfiguration
     /// This ensures no transactions are being executed during reconfiguration
     pub async fn execution_lock_for_reconfiguration(&self) -> tokio::sync::RwLockWriteGuard<'_, u64> {
         self.execution_lock.write().await
     }
 
-    /// Get current epoch from execution lock
-    pub async fn get_current_epoch_from_lock(&self) -> u64 {
-        *self.execution_lock.read().await
-    }
-
     /// Update execution lock with new epoch
     pub async fn update_execution_lock_epoch(&self, new_epoch: u64) {
         *self.execution_lock.write().await = new_epoch;
+    }
+
+    /// Test if consensus is ready to accept transactions
+    /// This is a lightweight check to ensure consensus is actually running before submitting queued transactions
+    async fn test_consensus_readiness(&self) -> bool {
+        // Try to submit a minimal dummy transaction to test if consensus accepts it
+        // If it succeeds, consensus is ready. If it fails, consensus may still be starting up.
+
+        // Create a minimal dummy transaction (this won't be processed, just tests connectivity)
+        let dummy_tx = vec![0u8; 64]; // Minimal transaction data
+        let test_transactions = vec![dummy_tx];
+
+        match self.transaction_client_proxy.submit(test_transactions).await {
+            Ok(_) => {
+                info!("🧪 [CONSENSUS READY] Consensus accepted test transaction - ready for queued transactions");
+                true
+            },
+            Err(e) => {
+                info!("🧪 [CONSENSUS READY] Consensus rejected test transaction: {} - may still be starting up", e);
+                false
+            }
+        }
     }
 
     /// Reset reconfiguration state to clean state after successful transition
@@ -1630,20 +1736,6 @@ impl ConsensusNode {
         info!("Closed all transactions during reconfiguration");
     }
 
-    /// Check if user certificates should be accepted
-    pub async fn should_accept_user_certs(&self) -> bool {
-        self.reconfig_state.read().await.should_accept_user_certs()
-    }
-
-    /// Check if consensus certificates should be accepted
-    pub async fn should_accept_consensus_certs(&self) -> bool {
-        self.reconfig_state.read().await.should_accept_consensus_certs()
-    }
-
-    /// Check if any certificates should be accepted
-    pub async fn should_accept_certs(&self) -> bool {
-        self.reconfig_state.read().await.should_accept_certs()
-    }
 
     /// Check if any transactions should be accepted
     pub async fn should_accept_tx(&self) -> bool {

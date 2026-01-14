@@ -394,23 +394,49 @@ impl RpcServer {
             "unknown".to_string()
         };
         
-        // Check if node is ready to accept transactions
+        // Check if node is ready to accept transactions or should queue them
         if let Some(ref node) = node {
             let node_guard = node.lock().await;
-            let (is_ready, reason) = node_guard.is_ready_for_transactions().await;
+            let (is_ready, should_queue, reason) = node_guard.check_transaction_acceptance().await;
             drop(node_guard);
-            
+
             if !is_ready {
-                warn!("🚫 [TX FLOW] Transaction rejected: node not ready - {} (first_hash={}, count={})", 
-                    reason, first_tx_hash, transactions_to_submit.len());
-                if is_length_prefixed {
-                    Self::send_binary_response(stream, false, &format!("Node not ready: {}", reason)).await?;
+                if should_queue {
+                    // Queue transactions for next epoch instead of rejecting
+                    info!("📦 [TX FLOW] Queueing {} transaction(s) for next epoch: {} (first_hash={})",
+                        transactions_to_submit.len(), reason, first_tx_hash);
+
+                    // Queue all transactions
+                    let node_guard = node.lock().await;
+                    for (i, tx_data) in transactions_to_submit.iter().enumerate() {
+                        if let Err(e) = node_guard.queue_transaction_for_next_epoch(tx_data.clone()).await {
+                            error!("❌ [TX FLOW] Failed to queue transaction {}: {}", i, e);
+                        } else {
+                            let tx_hash = calculate_transaction_hash_hex(tx_data);
+                            info!("📦 [TX FLOW] Queued TX[{}]: hash={}", i, tx_hash);
+                        }
+                    }
+
+                    if is_length_prefixed {
+                        Self::send_binary_response(stream, true, "Transactions queued for next epoch").await?;
+                    } else {
+                        let response = r#"{"success":true,"message":"Transactions queued for next epoch"}"#;
+                        Self::send_response(stream, response, true).await?;
+                    }
+                    return Ok(());
                 } else {
-                    let response = format!(r#"{{"success":false,"error":"Node not ready to accept transactions: {}"}}"#, 
-                        reason.replace('"', "\\\""));
-                    Self::send_response(stream, &response, false).await?;
+                    // Reject transactions
+                    warn!("🚫 [TX FLOW] Transaction rejected: {} (first_hash={}, count={})",
+                        reason, first_tx_hash, transactions_to_submit.len());
+                    if is_length_prefixed {
+                        Self::send_binary_response(stream, false, &reason).await?;
+                    } else {
+                        let response = format!(r#"{{"success":false,"error":"{}"}}"#,
+                            reason.replace('"', "\\\""));
+                        Self::send_response(stream, &response, false).await?;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
             }
         }
         
