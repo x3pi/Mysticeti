@@ -1188,11 +1188,11 @@ impl ConsensusNode {
         info!("  📊 EndOfEpoch detected at commit_index={}, current_commit_index={}", 
             commit_index, self.current_commit_index.load(Ordering::SeqCst));
         
-        // OPTIMIZED: Wait for commit processor to catch up with shorter timeouts for smoother transition
+        // Wait for commit processor to catch up with adequate timeouts to prevent transaction loss
         // We wait until current_commit_index stops increasing (no new commits being processed)
         let start_time = std::time::Instant::now();
-        const MAX_WAIT_FOR_COMMITS_SECS: u64 = 10; // Reduced from 30s to 10s for faster transition
-        const STABLE_TIME_SECS: u64 = 2; // Reduced from 5s to 2s for faster transition
+        const MAX_WAIT_FOR_COMMITS_SECS: u64 = 30; // Increased to ensure commit processor has enough time
+        const STABLE_TIME_SECS: u64 = 5; // Increased to ensure commits are fully processed
         let mut last_commit_index = self.current_commit_index.load(Ordering::SeqCst);
         let mut last_change_time = std::time::Instant::now();
         
