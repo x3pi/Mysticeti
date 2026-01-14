@@ -36,6 +36,10 @@ pub struct CommitProcessor {
     /// Called immediately when an EndOfEpoch system transaction is detected in a committed sub-dag
     /// Uses commit finalization approach (like Sui) - no buffer needed as commits are processed sequentially
     epoch_transition_callback: Option<Arc<dyn Fn(u64, u64, u32) -> Result<()> + Send + Sync>>,
+    // TODO: Future enhancement - commit processed callback
+    // /// Optional callback to notify when a commit has been fully processed
+    // /// Useful for epoch transition to know when commit processor has caught up
+    // commit_processed_callback: Option<Arc<dyn Fn(u32) + Send + Sync>>,
 }
 
 impl CommitProcessor {
@@ -51,6 +55,8 @@ impl CommitProcessor {
             is_transitioning: None,
             pending_transactions_queue: None,
             epoch_transition_callback: None,
+            // TODO: Future enhancement
+            // commit_processed_callback: None,
         }
     }
 
@@ -102,6 +108,16 @@ impl CommitProcessor {
         self
     }
 
+    // TODO: Future enhancement - commit processed callback
+    // /// Set callback to notify when a commit has been fully processed
+    // pub fn with_commit_processed_callback<F>(mut self, callback: F) -> Self
+    // where
+    //     F: Fn(u32) + Send + Sync + 'static,
+    // {
+    //     self.commit_processed_callback = Some(Arc::new(callback));
+    //     self
+    // }
+
     /// Process commits in order
     pub async fn run(self) -> Result<()> {
         let mut receiver = self.receiver;
@@ -113,6 +129,8 @@ impl CommitProcessor {
         let executor_client = self.executor_client;
         let pending_transactions_queue = self.pending_transactions_queue;
         let epoch_transition_callback = self.epoch_transition_callback;
+        // TODO: Future enhancement
+        // let commit_processed_callback = self.commit_processed_callback;
         
         // #region agent log
         {
@@ -235,6 +253,11 @@ impl CommitProcessor {
                         if let Some(ref callback) = commit_index_callback {
                             callback(commit_index);
                         }
+
+                        // TODO: Future enhancement - notify that commit has been fully processed
+                        // if let Some(ref callback) = commit_processed_callback {
+                        //     callback(commit_index);
+                        // }
                         
                         // Heartbeat monitoring: Log progress and detect stuck
                         if commit_index >= last_heartbeat_commit + HEARTBEAT_INTERVAL {
@@ -272,6 +295,11 @@ impl CommitProcessor {
                             if let Some(ref callback) = commit_index_callback {
                                 callback(pending_commit_index);
                             }
+
+                            // TODO: Future enhancement - notify that commit has been fully processed
+                            // if let Some(ref callback) = commit_processed_callback {
+                            //     callback(pending_commit_index);
+                            // }
                             
                             next_expected_index += 1;
                         }

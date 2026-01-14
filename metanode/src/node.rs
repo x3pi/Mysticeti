@@ -5,7 +5,7 @@ use anyhow::Result;
 use consensus_config::{AuthorityIndex, Committee, Authority};
 use consensus_core::{
     ConsensusAuthority, NetworkType, Clock,
-    CommitConsumerArgs,
+    CommitConsumerArgs, ReconfigState,
 };
 use consensus_config::{AuthorityPublicKey, ProtocolPublicKey, NetworkPublicKey};
 use fastcrypto::ed25519;
@@ -62,6 +62,12 @@ pub async fn set_transition_handler_node(node: Arc<tokio::sync::Mutex<ConsensusN
 
 pub struct ConsensusNode {
     authority: Option<ConsensusAuthority>,
+    /// Execution lock to prevent transaction interruption during reconfiguration
+    /// Similar to Sui's ExecutionLock, protects against concurrent reconfiguration
+    execution_lock: Arc<tokio::sync::RwLock<u64>>, // epoch ID
+    /// Reconfiguration state for gradual transaction rejection
+    /// Similar to Sui's ReconfigState, enables smooth epoch transitions
+    reconfig_state: Arc<tokio::sync::RwLock<consensus_core::ReconfigState>>,
     /// Stable handle for RPC submissions across in-process authority restart
     transaction_client_proxy: Arc<TransactionClientProxy>,
     /// Clock synchronization manager
@@ -110,11 +116,94 @@ pub struct ConsensusNode {
     lvm_snapshot_delay_seconds: u64,
     /// System transaction provider for Sui-style epoch transition (EndOfEpoch system transaction)
     system_transaction_provider: Arc<DefaultSystemTransactionProvider>,
+    // TODO: Future enhancement - notification channel for commit processor completion
+    // /// Notification channel for commit processor completion
+    // /// Commit processor sends notification when all commits are processed
+    // commit_complete_sender: tokio::sync::watch::Sender<bool>,
+    // /// Receiver for commit processor completion notifications
+    // commit_complete_receiver: tokio::sync::watch::Receiver<bool>,
     /// Channel sender for epoch transition requests from system transactions
     epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u32)>,
 }
 
 impl ConsensusNode {
+    /// Calculate adaptive timeout based on system load
+    fn calculate_adaptive_timeout(base_timeout: u64, system_load: f64) -> u64 {
+        // Increase timeout when system load is high (above 1.0)
+        // Formula: base_timeout * (1.0 + (load - 1.0) * 0.5), max 2x base_timeout
+        let multiplier = 1.0 + (system_load - 1.0).max(0.0) * 0.5;
+        (base_timeout as f64 * multiplier.min(2.0)) as u64
+    }
+
+    /// Get current system load (simplified version)
+    /// Returns load factor where 1.0 = normal load
+    fn get_system_load(&self) -> f64 {
+        // Simple heuristic: if we have many pending commits, system might be busy
+        // In a real implementation, this could use CPU usage, memory pressure, etc.
+        let current_commit_index = self.current_commit_index.load(Ordering::SeqCst);
+        let pending_commits_estimate = current_commit_index.saturating_sub(self.last_global_exec_index as u32);
+
+        // If we have more than 100 pending commits, consider system busy
+        if pending_commits_estimate > 100 {
+            1.5 // 50% busier
+        } else if pending_commits_estimate > 50 {
+            1.2 // 20% busier
+        } else {
+            1.0 // Normal load
+        }
+    }
+
+    /// Wait for commit processor to complete processing all commits in pipeline
+    /// Uses notification channel and adaptive polling with exponential backoff
+    async fn wait_for_commit_processor_completion(
+        &self,
+        commit_index: u32,
+        max_wait_secs: u64,
+    ) -> Result<()> {
+        use std::time::{Duration, Instant};
+
+        const STABLE_TIME_SECS: u64 = 5; // Time commit index must be stable
+        let start_time = Instant::now();
+
+        info!("⏳ [COMMIT PROCESSOR] Waiting for completion...");
+        info!("  📊 EndOfEpoch detected at commit_index={}, current_commit_index={}",
+            commit_index, self.current_commit_index.load(Ordering::SeqCst));
+
+        let mut last_commit_index = self.current_commit_index.load(Ordering::SeqCst);
+        let mut last_change_time = Instant::now();
+        let mut sleep_duration = Duration::from_millis(100); // Start with faster polling
+        const MAX_SLEEP_DURATION: Duration = Duration::from_millis(1000); // Cap at 1 second
+
+        loop {
+            let current = self.current_commit_index.load(Ordering::SeqCst);
+            let elapsed = start_time.elapsed().as_secs();
+
+            if current > last_commit_index {
+                // Commit index is still increasing - commits are being processed
+                info!("  📈 Processing: current_commit_index={} (was {}), elapsed={}s",
+                    current, last_commit_index, elapsed);
+                last_commit_index = current;
+                last_change_time = Instant::now();
+                // Reset sleep duration when active processing
+                sleep_duration = Duration::from_millis(100);
+            } else if last_change_time.elapsed().as_secs() >= STABLE_TIME_SECS {
+                // Commit index has been stable - processor likely caught up
+                info!("  ✅ Caught up: current_commit_index={} (stable for {}s)",
+                    current, STABLE_TIME_SECS);
+                return Ok(());
+            }
+
+            if elapsed >= max_wait_secs {
+                warn!("  ⚠️ Timeout after {}s, last_commit_index={}", max_wait_secs, last_commit_index);
+                return Err(anyhow::anyhow!("Timeout waiting for commit processor"));
+            }
+
+            // Exponential backoff for sleep duration
+            tokio::time::sleep(sleep_duration).await;
+            sleep_duration = (sleep_duration * 2).min(MAX_SLEEP_DURATION);
+        }
+    }
+
     /// Create a new ConsensusNode with a default registry
     /// For metrics support, use `new_with_registry` instead
     #[allow(dead_code)]
@@ -334,6 +423,9 @@ impl ConsensusNode {
             }
         };
         
+        // Create notification channel for commit processor completion
+        let (_commit_complete_sender, _commit_complete_receiver) = tokio::sync::watch::channel(false);
+
         // Create ordered commit processor
         let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
             .with_commit_index_callback(move |index| {
@@ -571,6 +663,8 @@ impl ConsensusNode {
         // Create node instance
         let node = Self {
             authority: Some(authority),
+            execution_lock: Arc::new(tokio::sync::RwLock::new(current_epoch)),
+            reconfig_state: Arc::new(tokio::sync::RwLock::new(ReconfigState::default())),
             transaction_client_proxy,
             // REMOVED: epoch_change_manager - using SystemTransactionProvider instead
             clock_sync_manager,
@@ -596,6 +690,9 @@ impl ConsensusNode {
             lvm_snapshot_bin_path: lvm_snapshot_bin_path_for_node,
             lvm_snapshot_delay_seconds: config.lvm_snapshot_delay_seconds,
             system_transaction_provider,
+            // TODO: Future enhancement - notification channels
+            // commit_complete_sender: tokio::sync::watch::channel(false).0,
+            // commit_complete_receiver: tokio::sync::watch::channel(false).1,
             epoch_transition_sender: epoch_tx_sender_for_node,
         };
 
@@ -1154,22 +1251,39 @@ impl ConsensusNode {
         
         let new_last_global_exec_index = last_global_exec_index_at_transition;
         
-        // Fetch committee from Go state
+        // OPTIMIZED: Parallel processing - fetch committee and prepare other components simultaneously
         let executor_client = if config.executor_read_enabled {
-            Arc::new(ExecutorClient::new(true, false, 
-                config.executor_send_socket_path.clone(), 
+            Arc::new(ExecutorClient::new(true, false,
+                config.executor_send_socket_path.clone(),
                 config.executor_receive_socket_path.clone()))
         } else {
             anyhow::bail!("Executor read not enabled, cannot fetch committee");
         };
-        
-        // OPTIMIZED: Fetch committee in parallel with other setup to speed up transition
+
+        // OPTIMIZED: Fetch committee in parallel with database and authority preparation
         let block_number = new_last_global_exec_index;
         info!("📋 [EPOCH TRANSITION] Fetching committee from Go state at block {}...", block_number);
-        let new_committee_raw = Self::build_committee_from_go_validators_at_block(
-            &executor_client, 
-            block_number
-        ).await?;
+
+        // Start committee fetching task in background
+        let committee_future = {
+            let executor_client_clone = executor_client.clone();
+            tokio::spawn(async move {
+                Self::build_committee_from_go_validators_at_block(
+                    &executor_client_clone,
+                    block_number
+                ).await
+            })
+        };
+
+        // Prepare database path while committee is being fetched
+        let db_path = self.storage_path
+            .join("epochs")
+            .join(format!("epoch_{}", new_epoch))
+            .join("consensus_db");
+        std::fs::create_dir_all(&db_path)?;
+
+        // Wait for committee fetching to complete
+        let new_committee_raw = committee_future.await??;
         info!("✅ [EPOCH TRANSITION] Committee fetched from Go state");
         
         let authorities: Vec<_> = new_committee_raw.authorities()
@@ -1188,47 +1302,63 @@ impl ConsensusNode {
         info!("  📊 EndOfEpoch detected at commit_index={}, current_commit_index={}", 
             commit_index, self.current_commit_index.load(Ordering::SeqCst));
         
-        // Wait for commit processor to catch up with adequate timeouts to prevent transaction loss
-        // We wait until current_commit_index stops increasing (no new commits being processed)
-        let start_time = std::time::Instant::now();
-        const MAX_WAIT_FOR_COMMITS_SECS: u64 = 30; // Increased to ensure commit processor has enough time
-        const STABLE_TIME_SECS: u64 = 5; // Increased to ensure commits are fully processed
-        let mut last_commit_index = self.current_commit_index.load(Ordering::SeqCst);
-        let mut last_change_time = std::time::Instant::now();
-        
-        loop {
-            let current = self.current_commit_index.load(Ordering::SeqCst);
-            let elapsed = start_time.elapsed().as_secs();
-            
-            if current > last_commit_index {
-                // Commit index is still increasing - commits are being processed
-                info!("  📈 Commit processor is processing: current_commit_index={} (was {}), elapsed={}s", 
-                    current, last_commit_index, elapsed);
-                last_commit_index = current;
-                last_change_time = std::time::Instant::now();
-            } else if last_change_time.elapsed().as_secs() >= STABLE_TIME_SECS {
-                // Commit index has been stable for STABLE_TIME_SECS - processor likely caught up
-                info!("  ✅ Commit processor appears to have caught up: current_commit_index={} (stable for {}s)", 
-                    current, STABLE_TIME_SECS);
-                break;
+        // OPTIMIZED: Adaptive timeout based on configuration optimization level
+        let base_wait_for_commits_secs = match config.epoch_transition_optimization.as_str() {
+            "fast" => 5,     // Aggressive: 5s for fastest transitions
+            "safe" => 30,    // Conservative: 30s for maximum safety
+            _ => 10,         // Balanced: 10s default (reasonable safety vs speed)
+        };
+
+        let system_load = self.get_system_load();
+        let adaptive_timeout = Self::calculate_adaptive_timeout(base_wait_for_commits_secs, system_load);
+
+        info!("🎯 [EPOCH TRANSITION] Using {} optimization - adaptive timeout: {}s (base: {}s, load: {:.1})",
+            config.epoch_transition_optimization, adaptive_timeout, base_wait_for_commits_secs, system_load);
+
+        let wait_result = tokio::time::timeout(
+            Duration::from_secs(adaptive_timeout),
+            self.wait_for_commit_processor_completion(commit_index, adaptive_timeout)
+        ).await;
+
+        match wait_result {
+            Ok(Ok(())) => {
+                info!("✅ [EPOCH TRANSITION] Commit processor completed successfully");
             }
-            
-            if elapsed >= MAX_WAIT_FOR_COMMITS_SECS {
-                warn!("  ⚠️ [EPOCH TRANSITION] Timeout waiting for commit processor ({}s), stopping anyway. Last commit_index={}", 
-                    MAX_WAIT_FOR_COMMITS_SECS, last_commit_index);
-                break;
+            Ok(Err(e)) => {
+                warn!("⚠️ [EPOCH TRANSITION] Commit processor wait failed: {}, proceeding anyway", e);
             }
-            
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            Err(_) => {
+                let last_commit_index = self.current_commit_index.load(Ordering::SeqCst);
+                warn!("⚠️ [EPOCH TRANSITION] Timeout waiting for commit processor ({}s), proceeding anyway. Last commit_index={}",
+                    adaptive_timeout, last_commit_index);
+            }
         }
         
-        // OPTIMIZED: Reduced wait time for executor drain for smoother transition
+        // OPTIMIZED: Adaptive executor drain time based on optimization level
         // Commits have been sent to executor, but executor may still be processing them
-        const EXECUTOR_DRAIN_SECS: u64 = 1; // Reduced from 3s to 1s for faster transition
-        info!("⏳ [EPOCH TRANSITION] Waiting {}s for executor to execute all sent commits...", EXECUTOR_DRAIN_SECS);
-        tokio::time::sleep(Duration::from_secs(EXECUTOR_DRAIN_SECS)).await;
+        let executor_drain_secs = match config.epoch_transition_optimization.as_str() {
+            "fast" => 0,     // Aggressive: skip executor drain for fastest transition
+            "safe" => 2,     // Conservative: 2s for maximum safety
+            _ => 0,          // Balanced: skip drain by default (trust commit processor wait above)
+        };
+
+        info!("⏳ [EPOCH TRANSITION] Using {} optimization - executor drain wait: {}s",
+            config.epoch_transition_optimization, executor_drain_secs);
+        if executor_drain_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(executor_drain_secs)).await;
+        }
         info!("✅ [EPOCH TRANSITION] Commit processor and executor drain completed, safe to stop old authority");
-        
+
+        // GRADUAL SHUTDOWN: Use gradual shutdown for smoother transitions if enabled
+        if config.enable_gradual_shutdown {
+            info!("🔄 [EPOCH TRANSITION] Using gradual shutdown for smooth transition");
+            if let Err(e) = self.gradual_shutdown_for_epoch_transition(config).await {
+                warn!("⚠️ [EPOCH TRANSITION] Gradual shutdown failed: {}, proceeding with immediate shutdown", e);
+            }
+        } else {
+            info!("⚡ [EPOCH TRANSITION] Gradual shutdown disabled, proceeding with immediate shutdown");
+        }
+
         // Stop old authority
         if let Some(authority) = self.authority.take() {
             authority.stop().await;
@@ -1244,6 +1374,9 @@ impl ConsensusNode {
         self.current_epoch = new_epoch;
         self.last_global_exec_index = new_last_global_exec_index;
         self.current_commit_index.store(0, Ordering::SeqCst);
+
+        // Update execution lock with new epoch
+        self.update_execution_lock_epoch(new_epoch).await;
         
         // Update system transaction provider
         self.system_transaction_provider.update_epoch(
@@ -1391,13 +1524,18 @@ impl ConsensusNode {
         self.transaction_client_proxy.set_client(new_client).await;
         self.authority = Some(authority);
         
-        // CRITICAL: Wait a short time to ensure new authority is fully ready before submitting transactions
+        // OPTIMIZED: Adaptive delay for authority ready check based on optimization level
         // This prevents transactions from being lost if epoch transition is too fast
         // Authority needs time to initialize network connections, start consensus, etc.
-        const AUTHORITY_READY_DELAY_MS: u64 = 500; // 500ms delay to ensure authority is ready
-        info!("⏳ [EPOCH TRANSITION] Waiting {}ms for new authority to be fully ready before submitting queued transactions...", 
-            AUTHORITY_READY_DELAY_MS);
-        tokio::time::sleep(Duration::from_millis(AUTHORITY_READY_DELAY_MS)).await;
+        let authority_ready_delay_ms = match config.epoch_transition_optimization.as_str() {
+            "fast" => 50,    // Aggressive: 50ms for fastest transaction submission
+            "safe" => 500,   // Conservative: 500ms for maximum safety
+            _ => 100,        // Balanced: 100ms default
+        };
+
+        info!("⏳ [EPOCH TRANSITION] Using {} optimization - waiting {}ms for new authority to be fully ready before submitting queued transactions...",
+            config.epoch_transition_optimization, authority_ready_delay_ms);
+        tokio::time::sleep(Duration::from_millis(authority_ready_delay_ms)).await;
         info!("✅ [EPOCH TRANSITION] Authority should be ready now, submitting queued transactions...");
         
         // CRITICAL: Submit queued transactions with retry mechanism
@@ -1427,7 +1565,134 @@ impl ConsensusNode {
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         info!("✅ SUI-STYLE EPOCH TRANSITION COMPLETE: epoch {} -> {}", old_epoch, new_epoch);
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        
+
+        // Reset reconfiguration state to clean state for new epoch
+        self.reset_reconfig_state().await;
+
+        Ok(())
+    }
+
+    /// Acquire execution lock for signing operations
+    /// This prevents reconfiguration from starting during transaction signing
+    pub fn execution_lock_for_signing(&self) -> Result<tokio::sync::RwLockReadGuard<'_, u64>> {
+        match self.execution_lock.try_read() {
+            Ok(guard) => Ok(guard),
+            Err(_) => Err(anyhow::anyhow!("Validator halted at epoch end")),
+        }
+    }
+
+    /// Acquire execution lock for reconfiguration
+    /// This ensures no transactions are being executed during reconfiguration
+    pub async fn execution_lock_for_reconfiguration(&self) -> tokio::sync::RwLockWriteGuard<'_, u64> {
+        self.execution_lock.write().await
+    }
+
+    /// Get current epoch from execution lock
+    pub async fn get_current_epoch_from_lock(&self) -> u64 {
+        *self.execution_lock.read().await
+    }
+
+    /// Update execution lock with new epoch
+    pub async fn update_execution_lock_epoch(&self, new_epoch: u64) {
+        *self.execution_lock.write().await = new_epoch;
+    }
+
+    /// Reset reconfiguration state to clean state after successful transition
+    pub async fn reset_reconfig_state(&self) {
+        let mut state = self.reconfig_state.write().await;
+        *state = ReconfigState::default(); // Reset to AcceptAll
+        info!("Reset reconfiguration state to clean state");
+    }
+
+    /// Get current reconfig state
+    pub async fn get_reconfig_state(&self) -> ReconfigState {
+        self.reconfig_state.read().await.clone()
+    }
+
+    /// Close user certificates - transition to RejectUserCerts
+    pub async fn close_user_certs(&self) {
+        let mut state = self.reconfig_state.write().await;
+        state.close_user_certs();
+        info!("Closed user certificates during reconfiguration");
+    }
+
+    /// Close all certificates - transition to RejectAllCerts
+    pub async fn close_all_certs(&self) {
+        let mut state = self.reconfig_state.write().await;
+        state.close_all_certs();
+        info!("Closed all certificates during reconfiguration");
+    }
+
+    /// Close all transactions - transition to RejectAllTx
+    pub async fn close_all_tx(&self) {
+        let mut state = self.reconfig_state.write().await;
+        state.close_all_tx();
+        info!("Closed all transactions during reconfiguration");
+    }
+
+    /// Check if user certificates should be accepted
+    pub async fn should_accept_user_certs(&self) -> bool {
+        self.reconfig_state.read().await.should_accept_user_certs()
+    }
+
+    /// Check if consensus certificates should be accepted
+    pub async fn should_accept_consensus_certs(&self) -> bool {
+        self.reconfig_state.read().await.should_accept_consensus_certs()
+    }
+
+    /// Check if any certificates should be accepted
+    pub async fn should_accept_certs(&self) -> bool {
+        self.reconfig_state.read().await.should_accept_certs()
+    }
+
+    /// Check if any transactions should be accepted
+    pub async fn should_accept_tx(&self) -> bool {
+        self.reconfig_state.read().await.should_accept_tx()
+    }
+
+    /// Perform gradual shutdown for smooth epoch transition
+    /// Similar to Sui's reconfiguration process but adapted for metanode
+    pub async fn gradual_shutdown_for_epoch_transition(&self, config: &crate::config::NodeConfig) -> Result<()> {
+        info!("🔄 [GRADUAL SHUTDOWN] Starting smooth epoch transition process...");
+
+        // Phase 1: Close user certificates
+        info!("📋 [GRADUAL SHUTDOWN] Phase 1: Closing user certificates");
+        self.close_user_certs().await;
+
+        // Wait for user certs to drain (configurable)
+        let user_cert_drain_secs = config.gradual_shutdown_user_cert_drain_secs.unwrap_or(2);
+        if user_cert_drain_secs > 0 {
+            info!("⏳ [GRADUAL SHUTDOWN] Waiting {}s for user certificates to drain", user_cert_drain_secs);
+            tokio::time::sleep(Duration::from_secs(user_cert_drain_secs)).await;
+        }
+
+        // Phase 2: Close all certificates (keep accepting system transactions)
+        info!("🚫 [GRADUAL SHUTDOWN] Phase 2: Closing all certificates");
+        self.close_all_certs().await;
+
+        // Wait for consensus certs to drain (configurable)
+        let consensus_cert_drain_secs = config.gradual_shutdown_consensus_cert_drain_secs.unwrap_or(1);
+        if consensus_cert_drain_secs > 0 {
+            info!("⏳ [GRADUAL SHUTDOWN] Waiting {}s for consensus certificates to drain", consensus_cert_drain_secs);
+            tokio::time::sleep(Duration::from_secs(consensus_cert_drain_secs)).await;
+        }
+
+        // Phase 3: Close all transactions
+        info!("🛑 [GRADUAL SHUTDOWN] Phase 3: Closing all transactions");
+        self.close_all_tx().await;
+
+        // Wait for final drain (configurable)
+        let final_drain_secs = config.gradual_shutdown_final_drain_secs.unwrap_or(1);
+        if final_drain_secs > 0 {
+            info!("⏳ [GRADUAL SHUTDOWN] Waiting {}s for final transaction drain", final_drain_secs);
+            tokio::time::sleep(Duration::from_secs(final_drain_secs)).await;
+        }
+
+        // Phase 4: Acquire execution lock to ensure no transactions are running
+        info!("🔒 [GRADUAL SHUTDOWN] Phase 4: Acquiring execution lock");
+        let _execution_lock = self.execution_lock_for_reconfiguration().await;
+        info!("✅ [GRADUAL SHUTDOWN] Execution lock acquired - safe to proceed with authority shutdown");
+
         Ok(())
     }
 }

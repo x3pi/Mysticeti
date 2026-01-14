@@ -121,6 +121,23 @@ pub struct NodeConfig {
     /// This delay allows Go executor to finish processing and stabilize before snapshot
     #[serde(default = "default_lvm_snapshot_delay_seconds")]
     pub lvm_snapshot_delay_seconds: u64,
+    /// Epoch transition optimization level (default: "balanced")
+    /// Options: "fast" (minimal waits, faster transitions), "balanced" (reasonable waits), "safe" (conservative waits)
+    #[serde(default = "default_epoch_transition_optimization")]
+    pub epoch_transition_optimization: String,
+    /// Enable gradual shutdown for smoother epoch transitions (default: true)
+    /// When enabled, transactions are rejected gradually before authority shutdown
+    #[serde(default = "default_enable_gradual_shutdown")]
+    pub enable_gradual_shutdown: bool,
+    /// Seconds to wait for user certificates to drain during gradual shutdown (default: 2)
+    #[serde(default = "default_gradual_shutdown_user_cert_drain_secs")]
+    pub gradual_shutdown_user_cert_drain_secs: Option<u64>,
+    /// Seconds to wait for consensus certificates to drain during gradual shutdown (default: 1)
+    #[serde(default = "default_gradual_shutdown_consensus_cert_drain_secs")]
+    pub gradual_shutdown_consensus_cert_drain_secs: Option<u64>,
+    /// Seconds to wait for final transaction drain during gradual shutdown (default: 1)
+    #[serde(default = "default_gradual_shutdown_final_drain_secs")]
+    pub gradual_shutdown_final_drain_secs: Option<u64>,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -164,6 +181,26 @@ fn default_adaptive_delay_ms() -> u64 {
 
 fn default_lvm_snapshot_delay_seconds() -> u64 {
     5 // Default delay: 5 seconds
+}
+
+fn default_epoch_transition_optimization() -> String {
+    "balanced".to_string()
+}
+
+fn default_enable_gradual_shutdown() -> bool {
+    true
+}
+
+fn default_gradual_shutdown_user_cert_drain_secs() -> Option<u64> {
+    Some(2)
+}
+
+fn default_gradual_shutdown_consensus_cert_drain_secs() -> Option<u64> {
+    Some(1)
+}
+
+fn default_gradual_shutdown_final_drain_secs() -> Option<u64> {
+    Some(1)
 }
 
 impl NodeConfig {
@@ -230,10 +267,15 @@ impl NodeConfig {
                 commit_sync_batches_ahead: default_commit_sync_batches_ahead(),
                 adaptive_catchup_enabled: default_adaptive_catchup(),
                 adaptive_delay_enabled: default_adaptive_delay(),
-                adaptive_delay_ms: default_adaptive_delay_ms(),
-                enable_lvm_snapshot: false, // Disabled by default
+                enable_lvm_snapshot: false,
                 lvm_snapshot_bin_path: None,
-                lvm_snapshot_delay_seconds: default_lvm_snapshot_delay_seconds(),
+                lvm_snapshot_delay_seconds: 120,
+                epoch_transition_optimization: "balanced".to_string(),
+                enable_gradual_shutdown: true,
+                gradual_shutdown_user_cert_drain_secs: Some(2),
+                gradual_shutdown_consensus_cert_drain_secs: Some(1),
+                gradual_shutdown_final_drain_secs: Some(1),
+                adaptive_delay_ms: default_adaptive_delay_ms(),
             };
 
             // Save keys - use private_key_bytes and public key bytes

@@ -27,13 +27,13 @@ pub struct DefaultSystemTransactionProvider {
     /// Last commit index where we checked for epoch change
     last_checked_commit_index: Arc<RwLock<u32>>,
     /// Commit index buffer (number of commits to wait after detecting system transaction)
-    /// Default: 100 commits for high commit rate systems (was 10)
-    /// With commit rate 200 commits/s, 100 commits = 500ms (safer than 10 commits = 50ms)
+    /// OPTIMIZED: Default reduced to 50 commits for faster epoch transitions (was 100)
+    /// With commit rate 200 commits/s, 50 commits = 250ms (faster than 100 commits = 500ms)
     commit_index_buffer: u32,
 }
 
 impl DefaultSystemTransactionProvider {
-    /// Create a new provider with default buffer (100 commits)
+    /// Create a new provider with default buffer (50 commits for faster transition)
     pub fn new(
         current_epoch: Epoch,
         epoch_duration_seconds: u64,
@@ -45,19 +45,20 @@ impl DefaultSystemTransactionProvider {
             epoch_duration_seconds,
             epoch_start_timestamp_ms,
             time_based_enabled,
-            100, // Default: 100 commits (increased from 10 for high commit rate safety)
+            50, // OPTIMIZED: Reduced from 100 to 50 commits for faster epoch transition
         )
     }
 
     /// Create a new provider with custom commit index buffer
-    /// 
+    ///
     /// # Arguments
     /// * `commit_index_buffer` - Number of commits to wait after detecting system transaction
-    ///   before triggering epoch transition. 
+    ///   before triggering epoch transition.
     ///   - For low commit rate (<10 commits/s): 10-20 commits is sufficient
-    ///   - For medium commit rate (10-100 commits/s): 50-100 commits recommended
-    ///   - For high commit rate (>100 commits/s): 100-200 commits recommended
-    ///   - With 200 commits/s, 100 commits = 500ms (safer than 10 commits = 50ms)
+    ///   - For medium commit rate (10-100 commits/s): 20-50 commits recommended
+    ///   - For high commit rate (>100 commits/s): 50-100 commits recommended
+    ///   - OPTIMIZED: Default reduced from 100 to 50 commits for faster transitions
+    ///   - With 200 commits/s, 50 commits = 250ms (faster than 100 commits = 500ms)
     pub fn new_with_buffer(
         current_epoch: Epoch,
         epoch_duration_seconds: u64,

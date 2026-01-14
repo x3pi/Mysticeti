@@ -9,6 +9,9 @@ use consensus_core::TransactionClient;
 use tokio::sync::RwLock;
 use consensus_core::BlockStatus;
 
+// Forward declaration to avoid circular import
+// We'll use super::ConsensusNode
+
 /// Small abstraction so RPC can keep working across in-process authority restarts.
 #[async_trait]
 pub trait TransactionSubmitter: Send + Sync {

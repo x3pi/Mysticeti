@@ -30,6 +30,7 @@ mod linearizer;
 mod metrics;
 mod network;
 mod proposed_block_handler;
+mod reconfiguration;
 mod round_prober;
 mod round_tracker;
 mod stake_aggregator;
@@ -60,6 +61,7 @@ pub use authority_node::{ConsensusAuthority, NetworkType};
 pub use block::{BlockAPI, CertifiedBlock, CertifiedBlocksOutput};
 pub use epoch_change::{EpochChangeProposal, EpochChangeVote};
 pub use epoch_change_provider::EpochChangeProcessor;
+pub use reconfiguration::{ReconfigCertStatus, ReconfigState};
 
 /// Exported API for testing and tools.
 pub use block::{TestBlock, Transaction, VerifiedBlock};
