@@ -924,8 +924,8 @@ impl ConsensusNode {
         
         // Submit transactions with retry mechanism
         // Retry failed submissions with exponential backoff to handle consensus startup delays
-        const MAX_RETRIES: u32 = 10; // Increased from 5 to 10 for better epoch transition reliability
-        const INITIAL_RETRY_DELAY_MS: u64 = 100;
+        const MAX_RETRIES: u32 = 20; // Increased from 10 to 20 for better epoch transition reliability
+        const INITIAL_RETRY_DELAY_MS: u64 = 200; // Increased from 100 to 200ms
         let mut successful_count = 0;
         let mut requeued_count = 0;
         
@@ -1613,9 +1613,9 @@ impl ConsensusNode {
         // This prevents transactions from being lost if epoch transition is too fast
         // Authority needs time to initialize network connections, start consensus, etc.
         let authority_ready_delay_ms = match config.epoch_transition_optimization.as_str() {
-            "fast" => 100,   // Aggressive: 100ms minimum for consensus startup
-            "safe" => 2000,  // Conservative: 2s for maximum safety, allows consensus to fully sync
-            _ => 500,        // Balanced: 500ms reasonable delay for consensus startup
+            "fast" => 200,   // Aggressive: 200ms minimum for consensus startup
+            "safe" => 3000,  // Conservative: 3s for maximum safety, allows consensus to fully sync
+            _ => 1000,       // Balanced: 1s reasonable delay for consensus startup (increased from 500ms)
         };
 
         info!("⏳ [EPOCH TRANSITION] Using {} optimization - waiting {}ms for new authority to be fully ready before submitting queued transactions...",
@@ -1706,8 +1706,9 @@ impl ConsensusNode {
     /// Reset reconfiguration state to clean state after successful transition
     pub async fn reset_reconfig_state(&self) {
         let mut state = self.reconfig_state.write().await;
+        let old_status = state.status().clone();
         *state = ReconfigState::default(); // Reset to AcceptAll
-        info!("Reset reconfiguration state to clean state");
+        info!("🔄 [RECONFIG RESET] Reset reconfiguration state from {:?} to {:?}", old_status, state.status());
     }
 
     /// Get current reconfig state
@@ -1718,8 +1719,9 @@ impl ConsensusNode {
     /// Close user certificates - transition to RejectUserCerts
     pub async fn close_user_certs(&self) {
         let mut state = self.reconfig_state.write().await;
+        let old_status = state.status().clone();
         state.close_user_certs();
-        info!("Closed user certificates during reconfiguration");
+        info!("🔄 [RECONFIG] Closed user certificates during reconfiguration: {:?} -> {:?}", old_status, state.status());
     }
 
     /// Close all certificates - transition to RejectAllCerts

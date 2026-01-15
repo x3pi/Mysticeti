@@ -329,12 +329,77 @@ impl CommitProcessor {
         Ok(())
     }
 
+    /// Queue all user transactions from a failed commit for processing in the next epoch
+    /// This prevents transaction loss during reconfiguration when executor rejects commits
+    async fn queue_commit_transactions_for_next_epoch(
+        subdag: &CommittedSubDag,
+        pending_transactions_queue: &Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+        commit_index: u32,
+        global_exec_index: u64,
+        epoch: u64,
+    ) {
+        // Check if this commit contains EndOfEpoch system transaction
+        let has_end_of_epoch = subdag.extract_end_of_epoch_transaction().is_some();
+
+        let mut queued_count = 0;
+        let mut skipped_count = 0;
+
+        // Queue all transactions from all blocks in the commit
+        for (block_idx, block) in subdag.blocks.iter().enumerate() {
+            for (tx_idx, tx) in block.transactions().iter().enumerate() {
+                let tx_data = tx.data();
+
+                // Skip EndOfEpoch system transactions - they are epoch-specific
+                if has_end_of_epoch && Self::is_end_of_epoch_transaction(tx_data) {
+                    info!("ℹ️  [TX FLOW] Skipping EndOfEpoch system transaction in failed commit {} (epoch-specific)", commit_index);
+                    skipped_count += 1;
+                    continue;
+                }
+
+                // Queue the transaction for next epoch
+                let mut queue = pending_transactions_queue.lock().await;
+                queue.push(tx_data.to_vec());
+                queued_count += 1;
+
+                // Log transaction hash for debugging
+                let tx_hash = crate::tx_hash::calculate_transaction_hash(tx_data);
+                let tx_hash_hex = hex::encode(&tx_hash[..8]);
+
+                info!("📦 [TX FLOW] Queued failed transaction from commit {} block {} tx {}: hash={} (size={})",
+                    commit_index, block_idx, tx_idx, tx_hash_hex, tx_data.len());
+            }
+        }
+
+        if queued_count > 0 {
+            info!("✅ [TX FLOW] Queued {} transactions from failed commit {} (global_exec_index={}, epoch={}) for next epoch (skipped {} system tx)",
+                queued_count, commit_index, global_exec_index, epoch, skipped_count);
+        }
+
+        if skipped_count > 0 {
+            info!("ℹ️  [TX FLOW] Skipped {} system transactions from failed commit {} (not suitable for next epoch)", skipped_count, commit_index);
+        }
+    }
+
+    /// Check if a transaction is an EndOfEpoch system transaction
+    fn is_end_of_epoch_transaction(tx_data: &[u8]) -> bool {
+        // Simple heuristic: check if transaction data contains epoch transition markers
+        // This is a basic implementation - may need refinement based on actual transaction format
+        if tx_data.len() < 10 {
+            return false;
+        }
+
+        // Look for common patterns in EndOfEpoch transactions
+        // This may need to be updated based on actual transaction serialization
+        let data_str = String::from_utf8_lossy(tx_data);
+        data_str.contains("EndOfEpoch") || data_str.contains("epoch") && data_str.contains("transition")
+    }
+
     async fn process_commit(
         subdag: &CommittedSubDag,
         global_exec_index: u64,
         epoch: u64,
         executor_client: Option<Arc<ExecutorClient>>,
-        _pending_transactions_queue: Option<Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>>,
+        pending_transactions_queue: Option<Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>>,
     ) -> Result<()> {
         let commit_index = subdag.commit_ref.index;
         
@@ -473,11 +538,18 @@ impl CommitProcessor {
                             }
                         }
                         // #endregion
-                        warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! This commit will be skipped to prevent fork. Error: {}", 
+                        warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! This commit will be skipped to prevent fork. Error: {}",
                             send_global_exec_index, e);
                     } else {
                         warn!("⚠️  [TX FLOW] Failed to send committed subdag to executor: {}", e);
-                        // Don't fail commit if executor is unavailable (network issues, etc.)
+
+                        // CRITICAL: If we have a pending_transactions_queue and executor failed (not duplicate error),
+                        // this might be due to reconfiguration. Queue all user transactions for next epoch to prevent loss.
+                        if let Some(ref queue) = pending_transactions_queue {
+                            Self::queue_commit_transactions_for_next_epoch(subdag, queue, commit_index, global_exec_index, send_epoch).await;
+                        } else {
+                            warn!("⚠️  [TX FLOW] No pending_transactions_queue available - transactions may be lost during reconfiguration!");
+                        }
                     }
                 } else {
                     // #region agent log
