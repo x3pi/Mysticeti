@@ -1556,17 +1556,69 @@ impl ConsensusNode {
         
         // Update state
         self.current_epoch = new_epoch;
-        self.last_global_exec_index = new_last_global_exec_index;
         self.current_commit_index.store(0, Ordering::SeqCst);
 
-        // CRITICAL: Update shared_last_global_exec_index for new epoch
+        // CRITICAL: Sync shared_last_global_exec_index with Go state BEFORE creating new commit processor
         // This ensures commit processor uses correct last_global_exec_index for sequential block numbering
-        {
-            let mut shared_index_guard = self.shared_last_global_exec_index.lock().await;
-            *shared_index_guard = new_last_global_exec_index;
-            info!("📊 [EPOCH TRANSITION] Updated shared_last_global_exec_index to {} for new epoch {}", 
-                new_last_global_exec_index, new_epoch);
-        }
+        // We query Go for last block number to ensure we're in sync
+        // The synced value will be used for:
+        // 1. self.last_global_exec_index
+        // 2. shared_last_global_exec_index
+        // 3. initial_next_expected for executor client
+        let synced_last_global_exec_index = if config.executor_read_enabled {
+            let executor_client_for_sync = Arc::new(ExecutorClient::new(true, false,
+                config.executor_send_socket_path.clone(),
+                config.executor_receive_socket_path.clone()));
+            
+            // Query Go for last block number to sync shared_last_global_exec_index
+            if let Ok(go_last_block_number) = executor_client_for_sync.get_last_block_number().await {
+                // CRITICAL: Use Go's last block number to ensure we're in sync
+                // If Go is ahead, use Go's value. If Go is behind, use our calculated value.
+                let synced = if go_last_block_number >= new_last_global_exec_index {
+                    // Go is ahead or equal - use Go's value to prevent duplicate commits
+                    info!("📊 [EPOCH TRANSITION] Go is ahead (last_block_number={} >= new_last_global_exec_index={}), syncing to Go's value", 
+                        go_last_block_number, new_last_global_exec_index);
+                    go_last_block_number
+                } else {
+                    // Go is behind - use our calculated value
+                    info!("📊 [EPOCH TRANSITION] Go is behind (last_block_number={} < new_last_global_exec_index={}), using calculated value", 
+                        go_last_block_number, new_last_global_exec_index);
+                    new_last_global_exec_index
+                };
+                
+                // Update shared index with synced value
+                {
+                    let mut shared_index_guard = self.shared_last_global_exec_index.lock().await;
+                    *shared_index_guard = synced;
+                    info!("📊 [EPOCH TRANSITION] Updated shared_last_global_exec_index to {} (synced with Go) for new epoch {}", 
+                        synced, new_epoch);
+                }
+                
+                synced
+            } else {
+                // Failed to query Go - use calculated value
+                warn!("⚠️  [EPOCH TRANSITION] Failed to query Go for last block number, using calculated value {}", new_last_global_exec_index);
+                {
+                    let mut shared_index_guard = self.shared_last_global_exec_index.lock().await;
+                    *shared_index_guard = new_last_global_exec_index;
+                    info!("📊 [EPOCH TRANSITION] Updated shared_last_global_exec_index to {} (calculated) for new epoch {}", 
+                        new_last_global_exec_index, new_epoch);
+                }
+                new_last_global_exec_index
+            }
+        } else {
+            // Executor read not enabled - use calculated value
+            {
+                let mut shared_index_guard = self.shared_last_global_exec_index.lock().await;
+                *shared_index_guard = new_last_global_exec_index;
+                info!("📊 [EPOCH TRANSITION] Updated shared_last_global_exec_index to {} (calculated, executor read disabled) for new epoch {}", 
+                    new_last_global_exec_index, new_epoch);
+            }
+            new_last_global_exec_index
+        };
+        
+        // Update self.last_global_exec_index with synced value
+        self.last_global_exec_index = synced_last_global_exec_index;
 
         // Update execution lock with new epoch
         self.update_execution_lock_epoch(new_epoch).await;
@@ -1591,14 +1643,17 @@ impl ConsensusNode {
         let executor_commit_enabled = self.executor_commit_enabled;
         
         let executor_client_opt = if executor_commit_enabled {
-            // CRITICAL FIX: Set initial next_expected_index based on new_last_global_exec_index
-            // This ensures commits with global_exec_index = new_last_global_exec_index + 1, +2, ... 
+            // CRITICAL FIX: Use synced_last_global_exec_index that was calculated above
+            // This ensures initial_next_expected matches what commit processor will use
+            // 
+            // CRITICAL: Set initial next_expected_index based on synced_last_global_exec_index
+            // This ensures commits with global_exec_index = synced_last_global_exec_index + 1, +2, ... 
             // will be sent correctly, not stuck in buffer
-            // For epoch 0: new_last_global_exec_index = 0, so initial = 1 (correct)
-            // For epoch N: new_last_global_exec_index = last block of previous epoch, so initial = last + 1 (correct)
-            let initial_next_expected = new_last_global_exec_index + 1;
-            info!("🔧 [EXECUTOR INIT] Creating executor client for epoch {} with initial_next_expected={} (based on new_last_global_exec_index={})", 
-                new_epoch, initial_next_expected, new_last_global_exec_index);
+            // For epoch 0: synced_last_global_exec_index = 0, so initial = 1 (correct)
+            // For epoch N: synced_last_global_exec_index = last block of previous epoch (synced with Go), so initial = last + 1 (correct)
+            let initial_next_expected = synced_last_global_exec_index + 1;
+            info!("🔧 [EXECUTOR INIT] Creating executor client for epoch {} with initial_next_expected={} (based on synced_last_global_exec_index={})", 
+                new_epoch, initial_next_expected, synced_last_global_exec_index);
             let client = Arc::new(ExecutorClient::new_with_initial_index(true, true, 
                 config.executor_send_socket_path.clone(), 
                 config.executor_receive_socket_path.clone(),
@@ -1638,10 +1693,15 @@ impl ConsensusNode {
             use std::io::Write;
             let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"node.rs:1127","message":"CREATING NEW COMMIT PROCESSOR","data":{{"new_epoch":{},"new_last_global_exec_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                // Get synced_last_global_exec_index for logging
+                let synced_for_log = {
+                    let shared_index_guard = self.shared_last_global_exec_index.lock().await;
+                    *shared_index_guard
+                };
+                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"node.rs:1127","message":"CREATING NEW COMMIT PROCESSOR","data":{{"new_epoch":{},"synced_last_global_exec_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#, 
                     ts.as_secs(), ts.as_nanos() % 1000000,
                     ts.as_millis(),
-                    new_epoch, new_last_global_exec_index);
+                    new_epoch, synced_for_log);
             }
         }
         // #endregion
@@ -1690,26 +1750,32 @@ impl ConsensusNode {
                 }
             })
             .with_shared_last_global_exec_index(self.shared_last_global_exec_index.clone())
-            .with_epoch_info(new_epoch, new_last_global_exec_index)
+            .with_epoch_info(new_epoch, synced_last_global_exec_index)
             .with_is_transitioning(is_transitioning_for_new_epoch)
             .with_pending_transactions_queue(self.pending_transactions_queue.clone())
             .with_epoch_transition_callback(epoch_transition_callback);
         
         if let Some(ref client) = executor_client_opt {
-            // CRITICAL FIX: Initialize executor client to sync with Go state
-            // This ensures next_expected_index and buffer are in sync with Go's last block number
-            let executor_client_for_init = client.clone();
-            tokio::spawn(async move {
-                info!("🔧 [EXECUTOR INIT] Initializing executor client to sync with Go state...");
-                executor_client_for_init.initialize_from_go().await;
-                info!("✅ [EXECUTOR INIT] Executor client initialized and synced with Go state");
-            });
+            // CRITICAL FIX: Do NOT call initialize_from_go() after epoch transition
+            // We've already synced shared_last_global_exec_index with Go state above
+            // and set initial_next_expected correctly. Calling initialize_from_go() here
+            // would overwrite the correct initial_next_expected and cause blocks to be stuck in buffer.
+            // 
+            // The executor client was created with correct initial_next_expected = synced_last_global_exec_index + 1,
+            // which matches what commit processor will use (shared_last_global_exec_index + 1).
+            info!("✅ [EXECUTOR INIT] Executor client for epoch {} already initialized with correct initial_next_expected (synced with Go state above)", new_epoch);
             commit_processor = commit_processor.with_executor_client(client.clone());
         }
         
+        // Get synced_last_global_exec_index for logging
+        let synced_last_global_exec_index_for_log = {
+            let shared_index_guard = self.shared_last_global_exec_index.lock().await;
+            *shared_index_guard
+        };
+        
         tokio::spawn(async move {
             info!("🚀 [COMMIT PROCESSOR] Starting for epoch {} (last_global_exec_index={})",
-                new_epoch_clone, new_last_global_exec_index);
+                new_epoch_clone, synced_last_global_exec_index_for_log);
             if let Err(e) = commit_processor.run().await {
                 error!("❌ [COMMIT PROCESSOR] Error: {}", e);
             }
