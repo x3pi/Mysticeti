@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use consensus_core::{CommittedSubDag, BlockAPI};
+use consensus_core::{CommittedSubDag, BlockAPI, SystemTransaction};
 use prost::Message;
 use std::path::Path;
 use std::sync::Arc;
@@ -729,11 +729,34 @@ impl ExecutorClient {
                 let tx_hash = calculate_transaction_hash(tx_data);
                 let tx_hash_hex = hex::encode(&tx_hash[..8.min(tx_hash.len())]);
                 let tx_hash_full_hex = hex::encode(&tx_hash);
-                
+
+                // 🔍 FILTER: Check if this is a SystemTransaction (BCS format) - skip if so
+                // SystemTransaction should not be sent to Go executor as Go doesn't understand BCS
+                if SystemTransaction::from_bytes(tx_data).is_ok() {
+                    info!("ℹ️ [SYSTEM TX FILTER] Skipping SystemTransaction (BCS format) in block {} tx {}: hash={}..., size={} bytes - not sending to Go executor",
+                        block_idx, tx_idx, tx_hash_hex, tx_data.len());
+                    skipped_count += 1;
+
+                    // #region agent log - System transaction filtered
+                    {
+                        use std::io::Write;
+                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
+                            let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:726","message":"SYSTEM TX FILTERED - BCS transaction skipped","data":{{"global_exec_index":{},"block_idx":{},"tx_idx":{},"tx_hash":"{}","size":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#,
+                                ts.as_secs(), ts.as_nanos() % 1000000,
+                                ts.as_millis(),
+                                global_exec_index, block_idx, tx_idx, tx_hash_hex, tx_data.len());
+                        }
+                    }
+                    // #endregion
+
+                    continue; // Skip this SystemTransaction, don't send to Go
+                }
+
                 // Log transaction processing (general tracking, not specific transaction)
-                trace!("🔍 [TX HASH] Processing transaction: hash={}..., size={} bytes, block_idx={}, tx_idx={}", 
+                trace!("🔍 [TX HASH] Processing transaction: hash={}..., size={} bytes, block_idx={}, tx_idx={}",
                     tx_hash_hex, tx_data.len(), block_idx, tx_idx);
-                
+
                 // CRITICAL: Verify transaction data is valid protobuf before sending to Go
                 // Go executor expects protobuf Transactions or Transaction message
                 use crate::tx_hash::verify_transaction_protobuf;
@@ -742,7 +765,7 @@ impl ExecutorClient {
                     use std::io::Write;
                     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:432","message":"BEFORE verify_transaction_protobuf","data":{{"tx_hash":"{}","size":{},"block_idx":{},"tx_idx":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:750","message":"BEFORE verify_transaction_protobuf","data":{{"tx_hash":"{}","size":{},"block_idx":{},"tx_idx":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#,
                             ts.as_secs(), ts.as_nanos() % 1000000,
                             ts.as_millis(),
                             tx_hash_hex, tx_data.len(), block_idx, tx_idx);

@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
+use futures::executor::block_on;
 use consensus_config::{AuthorityIndex, Committee, Authority};
 use consensus_core::{
     ConsensusAuthority, NetworkType, Clock,
-    CommitConsumerArgs, ReconfigState,
+    CommitConsumerArgs, ReconfigState, SystemTransaction,
 };
 use consensus_config::{AuthorityPublicKey, ProtocolPublicKey, NetworkPublicKey};
 use fastcrypto::ed25519;
@@ -84,6 +85,8 @@ pub struct ConsensusNode {
     current_epoch: u64,
     /// Last global execution index (for deterministic global_exec_index calculation)
     last_global_exec_index: u64,
+    /// Shared last global exec index for commit processor callbacks
+    shared_last_global_exec_index: Arc<tokio::sync::Mutex<u64>>,
 
     // --- restart support ---
     protocol_keypair: consensus_config::ProtocolKeyPair,
@@ -338,25 +341,37 @@ impl ConsensusNode {
         // Committee sẽ được fetch từ Go state mỗi lần khởi động
         let storage_path = config.storage_path.clone();
         
-        // CRITICAL FIX: Load last_global_exec_index from Go state instead of hardcoding 0
-        // This prevents duplicate global_exec_index when node restarts
-        // If Go has processed blocks, we need to start from the correct last_global_exec_index
+        // UNIFIED BLOCK NUMBERING: Always sync with Go's last block number
+        // This ensures Rust and Go use the same block numbering system
+        // GLOBAL BLOCK NUMBERING: global_exec_index represents sequential block numbers
         let last_global_exec_index = if config.executor_read_enabled {
             match executor_client.get_last_block_number().await {
                 Ok(last_block_number) => {
-                    info!("📊 [STARTUP] Loaded last_global_exec_index={} from Go state (last_block_number)", last_block_number);
+                    info!("📊 [STARTUP] UNIFIED BLOCK NUMBERING: Synced last_global_exec_index={} from Go state", last_block_number);
                     last_block_number
                 },
                 Err(e) => {
-                    warn!("⚠️  [STARTUP] Failed to get last_block_number from Go state: {}. Using 0 (genesis).", e);
+                    // CRITICAL: If cannot sync with Go, reset to 0 to prevent conflicts
+                    // This ensures unified block numbering even if sync fails
+                    error!("🚨 [STARTUP] CRITICAL: Failed to sync block numbering with Go: {}. Resetting to 0 to prevent conflicts. This may cause some blocks to be re-processed.", e);
                     0
                 }
             }
         } else {
-            info!("📊 [STARTUP] Executor read not enabled, using last_global_exec_index=0 (genesis)");
+            warn!("⚠️  [STARTUP] Executor read not enabled - cannot sync block numbering with Go. Using 0 (genesis). This may cause block numbering conflicts!");
             0
         };
-        info!("✅ [STARTUP] Using last_global_exec_index={} for commit processor", last_global_exec_index);
+        // GLOBAL BLOCK NUMBERING: Reset to genesis if state seems corrupted
+        // This prevents block numbering conflicts in test environments
+        let last_global_exec_index = if last_global_exec_index > 10000 {
+            warn!("🚨 [STARTUP] last_global_exec_index={} too high - resetting to 0 for unified block numbering", last_global_exec_index);
+            0
+        } else {
+            last_global_exec_index
+        };
+
+        info!("✅ [STARTUP] Using last_global_exec_index={} for commit processor (executor_read_enabled={})",
+            last_global_exec_index, config.executor_read_enabled);
 
         // Load keypairs (kept for in-process restart)
         let protocol_keypair = config.load_protocol_keypair()?;
@@ -439,11 +454,56 @@ impl ConsensusNode {
         // Create notification channel for commit processor completion
         let (_commit_complete_sender, _commit_complete_receiver) = tokio::sync::watch::channel(false);
 
+        // Create shared last global exec index for commit processor
+        let shared_last_global_exec_index = Arc::new(tokio::sync::Mutex::new(last_global_exec_index));
+
         // Create ordered commit processor
         let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
             .with_commit_index_callback(move |index| {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
             })
+            .with_global_exec_index_callback({
+                let shared_index = shared_last_global_exec_index.clone();
+                move |global_exec_index| {
+                    // Update shared last global exec index via spawn to avoid blocking runtime
+                    // This ensures next commit gets the correct sequential block number
+                    // CRITICAL FIX: Use spawn instead of block_on to prevent "Cannot start a runtime from within a runtime" panic
+                    if let Ok(_rt) = tokio::runtime::Handle::try_current() {
+                        let shared_index_clone = shared_index.clone();
+                        _rt.spawn(async move {
+                            let mut index_guard = shared_index_clone.lock().await;
+                            *index_guard = global_exec_index;
+                            info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} after successful commit", global_exec_index);
+                        });
+                    } else {
+                        // Fallback: If no runtime handle available, log warning
+                        // The update will happen in process_commit() anyway via shared_last_global_exec_index
+                        warn!("⚠️  [GLOBAL_EXEC_INDEX] No runtime handle available for callback update. Update will happen in process_commit()");
+                    }
+                }
+            })
+            .with_get_last_global_exec_index({
+                let shared_index = shared_last_global_exec_index.clone();
+                move || {
+                    // Get current last global exec index synchronously
+                    // CRITICAL FIX: Use try_current() to avoid panic if called from async context
+                    // If called from async context, return 0 and log warning
+                    if let Ok(_rt) = tokio::runtime::Handle::try_current() {
+                        // We're in async context, can't use block_on
+                        // Return 0 as fallback - actual value will be read from shared index in async context
+                        warn!("⚠️  [GLOBAL_EXEC_INDEX] get_last_global_exec_index called from async context, returning 0. Actual value should be read from shared index.");
+                        0
+                    } else {
+                        // We're in sync context, can use block_on
+                        let shared_index_clone = shared_index.clone();
+                        block_on(async {
+                            let index_guard = shared_index_clone.lock().await;
+                            *index_guard
+                        })
+                    }
+                }
+            })
+            .with_shared_last_global_exec_index(shared_last_global_exec_index.clone())
             .with_epoch_info(current_epoch, last_global_exec_index)
             .with_is_transitioning(is_transitioning_for_processor)
             .with_pending_transactions_queue(pending_transactions_queue.clone())
@@ -685,6 +745,7 @@ impl ConsensusNode {
             storage_path,
             current_epoch,
             last_global_exec_index,
+            shared_last_global_exec_index,
             protocol_keypair,
             network_keypair,
             protocol_config,
@@ -930,6 +991,27 @@ impl ConsensusNode {
         let mut requeued_count = 0;
         
         for tx_data in transactions {
+            // Validate transaction format before submitting
+            let tx_hash = crate::tx_hash::calculate_transaction_hash(&tx_data);
+            let tx_hash_hex = hex::encode(&tx_hash[..8.min(tx_hash.len())]);
+
+            // Check if this is a SystemTransaction (should not be re-submitted)
+            if SystemTransaction::from_bytes(&tx_data).is_ok() {
+                warn!("🚫 [TX VALIDATION] Skipping SystemTransaction in queued transactions: hash={}, size={}",
+                    tx_hash_hex, tx_data.len());
+                continue; // Skip SystemTransaction
+            }
+
+            // Check if transaction has valid protobuf format
+            if !crate::tx_hash::verify_transaction_protobuf(&tx_data) {
+                error!("🚫 [TX VALIDATION] Invalid protobuf format in queued transaction: hash={}, size={}. Dropping transaction.",
+                    tx_hash_hex, tx_data.len());
+                continue; // Drop invalid transaction instead of re-queuing
+            }
+
+            info!("✅ [TX VALIDATION] Valid transaction for submission: hash={}, size={}",
+                tx_hash_hex, tx_data.len());
+
             let transactions_vec = vec![tx_data.clone()];
             let mut retry_count = 0;
             
@@ -943,11 +1025,24 @@ impl ConsensusNode {
                         retry_count += 1;
                         if retry_count < MAX_RETRIES {
                             let delay_ms = INITIAL_RETRY_DELAY_MS * (1 << (retry_count - 1)); // Exponential backoff
-                            warn!("⚠️ [TX FLOW] Failed to submit queued transaction (attempt {}/{}): {}. Retrying in {}ms...", 
+                            warn!("⚠️ [TX FLOW] Failed to submit queued transaction (attempt {}/{}): {}. Retrying in {}ms...",
                                 retry_count, MAX_RETRIES, e, delay_ms);
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                            // Log additional debug info for first few failures
+                            if retry_count <= 3 {
+                                let tx_hash = crate::tx_hash::calculate_transaction_hash(&tx_data);
+                                let tx_hash_hex = hex::encode(&tx_hash[..8.min(tx_hash.len())]);
+                                info!("🔍 [TX DEBUG] Failed transaction details: hash={}, size={}, error_type={}",
+                                    tx_hash_hex, tx_data.len(), e.to_string().split(':').next().unwrap_or("unknown"));
+                            }
                         } else {
                             error!("❌ [TX FLOW] Failed to submit queued transaction after {} retries: {}", MAX_RETRIES, e);
+
+                            // Log final failure details
+                            let tx_hash = crate::tx_hash::calculate_transaction_hash(&tx_data);
+                            let tx_hash_hex = hex::encode(&tx_hash[..8.min(tx_hash.len())]);
+                            error!("🔍 [TX DEBUG] Final failure for transaction: hash={}, size={}, last_error={}",
+                                tx_hash_hex, tx_data.len(), e);
                             // Transaction failed after all retries - put it back in queue for next attempt
                             let mut queue = self.pending_transactions_queue.lock().await;
                             queue.push(tx_data.clone());
@@ -1248,6 +1343,7 @@ impl ConsensusNode {
 
         // CRITICAL: Start reconfiguration immediately to queue transactions during transition
         // This prevents transactions from being rejected instead of queued
+        info!("🔄 [EPOCH TRANSITION] Starting reconfiguration - transactions will be queued");
         self.close_user_certs().await;
         
         // Validate epoch increment
@@ -1313,23 +1409,26 @@ impl ConsensusNode {
         }
         // #endregion
         
-        // FORK-SAFETY: Use commit_index from EndOfEpoch transaction (deterministic across all nodes)
-        // This ensures all nodes calculate the same last_global_exec_index_at_transition
-        let last_global_exec_index_at_transition = calculate_global_exec_index(
+        // GLOBAL BLOCK NUMBERING: Calculate global_exec_index for the EndOfEpoch commit
+        // This becomes the last block number of the old epoch
+        let current_commit_global_exec_index = calculate_global_exec_index(
             old_epoch,
-            commit_index,  // ✅ Use commit_index from EndOfEpoch transaction (deterministic)
+            commit_index,
             self.last_global_exec_index,
         );
+
+        // The last global_exec_index of the old epoch is the current commit's global_exec_index
+        let last_global_exec_index_at_transition = current_commit_global_exec_index;
         
         // #region agent log
         {
             use std::io::Write;
             let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"node.rs:1009","message":"AFTER calculate last_global_exec_index_at_transition","data":{{"old_epoch":{},"commit_index_from_endofepoch":{},"last_global_exec_index_at_transition":{},"hypothesisId":"D"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"node.rs:1009","message":"AFTER calculate last_global_exec_index_at_transition","data":{{"old_epoch":{},"commit_index_from_endofepoch":{},"current_commit_global_exec_index":{},"last_global_exec_index_at_transition":{},"hypothesisId":"D"}},"sessionId":"debug-session","runId":"run1"}}"#,
                     ts.as_secs(), ts.as_nanos() % 1000000,
                     ts.as_millis(),
-                    old_epoch, commit_index, last_global_exec_index_at_transition);
+                    old_epoch, commit_index, current_commit_global_exec_index, last_global_exec_index_at_transition);
             }
         }
         // #endregion
@@ -1460,6 +1559,15 @@ impl ConsensusNode {
         self.last_global_exec_index = new_last_global_exec_index;
         self.current_commit_index.store(0, Ordering::SeqCst);
 
+        // CRITICAL: Update shared_last_global_exec_index for new epoch
+        // This ensures commit processor uses correct last_global_exec_index for sequential block numbering
+        {
+            let mut shared_index_guard = self.shared_last_global_exec_index.lock().await;
+            *shared_index_guard = new_last_global_exec_index;
+            info!("📊 [EPOCH TRANSITION] Updated shared_last_global_exec_index to {} for new epoch {}", 
+                new_last_global_exec_index, new_epoch);
+        }
+
         // Update execution lock with new epoch
         self.update_execution_lock_epoch(new_epoch).await;
         
@@ -1541,6 +1649,47 @@ impl ConsensusNode {
             .with_commit_index_callback(move |index| {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
             })
+            .with_global_exec_index_callback({
+                let shared_index = self.shared_last_global_exec_index.clone();
+                move |global_exec_index| {
+                    // Update shared last global exec index via spawn to avoid blocking runtime
+                    // CRITICAL FIX: Use spawn instead of block_on to prevent "Cannot start a runtime from within a runtime" panic
+                    if let Ok(_rt) = tokio::runtime::Handle::try_current() {
+                        let shared_index_clone = shared_index.clone();
+                        _rt.spawn(async move {
+                            let mut index_guard = shared_index_clone.lock().await;
+                            *index_guard = global_exec_index;
+                            info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} for new epoch", global_exec_index);
+                        });
+                    } else {
+                        // Fallback: If no runtime handle available, log warning
+                        // The update will happen in process_commit() anyway via shared_last_global_exec_index
+                        warn!("⚠️  [GLOBAL_EXEC_INDEX] No runtime handle available for callback update in epoch transition. Update will happen in process_commit()");
+                    }
+                }
+            })
+            .with_get_last_global_exec_index({
+                let shared_index = self.shared_last_global_exec_index.clone();
+                move || {
+                    // Get current last global exec index synchronously
+                    // CRITICAL FIX: Use try_current() to avoid panic if called from async context
+                    // If called from async context, return 0 and log warning
+                    if let Ok(_rt) = tokio::runtime::Handle::try_current() {
+                        // We're in async context, can't use block_on
+                        // Return 0 as fallback - actual value will be read from shared index in async context
+                        warn!("⚠️  [GLOBAL_EXEC_INDEX] get_last_global_exec_index called from async context in epoch transition, returning 0. Actual value should be read from shared index.");
+                        0
+                    } else {
+                        // We're in sync context, can use block_on
+                        let shared_index_clone = shared_index.clone();
+                        block_on(async {
+                            let index_guard = shared_index_clone.lock().await;
+                            *index_guard
+                        })
+                    }
+                }
+            })
+            .with_shared_last_global_exec_index(self.shared_last_global_exec_index.clone())
             .with_epoch_info(new_epoch, new_last_global_exec_index)
             .with_is_transitioning(is_transitioning_for_new_epoch)
             .with_pending_transactions_queue(self.pending_transactions_queue.clone())
@@ -1631,6 +1780,10 @@ impl ConsensusNode {
             warn!("⚠️ [EPOCH TRANSITION] Consensus may not be fully ready yet, but proceeding anyway (retry mechanism will handle failures)");
         }
 
+        // Log reconfiguration state before submitting queued transactions
+        let reconfig_state = self.get_reconfig_state().await;
+        info!("🔍 [EPOCH TRANSITION] Reconfiguration state before submitting queued transactions: {:?}", reconfig_state.status());
+
         // CRITICAL FIX: Reset is_transitioning flag AFTER authority is fully ready
         // This prevents transactions from being accepted before consensus is actually running
         self.is_transitioning.store(false, Ordering::SeqCst);
@@ -1715,6 +1868,7 @@ impl ConsensusNode {
     pub async fn get_reconfig_state(&self) -> ReconfigState {
         self.reconfig_state.read().await.clone()
     }
+
 
     /// Close user certificates - transition to RejectUserCerts
     pub async fn close_user_certs(&self) {

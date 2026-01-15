@@ -15,33 +15,25 @@
 /// 
 /// This is similar to Sui's Checkpoint Sequence Number which increases continuously
 /// across epochs without resetting.
+/// Calculate global execution index as sequential block number
+/// GLOBAL REFACTOR: global_exec_index now represents sequential block numbers
+/// that are shared between Rust and Go for unified block ordering
 pub fn calculate_global_exec_index(
-    epoch: u64,
-    commit_index: u32,
+    _epoch: u64,  // No longer used - block numbers are global and sequential
+    _commit_index: u32, // No longer used - each commit gets next sequential number
     last_global_exec_index: u64,
 ) -> u64 {
-    if epoch == 0 {
-        // Epoch 0: commit_index starts from 1, so global_exec_index starts from 1
-        // commit_index=1 → global_exec_index=1 (first block is block 1)
-        // commit_index=2 → global_exec_index=2, etc.
+    // GLOBAL BLOCK NUMBERING: Each commit gets the next sequential block number
+    // This ensures Rust and Go use the same block numbering system
+    //
+    // Example:
+    // - Genesis: global_exec_index = 1 (first block)
+    // - Next commit: global_exec_index = 2
+    // - After epoch transition: global_exec_index = last_global_exec_index + 1
+    //
+    // This creates: 1, 2, 3, 4, 5, ... continuous block numbers
 
-        // SPECIAL CASE: If last_global_exec_index is much higher than commit_index,
-        // it means we're synchronizing with an existing chain state.
-        // Use last_global_exec_index as base to continue from the correct point.
-        if last_global_exec_index > commit_index as u64 * 10 {
-            // Synchronization case: continue from last_global_exec_index
-            last_global_exec_index + commit_index as u64
-        } else {
-            // Normal genesis case: start from commit_index
-            commit_index as u64
-        }
-    } else {
-        // Epoch N: commit_index starts from 1 → first global_exec_index is last_global_exec_index + 1
-        // Example:
-        // - Epoch 0 ends at global_exec_index=1276
-        // - Epoch 1, commit_index=1 → global_exec_index = 1276 + 1 = 1277
-        last_global_exec_index + commit_index as u64
-    }
+    last_global_exec_index + 1
 }
 
 #[cfg(test)]
@@ -49,49 +41,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_calculate_global_exec_index_epoch_0() {
-        // Epoch 0: global_exec_index = commit_index (commit_index starts from 1, so global_exec_index starts from 1)
-        assert_eq!(calculate_global_exec_index(0, 0, 0), 0); // commit_index=0 → global_exec_index=0 (edge case)
-        assert_eq!(calculate_global_exec_index(0, 1, 0), 1); // commit_index=1 → global_exec_index=1 (first block is block 1)
-        assert_eq!(calculate_global_exec_index(0, 2, 0), 2); // commit_index=2 → global_exec_index=2
-        assert_eq!(calculate_global_exec_index(0, 100, 0), 100); // commit_index=100 → global_exec_index=100
+    fn test_calculate_global_exec_index_sequential_block_numbers() {
+        // GLOBAL BLOCK NUMBERING: global_exec_index = last_global_exec_index + 1
+        // Independent of epoch and commit_index - represents sequential block numbers
+
+        // Genesis case: first block
+        assert_eq!(calculate_global_exec_index(0, 0, 0), 1); // First block is block 1
+
+        // Sequential blocks (epoch and commit_index ignored)
+        assert_eq!(calculate_global_exec_index(0, 1, 1), 2); // Block 2
+        assert_eq!(calculate_global_exec_index(5, 100, 2), 3); // Block 3 (epoch/commit_index ignored)
+        assert_eq!(calculate_global_exec_index(10, 500, 99), 100); // Block 100
+
+        // Epoch transitions: continue sequential numbering
+        assert_eq!(calculate_global_exec_index(1, 1, 100), 101); // Block 101 (after epoch transition)
+        assert_eq!(calculate_global_exec_index(1, 50, 101), 102); // Block 102
+        assert_eq!(calculate_global_exec_index(2, 1, 150), 151); // Block 151 (after another epoch transition)
     }
 
     #[test]
-    fn test_calculate_global_exec_index_epoch_1() {
-        // Epoch 1: global_exec_index = last_global_exec_index + commit_index
-        // Assume epoch 0 ended at commit_index 100, so last_global_exec_index = 100
-        // Epoch 1, commit_index=1 → global_exec_index = 100 + 1 = 101
-        assert_eq!(calculate_global_exec_index(1, 0, 100), 100); // commit_index=0 (edge case; not used by consensus)
-        assert_eq!(calculate_global_exec_index(1, 1, 100), 101);
-        assert_eq!(calculate_global_exec_index(1, 50, 100), 150);
-    }
-
-    #[test]
-    fn test_calculate_global_exec_index_epoch_2() {
-        // Epoch 2: continue from epoch 1
-        // Assume epoch 1 ended at commit_index 50, so last_global_exec_index = 150 (100 + 50)
-        // Epoch 2, commit_index=1 → global_exec_index = 150 + 1 = 151
-        assert_eq!(calculate_global_exec_index(2, 0, 150), 150); // edge case (not used by consensus)
-        assert_eq!(calculate_global_exec_index(2, 1, 150), 151);
-        assert_eq!(calculate_global_exec_index(2, 25, 150), 175);
-    }
-
-    #[test]
-    fn test_deterministic_across_nodes() {
-        // All nodes with same epoch, commit_index, last_global_exec_index
-        // should compute the same global_exec_index
-        let epoch = 5;
-        let commit_index = 42;
+    fn test_global_exec_index_deterministic() {
+        // All nodes with same last_global_exec_index should compute same next block number
         let last_global_exec_index = 1000;
-        
-        let result1 = calculate_global_exec_index(epoch, commit_index, last_global_exec_index);
-        let result2 = calculate_global_exec_index(epoch, commit_index, last_global_exec_index);
-        let result3 = calculate_global_exec_index(epoch, commit_index, last_global_exec_index);
-        
+
+        let result1 = calculate_global_exec_index(0, 0, last_global_exec_index);
+        let result2 = calculate_global_exec_index(5, 50, last_global_exec_index);
+        let result3 = calculate_global_exec_index(10, 100, last_global_exec_index);
+
         assert_eq!(result1, result2);
         assert_eq!(result2, result3);
-        assert_eq!(result1, 1042); // 1000 + 42
+        assert_eq!(result1, 1001); // Always last_global_exec_index + 1
     }
 }
 
