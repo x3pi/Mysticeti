@@ -33,6 +33,15 @@ use crate::checkpoint::calculate_global_exec_index;
 use crate::executor_client::ExecutorClient;
 use consensus_core::{SystemTransactionProvider, DefaultSystemTransactionProvider};
 
+/// Node operation modes
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum NodeMode {
+    /// Node chỉ đồng bộ dữ liệu, không tham gia voting
+    SyncOnly,
+    /// Node tham gia consensus và voting
+    Validator,
+}
+
 // Global registry for transition handler to access node
 // This allows transition handler task to call transition function on the node
 static TRANSITION_HANDLER_REGISTRY: tokio::sync::OnceCell<Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<ConsensusNode>>>>>> = tokio::sync::OnceCell::const_new();
@@ -64,6 +73,8 @@ pub async fn set_transition_handler_node(node: Arc<tokio::sync::Mutex<ConsensusN
 
 pub struct ConsensusNode {
     authority: Option<ConsensusAuthority>,
+    /// Current node operation mode (SyncOnly or Validator)
+    node_mode: NodeMode,
     /// Execution lock to prevent transaction interruption during reconfiguration
     /// Similar to Sui's ExecutionLock, protects against concurrent reconfiguration
     execution_lock: Arc<tokio::sync::RwLock<u64>>, // epoch ID
@@ -71,7 +82,8 @@ pub struct ConsensusNode {
     /// Similar to Sui's ReconfigState, enables smooth epoch transitions
     reconfig_state: Arc<tokio::sync::RwLock<consensus_core::ReconfigState>>,
     /// Stable handle for RPC submissions across in-process authority restart
-    transaction_client_proxy: Arc<TransactionClientProxy>,
+    /// None for sync-only nodes that don't submit transactions
+    transaction_client_proxy: Option<Arc<TransactionClientProxy>>,
     /// Clock synchronization manager
     #[allow(dead_code)] // Used internally by sync tasks
     clock_sync_manager: Arc<RwLock<ClockSyncManager>>,
@@ -128,6 +140,8 @@ pub struct ConsensusNode {
     // commit_complete_receiver: tokio::sync::watch::Receiver<bool>,
     /// Channel sender for epoch transition requests from system transactions
     epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u32)>,
+    /// Sync task handle for sync-only nodes
+    sync_task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ConsensusNode {
@@ -378,17 +392,25 @@ impl ConsensusNode {
         let network_keypair = config.load_network_keypair()?;
 
         // Get own authority index by matching hostname (committee is now sorted by address)
+        // Note: Node may not be in committee (sync-only mode) - own_index can be None
         let own_hostname = format!("node-{}", config.node_id);
-        let own_index = committee.authorities().find_map(|(idx, auth)| {
+        let own_index_opt = committee.authorities().find_map(|(idx, auth)| {
             if auth.hostname == own_hostname {
                 Some(idx)
             } else {
                 None
             }
-        }).ok_or_else(|| {
-            anyhow::anyhow!("Cannot find authority with hostname '{}' in committee", own_hostname)
-        })?;
-        info!("Node {} matched to authority index {}", config.node_id, own_index);
+        });
+        
+        // Check if node is in committee (determines if we should start as validator)
+        let is_in_committee = own_index_opt.is_some();
+        let own_index = own_index_opt.unwrap_or(AuthorityIndex::ZERO); // Default index for sync-only nodes (won't be used)
+        
+        if is_in_committee {
+            info!("✅ Node {} matched to authority index {} (will start as validator)", config.node_id, own_index);
+        } else {
+            info!("🔄 Node {} not found in committee (will start as sync-only)", config.node_id);
+        }
 
         // Create storage directory
         std::fs::create_dir_all(&config.storage_path)?;
@@ -673,28 +695,44 @@ impl ConsensusNode {
             ClockSyncManager::start_drift_monitor(monitor_manager_clone);
         }
 
-        // Start authority node
-        info!("Starting consensus authority node...");
-        let authority = ConsensusAuthority::start(
-            NetworkType::Tonic,
-            epoch_start_timestamp,
-            own_index,
-            committee,
-            parameters.clone(),
-            protocol_config.clone(),
-            protocol_keypair.clone(),
-            network_keypair.clone(),
-            clock.clone(),
-            transaction_verifier.clone(),
-            commit_consumer,
-            registry.clone(),
-            0, // boot_counter
-            Some(system_transaction_provider.clone() as Arc<dyn SystemTransactionProvider>), // Pass system transaction provider
-        )
-        .await;
+        // Start authority node ONLY if node is in committee (validator mode)
+        // If node is not in committee (sync-only mode), authority will be None
+        let authority = if is_in_committee {
+            info!("🚀 Starting consensus authority node (node is in committee)...");
+            Some(ConsensusAuthority::start(
+                NetworkType::Tonic,
+                epoch_start_timestamp,
+                own_index,
+                committee.clone(),
+                parameters.clone(),
+                protocol_config.clone(),
+                protocol_keypair.clone(),
+                network_keypair.clone(),
+                clock.clone(),
+                transaction_verifier.clone(),
+                commit_consumer,
+                registry.clone(),
+                0, // boot_counter
+                Some(system_transaction_provider.clone() as Arc<dyn SystemTransactionProvider>), // Pass system transaction provider
+            )
+            .await)
+        } else {
+            info!("🔄 Skipping consensus authority start (node is not in committee - sync-only mode)");
+            None
+        };
 
-        let transaction_client = authority.transaction_client();
-        let transaction_client_proxy = Arc::new(TransactionClientProxy::new(transaction_client));
+        // Create transaction client proxy
+        // Only create for validator nodes - sync-only nodes don't need it
+        // When sync-only node becomes validator during epoch transition, proxy will be created then
+        let transaction_client_proxy = if let Some(ref auth) = authority {
+            let transaction_client = auth.transaction_client();
+            Some(Arc::new(TransactionClientProxy::new(transaction_client)))
+        } else {
+            // Sync-only nodes don't submit transactions, so no transaction client proxy needed
+            // It will be created automatically when node switches to validator mode during epoch transition
+            info!("🔄 Sync-only node: No transaction client proxy needed (will be created when node becomes validator)");
+            None
+        };
 
         // Create no-op provider/processor to satisfy Core's interface
         use consensus_core::epoch_change_provider::{EpochChangeProvider, EpochChangeProcessor};
@@ -734,8 +772,9 @@ impl ConsensusNode {
         let lvm_snapshot_bin_path_for_node = config.lvm_snapshot_bin_path.clone();
         
         // Create node instance
-        let node = Self {
-            authority: Some(authority),
+        let mut node = Self {
+            authority,
+            node_mode: config.initial_node_mode.clone(), // Start with configured initial mode
             execution_lock: Arc::new(tokio::sync::RwLock::new(current_epoch)),
             reconfig_state: Arc::new(tokio::sync::RwLock::new(ReconfigState::default())),
             transaction_client_proxy,
@@ -768,6 +807,7 @@ impl ConsensusNode {
             // commit_complete_sender: tokio::sync::watch::channel(false).0,
             // commit_complete_receiver: tokio::sync::watch::channel(false).1,
             epoch_transition_sender: epoch_tx_sender_for_node,
+            sync_task_handle: None,
         };
 
         // Spawn transition handler task
@@ -806,12 +846,23 @@ impl ConsensusNode {
             }
         });
 
+        // Check and update node mode based on initial committee membership
+        // This ensures node starts in correct mode (SyncOnly vs Validator) based on genesis committee
+        node.check_and_update_node_mode(&committee, &config).await?;
+
+        // If node is in sync-only mode after check, ensure sync task is started
+        if matches!(node.node_mode, NodeMode::SyncOnly) {
+            if let Err(e) = node.start_sync_task(&config).await {
+                warn!("⚠️ [STARTUP] Failed to start sync task for sync-only node: {}", e);
+            }
+        }
+
         Ok(node)
     }
 
     #[allow(dead_code)] 
-    pub fn transaction_submitter(&self) -> Arc<dyn TransactionSubmitter> {
-        self.transaction_client_proxy.clone() as Arc<dyn TransactionSubmitter>
+    pub fn transaction_submitter(&self) -> Option<Arc<dyn TransactionSubmitter>> {
+        self.transaction_client_proxy.as_ref().map(|proxy| proxy.clone() as Arc<dyn TransactionSubmitter>)
     }
 
     #[allow(dead_code)]
@@ -1012,11 +1063,21 @@ impl ConsensusNode {
             info!("✅ [TX VALIDATION] Valid transaction for submission: hash={}, size={}",
                 tx_hash_hex, tx_data.len());
 
+            // For sync-only nodes, we don't have transaction client proxy
+            if self.transaction_client_proxy.is_none() {
+                warn!("⚠️ [TX FLOW] Cannot submit transactions: node is sync-only (no transaction client). Re-queuing for when node becomes validator.");
+                // Re-queue transaction for when node becomes validator
+                let mut queue = self.pending_transactions_queue.lock().await;
+                queue.push(tx_data.clone());
+                requeued_count += 1;
+                continue;
+            }
+            
             let transactions_vec = vec![tx_data.clone()];
             let mut retry_count = 0;
             
             while retry_count < MAX_RETRIES {
-                match self.transaction_client_proxy.submit(transactions_vec.clone()).await {
+                match self.transaction_client_proxy.as_ref().unwrap().submit(transactions_vec.clone()).await {
                     Ok(_) => {
                         successful_count += 1;
                         break;
@@ -1086,8 +1147,14 @@ impl ConsensusNode {
         Ok(successful_count)
     }
 
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(mut self) -> Result<()> {
         info!("Shutting down consensus node...");
+
+        // Stop sync task if running
+        if let Err(e) = self.stop_sync_task().await {
+            warn!("⚠️ [SHUTDOWN] Failed to stop sync task: {}", e);
+        }
+
         if let Some(authority) = self.authority {
             authority.stop().await;
         }
@@ -1098,6 +1165,12 @@ impl ConsensusNode {
     #[allow(dead_code)]
     pub async fn graceful_shutdown(&mut self) -> Result<()> {
         info!("Starting graceful shutdown...");
+
+        // Stop sync task
+        if let Err(e) = self.stop_sync_task().await {
+            warn!("⚠️ [GRACEFUL SHUTDOWN] Failed to stop sync task: {}", e);
+        }
+
         tokio::time::sleep(Duration::from_millis(100)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1480,8 +1553,33 @@ impl ConsensusNode {
             .map(|(_, auth)| auth.clone())
             .collect();
         let new_committee = Committee::new(new_epoch, authorities);
-        
+
         info!("✅ Committee built from Go state: {} authorities", new_committee.size());
+
+        // Check and update node mode based on committee membership
+        self.check_and_update_node_mode(&new_committee, config).await?;
+        
+        // CRITICAL: Update own_index based on new committee membership
+        // This is essential for nodes that switch from sync-only to validator mode
+        // Tách biệt committee và cấu hình: node không nằm trong committee thì đồng bộ, có thì tham gia đồng thuận
+        let node_hostname = format!("node-{}", config.node_id);
+        if let Some((new_own_index, _)) = new_committee.authorities()
+            .find(|(_, authority)| authority.hostname == node_hostname) {
+            if self.own_index != new_own_index {
+                info!("🔄 [EPOCH TRANSITION] Updating own_index from {} to {} (node is now in committee - will participate in consensus)", 
+                    self.own_index, new_own_index);
+                self.own_index = new_own_index;
+            } else {
+                info!("📊 [EPOCH TRANSITION] own_index unchanged: {} (node remains in committee)", self.own_index);
+            }
+        } else {
+            // Node is not in committee - set to ZERO (won't be used for sync-only nodes)
+            if matches!(self.node_mode, NodeMode::Validator) {
+                warn!("⚠️ [EPOCH TRANSITION] Node mode is Validator but node is not in committee! This should not happen.");
+            }
+            self.own_index = AuthorityIndex::ZERO;
+            info!("📊 [EPOCH TRANSITION] Node not in committee - own_index set to ZERO (sync-only mode - will only sync data)");
+        }
         
         // CRITICAL FIX: Wait for commit processor to process ALL commits in pipeline
         // When EndOfEpoch transaction is detected in commit N, there may still be other commits
@@ -1788,14 +1886,15 @@ impl ConsensusNode {
             }
         });
         
-        // Restart authority
-        let mut parameters = self.parameters.clone();
-        parameters.db_path = db_path.clone();
-        self.boot_counter = self.boot_counter.saturating_add(1);
-        
+        // Restart authority only if node is in validator mode
         let new_registry = Registry::new();
-        
-        let authority = ConsensusAuthority::start(
+        let authority = if matches!(self.node_mode, NodeMode::Validator) {
+            info!("🚀 [AUTHORITY] Starting consensus authority for epoch {} (node mode: {:?})", new_epoch, self.node_mode);
+            let mut parameters = self.parameters.clone();
+            parameters.db_path = db_path.clone();
+            self.boot_counter = self.boot_counter.saturating_add(1);
+
+            Some(ConsensusAuthority::start(
             NetworkType::Tonic,
             new_epoch_timestamp_ms,
             self.own_index,
@@ -1810,19 +1909,38 @@ impl ConsensusNode {
             new_registry.clone(),
             self.boot_counter,
             Some(self.system_transaction_provider.clone() as Arc<dyn SystemTransactionProvider>),
-        )
-        .await;
-        
-        let registry_id = if let Some(ref rs) = self.registry_service {
+            )
+            .await)
+        } else {
+            info!("🔄 [AUTHORITY] Skipping consensus authority start for epoch {} (node mode: {:?})", new_epoch, self.node_mode);
+            None
+        };
+
+        let registry_id = if let (Some(ref rs), Some(ref _authority)) = (self.registry_service.as_ref(), authority.as_ref()) {
             Some(rs.add(new_registry))
         } else {
             None
         };
         self.current_registry_id = registry_id;
         
-        let new_client = authority.transaction_client();
-        self.transaction_client_proxy.set_client(new_client).await;
-        self.authority = Some(authority);
+        if let Some(ref auth) = authority {
+            let new_client = auth.transaction_client();
+            if let Some(ref proxy) = self.transaction_client_proxy {
+                // Update existing proxy
+                proxy.set_client(new_client).await;
+            } else {
+                // Create transaction client proxy if it doesn't exist (node switched from sync-only to validator)
+                info!("✅ [EPOCH TRANSITION] Creating transaction client proxy (node switched from sync-only to validator)");
+                self.transaction_client_proxy = Some(Arc::new(TransactionClientProxy::new(new_client)));
+            }
+        } else {
+            // Node switched to sync-only mode - clear transaction client proxy
+            if self.transaction_client_proxy.is_some() {
+                info!("🔄 [EPOCH TRANSITION] Clearing transaction client proxy (node switched from validator to sync-only)");
+                self.transaction_client_proxy = None;
+            }
+        }
+        self.authority = authority;
         
         // OPTIMIZED: Adaptive delay for authority ready check based on optimization level
         // This prevents transactions from being lost if epoch transition is too fast
@@ -1906,19 +2024,26 @@ impl ConsensusNode {
         // Try to submit a minimal dummy transaction to test if consensus accepts it
         // If it succeeds, consensus is ready. If it fails, consensus may still be starting up.
 
-        // Create a minimal dummy transaction (this won't be processed, just tests connectivity)
-        let dummy_tx = vec![0u8; 64]; // Minimal transaction data
-        let test_transactions = vec![dummy_tx];
+        // For sync-only nodes, we don't have transaction client proxy
+        if let Some(ref proxy) = self.transaction_client_proxy {
+            // Create a minimal dummy transaction (this won't be processed, just tests connectivity)
+            let dummy_tx = vec![0u8; 64]; // Minimal transaction data
+            let test_transactions = vec![dummy_tx];
 
-        match self.transaction_client_proxy.submit(test_transactions).await {
-            Ok(_) => {
-                info!("🧪 [CONSENSUS READY] Consensus accepted test transaction - ready for queued transactions");
-                true
-            },
-            Err(e) => {
-                info!("🧪 [CONSENSUS READY] Consensus rejected test transaction: {} - may still be starting up", e);
-                false
+            match proxy.submit(test_transactions).await {
+                Ok(_) => {
+                    info!("🧪 [CONSENSUS READY] Consensus accepted test transaction - ready for queued transactions");
+                    true
+                },
+                Err(e) => {
+                    info!("🧪 [CONSENSUS READY] Consensus rejected test transaction: {} - may still be starting up", e);
+                    false
+                }
             }
+        } else {
+            // Sync-only nodes don't have transaction client - consensus is not ready for submitting
+            info!("🧪 [CONSENSUS READY] Node is sync-only - no transaction client available");
+            false
         }
     }
 
@@ -2006,6 +2131,162 @@ impl ConsensusNode {
         info!("🔒 [GRADUAL SHUTDOWN] Phase 4: Acquiring execution lock");
         let _execution_lock = self.execution_lock_for_reconfiguration().await;
         info!("✅ [GRADUAL SHUTDOWN] Execution lock acquired - safe to proceed with authority shutdown");
+
+        Ok(())
+    }
+
+    /// Check if node should be in validator mode based on committee membership
+    /// and update mode accordingly
+    pub async fn check_and_update_node_mode(&mut self, committee: &consensus_config::Committee, config: &NodeConfig) -> Result<()> {
+        // Use hostname from config (node-{id}) instead of system hostname
+        // This ensures correct matching with committee hostnames
+        let node_hostname = format!("node-{}", config.node_id);
+        let should_be_validator = committee.authorities()
+            .any(|(_, authority)| authority.hostname == node_hostname);
+
+        let new_mode = if should_be_validator {
+            NodeMode::Validator
+        } else {
+            NodeMode::SyncOnly
+        };
+
+        if self.node_mode != new_mode {
+            info!("🔄 [NODE MODE] Switching from {:?} to {:?} (hostname: {}, in_committee: {})",
+                self.node_mode, new_mode, node_hostname, should_be_validator);
+
+            match (&self.node_mode, &new_mode) {
+                (NodeMode::SyncOnly, NodeMode::Validator) => {
+                    // Switching from sync-only to validator
+                    // Stop sync task and start consensus participation
+                    if let Err(e) = self.stop_sync_task().await {
+                        warn!("⚠️ [NODE MODE] Failed to stop sync task: {}", e);
+                    }
+                    // Authority should already be created during epoch transition
+                    if self.authority.is_none() {
+                        warn!("⚠️ [NODE MODE] Switching to validator mode but authority is None!");
+                    } else {
+                        info!("✅ [NODE MODE] Successfully switched to validator mode");
+                    }
+                }
+                (NodeMode::Validator, NodeMode::SyncOnly) => {
+                    // Switching from validator to sync-only
+                    // Start sync task and stop consensus participation
+                    if let Err(e) = self.start_sync_task(config).await {
+                        warn!("⚠️ [NODE MODE] Failed to start sync task: {}", e);
+                    }
+                    if self.authority.is_some() {
+                        info!("🔄 [NODE MODE] Switching to sync-only mode - stopping consensus participation");
+                        // Note: We don't stop the authority here as it might be needed for epoch transition
+                        // The authority will be properly managed during epoch transition
+                    }
+                }
+                _ => {} // Same mode, no action needed
+            }
+
+            self.node_mode = new_mode;
+        } else {
+            trace!("📊 [NODE MODE] Mode unchanged: {:?} (hostname: {}, in_committee: {})",
+                self.node_mode, node_hostname, should_be_validator);
+        }
+
+        Ok(())
+    }
+
+    /// Get current node mode
+    pub fn get_node_mode(&self) -> &NodeMode {
+        &self.node_mode
+    }
+
+    /// Start sync task for sync-only nodes
+    /// This task periodically syncs data from Go executor
+    pub async fn start_sync_task(&mut self, config: &NodeConfig) -> Result<()> {
+        if !matches!(self.node_mode, NodeMode::SyncOnly) {
+            info!("🔄 [SYNC TASK] Skipping sync task start - node is in {:?} mode", self.node_mode);
+            return Ok(());
+        }
+
+        if self.sync_task_handle.is_some() {
+            warn!("⚠️ [SYNC TASK] Sync task already running");
+            return Ok(());
+        }
+
+        info!("🚀 [SYNC TASK] Starting sync task for sync-only node");
+
+        // Create executor client for sync operations
+        let executor_client = Arc::new(ExecutorClient::new(
+            true, // Enable reading
+            false, // Don't commit
+            config.executor_send_socket_path.clone(),
+            config.executor_receive_socket_path.clone(),
+        ));
+
+        // Clone needed data for the task
+        let last_global_exec_index = Arc::clone(&self.shared_last_global_exec_index);
+        let current_epoch = self.current_epoch;
+        let node_mode = self.node_mode.clone();
+
+        let sync_task = tokio::spawn(async move {
+            info!("🔄 [SYNC TASK] Sync task started - monitoring Go executor state");
+
+            loop {
+                // Sync every 5 seconds
+                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                match Self::perform_sync_operation(&executor_client, &last_global_exec_index, current_epoch, &node_mode).await {
+                    Ok(_) => {
+                        trace!("✅ [SYNC TASK] Sync operation completed successfully");
+                    }
+                    Err(e) => {
+                        warn!("⚠️ [SYNC TASK] Sync operation failed: {}", e);
+                    }
+                }
+            }
+        });
+
+        self.sync_task_handle = Some(sync_task);
+        info!("✅ [SYNC TASK] Sync task started successfully");
+        Ok(())
+    }
+
+    /// Stop sync task if running
+    pub async fn stop_sync_task(&mut self) -> Result<()> {
+        if let Some(handle) = self.sync_task_handle.take() {
+            info!("🛑 [SYNC TASK] Stopping sync task...");
+            handle.abort();
+            // Wait for task to finish or timeout
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            info!("✅ [SYNC TASK] Sync task stopped");
+        }
+        Ok(())
+    }
+
+    /// Perform one sync operation with Go executor
+    async fn perform_sync_operation(
+        executor_client: &Arc<ExecutorClient>,
+        shared_last_global_exec_index: &Arc<tokio::sync::Mutex<u64>>,
+        _current_epoch: u64,
+        node_mode: &NodeMode,
+    ) -> Result<()> {
+        // Only sync if we're in sync-only mode
+        if !matches!(node_mode, NodeMode::SyncOnly) {
+            return Ok(());
+        }
+
+        // Get latest block number from Go
+        let go_last_block = executor_client.get_last_block_number().await?;
+        trace!("📊 [SYNC TASK] Go executor last block: {}", go_last_block);
+
+        // Update our shared last global exec index if needed
+        let mut shared_index = shared_last_global_exec_index.lock().await;
+        if go_last_block > *shared_index {
+            *shared_index = go_last_block;
+            trace!("📈 [SYNC TASK] Updated shared last_global_exec_index to {}", go_last_block);
+        }
+
+        // TODO: Future enhancements
+        // - Sync committee changes
+        // - Monitor for epoch transitions
+        // - Sync transaction pool if needed
 
         Ok(())
     }

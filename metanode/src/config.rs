@@ -11,6 +11,9 @@ use mysten_network::Multiaddr;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::{Path, PathBuf}};
 
+// Import NodeMode from parent module
+use crate::node::NodeMode;
+
 /// Extended committee configuration with epoch timestamp and global execution index
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommitteeConfig {
@@ -27,6 +30,10 @@ struct CommitteeConfig {
 
 fn default_speed_multiplier() -> f64 {
     1.0
+}
+
+fn default_node_mode() -> NodeMode {
+    NodeMode::SyncOnly
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +136,11 @@ pub struct NodeConfig {
     /// When enabled, transactions are rejected gradually before authority shutdown
     #[serde(default = "default_enable_gradual_shutdown")]
     pub enable_gradual_shutdown: bool,
+    /// Initial node operation mode (default: SyncOnly)
+    /// Node can be configured to start as SyncOnly or Validator
+    /// During runtime, node will automatically switch modes based on committee membership
+    #[serde(default = "default_node_mode")]
+    pub initial_node_mode: NodeMode,
     /// Seconds to wait for user certificates to drain during gradual shutdown (default: 2)
     #[serde(default = "default_gradual_shutdown_user_cert_drain_secs")]
     pub gradual_shutdown_user_cert_drain_secs: Option<u64>,
@@ -272,6 +284,7 @@ impl NodeConfig {
                 lvm_snapshot_delay_seconds: 120,
                 epoch_transition_optimization: "balanced".to_string(),
                 enable_gradual_shutdown: true,
+                initial_node_mode: default_node_mode(),
                 gradual_shutdown_user_cert_drain_secs: Some(2),
                 gradual_shutdown_consensus_cert_drain_secs: Some(1),
                 gradual_shutdown_final_drain_secs: Some(1),

@@ -1,9 +1,12 @@
 #!/bin/bash
 
-# Script để chạy full luồng: 1 Go Sub + 1 Go Master + 4 Rust Consensus Nodes
+# Script để chạy full luồng: 1 Go Sub + 1 Go Master + 5 Rust Consensus Nodes
+# - 4 Validator Nodes (node-0 đến node-3): Tham gia consensus và voting
+# - 1 Sync-Only Node (node-4): Chỉ đồng bộ data, không tham gia validator ban đầu
+#   Node-4 sẽ tự động chuyển thành validator nếu nằm trong committee khi chuyển epoch
 # Mỗi lần chạy sẽ:
 #   - Xóa dữ liệu cũ (sample và storage)
-#   - Tạo committee mới
+#   - Tạo committee mới (chỉ 4 validators đầu trong genesis.json)
 #   - Khởi động tất cả nodes từ epoch 0
 #
 # Thứ tự khởi động:
@@ -231,8 +234,8 @@ kill_port_processes() {
 }
 
 # Step 2.1: Kill all processes using ports FIRST (most aggressive)
-print_info "🔴 Bước 2.1: Kill tất cả processes đang dùng ports 9000-9003..."
-for port in 9000 9001 9002 9003; do
+print_info "🔴 Bước 2.1: Kill tất cả processes đang dùng ports 9000-9004..."
+for port in 9000 9001 9002 9003 9004; do
     kill_port_processes $port 5 || true
 done
 sleep 2
@@ -259,7 +262,7 @@ sleep 2
 
 # Step 2.4: Kill processes using ports AGAIN (in case tmux spawned new ones)
 print_info "🔴 Bước 2.4: Kill lại processes đang dùng ports (sau khi dừng tmux)..."
-for port in 9000 9001 9002 9003; do
+for port in 9000 9001 9002 9003 9004; do
     kill_port_processes $port 3 || true
 done
 sleep 3
@@ -267,7 +270,7 @@ sleep 3
 # Step 2.5: Final verification and cleanup
 print_info "🔴 Bước 2.5: Kiểm tra và cleanup cuối cùng..."
 all_ports_free=true
-for port in 9000 9001 9002 9003; do
+for port in 9000 9001 9002 9003 9004; do
     PIDS=$(lsof -ti :$port 2>/dev/null || true)
     if [ -n "$PIDS" ]; then
         print_error "❌ Port $port VẪN bị chiếm bởi PIDs: $PIDS"
@@ -298,7 +301,7 @@ fi
 
 # Final check before proceeding
 print_info "🔍 Kiểm tra cuối cùng trước khi tiếp tục..."
-for port in 9000 9001 9002 9003; do
+for port in 9000 9001 9002 9003 9004; do
     PIDS=$(lsof -ti :$port 2>/dev/null || true)
     if [ -n "$PIDS" ]; then
         print_error "❌❌❌ KHÔNG THỂ TIẾP TỤC: Port $port vẫn bị chiếm bởi: $PIDS"
@@ -380,8 +383,32 @@ print_info "📄 Đồng thời tạo genesis.json cho Go từ keys của Rust"
 print_info "💡 Committee data sẽ được fetch từ Go state qua Unix Domain Socket"
 cd "$METANODE_ROOT" || exit 1
 
-# Generate Rust keys and configs
-"$BINARY" generate --nodes 4 --output config
+# Generate Rust keys and configs (5 nodes total: 4 validators + 1 sync-only)
+"$BINARY" generate --nodes 5 --output config
+
+# Configure node-4 as sync-only (không tham gia validator ban đầu)
+print_info "🔄 Cấu hình node-4 là sync-only node..."
+NODE_4_CONFIG="$METANODE_ROOT/config/node_4.toml"
+if [ -f "$NODE_4_CONFIG" ]; then
+    # Update initial_node_mode if it exists, otherwise add it
+    if grep -q "^initial_node_mode" "$NODE_4_CONFIG"; then
+        # Update existing value
+        sed -i 's/^initial_node_mode = .*/initial_node_mode = "SyncOnly"/' "$NODE_4_CONFIG"
+        print_info "  ✅ Đã cập nhật initial_node_mode = SyncOnly cho node-4"
+    else
+        # Add new configuration
+        cat >> "$NODE_4_CONFIG" << EOF
+
+# Sync-Only Node Configuration
+# Node này chỉ đồng bộ data, không tham gia validator ban đầu
+# Có thể tự động chuyển thành validator nếu nằm trong committee
+initial_node_mode = "SyncOnly"
+EOF
+        print_info "  ✅ Đã thêm initial_node_mode = SyncOnly cho node-4"
+    fi
+else
+    print_warn "  ⚠️  Không tìm thấy node_4.toml sau khi generate"
+fi
 
 # UPDATE committee.json với stake từ genesis.json (từ delegator_stakes)
 print_info "🔄 Update committee.json với stake từ genesis.json..."
@@ -844,7 +871,7 @@ print_info "⏳ Đợi thêm 5 giây để đảm bảo Go Master hoàn toàn s�
 sleep 5
 
 # Step 8: Start Rust consensus nodes (sau Go Sub, sau khi Go Sub đã kết nối với Go Master)
-print_step "Bước 8: Khởi động 4 Rust consensus nodes (sau Go Sub, sau khi Go Sub đã kết nối với Go Master)..."
+print_step "Bước 8: Khởi động 5 Rust consensus nodes (4 validators + 1 sync-only) (sau Go Sub, sau khi Go Sub đã kết nối với Go Master)..."
 
 cd "$METANODE_ROOT" || exit 1
 
@@ -857,7 +884,7 @@ if [ -f "$METANODE_ROOT/scripts/node/run_nodes.sh" ]; then
     
     # CRITICAL: Đảm bảo dừng tất cả Rust nodes cũ trước khi khởi động mới
     print_info "🔴 Dừng tất cả Rust nodes cũ (nếu có)..."
-    for i in 0 1 2 3; do
+    for i in 0 1 2 3 4; do
         tmux kill-session -t "metanode-$i" 2>/dev/null && print_info "  ✅ Đã dừng metanode-$i" || true
     done
     # Kill all metanode processes
@@ -865,7 +892,7 @@ if [ -f "$METANODE_ROOT/scripts/node/run_nodes.sh" ]; then
     sleep 2
     
     # Verify ports are free
-    for port in 9000 9001 9002 9003; do
+    for port in 9000 9001 9002 9003 9004; do
         PIDS=$(lsof -ti :$port 2>/dev/null || true)
         if [ -n "$PIDS" ]; then
             print_warn "  ⚠️  Port $port vẫn bị chiếm bởi: $PIDS, đang kill..."
@@ -886,10 +913,10 @@ fi
 
 # Verify nodes are running
 NODE_COUNT=$(ps aux | grep -c "[m]etanode.*start" || true)
-if [ "$NODE_COUNT" -lt 4 ]; then
-    print_warn "Có vẻ như không đủ 4 Rust nodes đang chạy (tìm thấy: $NODE_COUNT)"
+if [ "$NODE_COUNT" -lt 5 ]; then
+    print_warn "Có vẻ như không đủ 5 Rust nodes đang chạy (tìm thấy: $NODE_COUNT)"
 else
-    print_info "✅ Đã khởi động $NODE_COUNT Rust nodes"
+    print_info "✅ Đã khởi động $NODE_COUNT Rust nodes (4 validators + 1 sync-only)"
 fi
 
 # Đợi thêm một chút để Rust nodes hoàn toàn sẵn sàng
@@ -903,7 +930,7 @@ sleep 5
 
 # Check Rust nodes
 RUST_NODES=$(ps aux | grep -c "[m]etanode.*start" || true)
-print_info "Rust nodes đang chạy: $RUST_NODES/4"
+print_info "Rust nodes đang chạy: $RUST_NODES/5 (4 validators + 1 sync-only)"
 
 # Check Go nodes
 GO_SUB=$(tmux has-session -t go-sub 2>/dev/null && echo "1" || echo "0")
@@ -931,15 +958,16 @@ print_info "🎉 Hệ thống đã được khởi động!"
 print_info "=========================================="
 echo ""
 print_info "📊 Trạng thái:"
-print_info "  - Rust Consensus Nodes: $RUST_NODES/4"
+print_info "  - Rust Consensus Nodes: $RUST_NODES/5 (4 validators + 1 sync-only)"
 print_info "  - Go Sub Node: $([ "$GO_SUB" = "1" ] && echo "✅" || echo "❌")"
 print_info "  - Go Master Node: $([ "$GO_MASTER" = "1" ] && echo "✅" || echo "❌")"
 echo ""
 print_info "📺 Xem logs:"
-print_info "  - Rust Node 0: tmux attach -t metanode-0"
-print_info "  - Rust Node 1: tmux attach -t metanode-1"
-print_info "  - Rust Node 2: tmux attach -t metanode-2"
-print_info "  - Rust Node 3: tmux attach -t metanode-3"
+print_info "  - Rust Node 0 (Validator): tmux attach -t metanode-0"
+print_info "  - Rust Node 1 (Validator): tmux attach -t metanode-1"
+print_info "  - Rust Node 2 (Validator): tmux attach -t metanode-2"
+print_info "  - Rust Node 3 (Validator): tmux attach -t metanode-3"
+print_info "  - Rust Node 4 (Sync-Only): tmux attach -t metanode-4"
 print_info "  - Go Sub: tmux attach -t go-sub"
 print_info "  - Go Master: tmux attach -t go-master"
 echo ""

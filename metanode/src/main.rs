@@ -107,35 +107,40 @@ async fn main() -> Result<()> {
             // This allows transition handler task to call transition function
             crate::node::set_transition_handler_node(node.clone()).await;
             
-            // Start RPC server for client submissions (HTTP)
-            let rpc_port = node_config.metrics_port + 1000;
+            // Start RPC server for client submissions (HTTP) - only for validator nodes
             let tx_client = { node.lock().await.transaction_submitter() };
-            let node_for_rpc = node.clone();
-            let rpc_server = rpc::RpcServer::with_node(tx_client.clone(), rpc_port, node_for_rpc.clone());
-            tokio::spawn(async move {
-                if let Err(e) = rpc_server.start().await {
-                    error!("RPC server error: {}", e);
-                }
-            });
+            if let Some(tx_client) = tx_client {
+                let rpc_port = node_config.metrics_port + 1000;
+                let node_for_rpc = node.clone();
+                let rpc_server = rpc::RpcServer::with_node(tx_client.clone(), rpc_port, node_for_rpc.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = rpc_server.start().await {
+                        error!("RPC server error: {}", e);
+                    }
+                });
 
-            // Start Unix Domain Socket server for local IPC
-            let socket_path = format!("/tmp/metanode-tx-{}.sock", node_config.node_id);
-            let tx_client_uds = tx_client.clone();
-            let node_for_uds = node.clone();
-            let uds_server = tx_socket_server::TxSocketServer::with_node(
-                socket_path.clone(),
-                tx_client_uds,
-                node_for_uds,
-            );
-            tokio::spawn(async move {
-                if let Err(e) = uds_server.start().await {
-                    error!("UDS server error: {}", e);
-                }
-            });
-            info!("Unix Domain Socket server available at {}", socket_path);
-            
-            info!("Consensus node started successfully");
-            info!("RPC server available at http://127.0.0.1:{}", rpc_port);
+                // Start Unix Domain Socket server for local IPC
+                let socket_path = format!("/tmp/metanode-tx-{}.sock", node_config.node_id);
+                let tx_client_uds = tx_client.clone();
+                let node_for_uds = node.clone();
+                let uds_server = tx_socket_server::TxSocketServer::with_node(
+                    socket_path.clone(),
+                    tx_client_uds,
+                    node_for_uds,
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = uds_server.start().await {
+                        error!("UDS server error: {}", e);
+                    }
+                });
+                info!("Unix Domain Socket server available at {}", socket_path);
+                
+                info!("Consensus node started successfully (validator mode)");
+                info!("RPC server available at http://127.0.0.1:{}", rpc_port);
+            } else {
+                // Sync-only node: no RPC/UDS servers needed
+                info!("Sync-only node started successfully (no transaction submission servers)");
+            }
             info!("Press Ctrl+C to stop the node");
 
             // --- MAIN LOOP ---

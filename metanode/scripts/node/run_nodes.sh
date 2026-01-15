@@ -10,7 +10,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # Configuration
-NODES=4
+NODES=5
 BINARY="./target/release/metanode"
 CONFIG_DIR="config"
 LOG_DIR="logs"
@@ -157,11 +157,13 @@ echo "  tmux attach -t metanode-0  # View node 0 (Ctrl+B, D to detach)"
 echo "  tmux attach -t metanode-1  # View node 1"
 echo "  tmux attach -t metanode-2  # View node 2"
 echo "  tmux attach -t metanode-3  # View node 3"
+echo "  tmux attach -t metanode-4  # View node 4 (sync-only)"
 echo ""
 echo "View log files:"
 echo "  tail -f $LOG_DIR/latest/node_0.log       # Follow node 0 logs (latest run)"
 echo "  tail -f $LOG_DIR/latest/node_0.epoch.log # Follow epoch-only logs (latest run)"
 echo "  tail -f $LOG_DIR/latest/node_1.log       # Follow node 1 logs"
+echo "  tail -f $LOG_DIR/latest/node_4.log       # Follow node 4 logs (sync-only)"
 echo ""
 echo "List all sessions:"
 echo "  tmux list-sessions"
