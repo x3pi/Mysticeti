@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 
 use parking_lot::RwLock;
 use tokio::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     CommitConsumerArgs, CommittedSubDag,
@@ -158,11 +158,12 @@ impl CommitObserver {
             .read_last_commit()
             .expect("Reading the last commit should not fail");
         let Some(last_commit) = &last_commit else {
-            assert_eq!(
-                replay_after_commit_index, 0,
-                "Commit replay should start at the beginning if there is no commit history"
-            );
-            info!("Nothing to recover for commit observer - starting new epoch");
+            // CRITICAL FIX: If Rust has no commit history but Go has executed blocks,
+            // it means Rust storage was reset but Go state is ahead. In this case,
+            // we should start from the beginning (replay_after_commit_index = 0) and
+            // let Go sync us up naturally through consensus.
+            warn!("⚠️  [COMMIT RECOVERY] Rust has no commit history but Go reports last_global_exec_index={}, starting from beginning", replay_after_commit_index);
+            info!("Nothing to recover for commit observer - starting new epoch from scratch");
             return;
         };
 

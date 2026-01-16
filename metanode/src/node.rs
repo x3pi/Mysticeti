@@ -361,7 +361,8 @@ impl ConsensusNode {
         let last_global_exec_index = if config.executor_read_enabled {
             match executor_client.get_last_block_number().await {
                 Ok(last_block_number) => {
-                    info!("📊 [STARTUP] UNIFIED BLOCK NUMBERING: Synced last_global_exec_index={} from Go state", last_block_number);
+                    info!("📊 [STARTUP] UNIFIED BLOCK NUMBERING: Synced last_global_exec_index={} from Go state (last executed block)", last_block_number);
+                    info!("✅ [STARTUP] System will resume from block {} (Go's last executed block), NOT from Rust storage", last_block_number);
                     last_block_number
                 },
                 Err(e) => {
@@ -377,15 +378,18 @@ impl ConsensusNode {
         };
         // GLOBAL BLOCK NUMBERING: Reset to genesis if state seems corrupted
         // This prevents block numbering conflicts in test environments
-        let last_global_exec_index = if last_global_exec_index > 10000 {
-            warn!("🚨 [STARTUP] last_global_exec_index={} too high - resetting to 0 for unified block numbering", last_global_exec_index);
-            0
-        } else {
-            last_global_exec_index
-        };
-
-        info!("✅ [STARTUP] Using last_global_exec_index={} for commit processor (executor_read_enabled={})",
-            last_global_exec_index, config.executor_read_enabled);
+        
+        // CRITICAL FIX: Create commit consumer AFTER getting last_global_exec_index from Go
+        // Use last_global_exec_index as replay_after_commit_index
+        // This ensures we only replay commits from Rust storage that are AFTER the last block Go executed
+        // This prevents replaying blocks that Rust created but Go never finished executing
+        info!("🔧 [STARTUP] Creating commit consumer with replay_after_commit_index={} (Go's last executed block)", last_global_exec_index);
+        let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(
+            last_global_exec_index as u32, // replay_after_commit_index: only replay commits after Go's last executed block
+            last_global_exec_index as u32, // consumer_last_processed_commit_index: same as replay_after
+        );
+        info!("✅ [STARTUP] Commit consumer created - will skip Rust storage commits <= {}, only replay commits > {}", 
+            last_global_exec_index, last_global_exec_index);
 
         // Load keypairs (kept for in-process restart)
         let protocol_keypair = config.load_protocol_keypair()?;
@@ -421,8 +425,8 @@ impl ConsensusNode {
         // Create transaction verifier (no-op for now, kept for in-process restart)
         let transaction_verifier = Arc::new(NoopTransactionVerifier);
 
-        // Create commit consumer args
-        let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
+        // NOTE: commit_consumer will be created AFTER we get last_global_exec_index from Go
+        // This ensures we replay commits from the correct starting point (Go's last executed block)
         
         // Track current commit index for fork-safe epoch transition
         let current_commit_index = Arc::new(AtomicU32::new(0));
@@ -1735,7 +1739,15 @@ impl ConsensusNode {
         std::fs::create_dir_all(&db_path)?;
         
         // Create new commit processor
-        let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
+        // CRITICAL FIX: For epoch transition, replay_after_commit_index should be 0
+        // Each epoch has its own commit index space, starting from 0
+        // synced_last_global_exec_index is used for global block numbering, not commit replay
+        info!("🔧 [EPOCH TRANSITION] Creating commit consumer with replay_after_commit_index=0 (new epoch starts from commit index 0)");
+        let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(
+            0, // replay_after_commit_index: 0 for new epoch (commit index space starts from 0)
+            0, // consumer_last_processed_commit_index: 0 for new epoch
+        );
+        info!("✅ [EPOCH TRANSITION] Commit consumer created for new epoch - will replay from commit index 0");
         let commit_index_for_callback = self.current_commit_index.clone();
         let new_epoch_clone = new_epoch;
         let executor_commit_enabled = self.executor_commit_enabled;
