@@ -92,6 +92,24 @@ graph TD
 - **ECDSA**: Tương thích hoàn toàn với Ethereum (MetaMask, Viem, v.v.)
 - **BLS**: Sử dụng cho các giao dịch nội bộ hoặc tối ưu hóa (Custom meta-node protocol)
 
+**Block Structure (Protobuf)**:
+Block được đóng gói dưới dạng Protobuf `pb.Block` (định nghĩa trong `pkg/proto/block.proto`) với BlockHeader chứa thông tin epoch:
+
+```protobuf
+message BlockHeader {
+  bytes LastBlockHash = 1;
+  uint64 BlockNumber = 2;
+  bytes AccountStatesRoot = 3;
+  bytes ReceiptRoot = 4;
+  bytes LeaderAddress = 5;
+  bytes AggregateSignature = 6;
+  uint64 TimeStamp = 7;
+  bytes TransactionsRoot = 8;
+  bytes StakeStatesRoot = 9;
+  uint64 Epoch = 10;  // Thêm field epoch cho việc track epoch transitions
+}
+```
+
 **Transaction Structure (Protobuf)**:
 Giao dịch được đóng gói dưới dạng Protobuf `pb.Transaction` (định nghĩa trong `pkg/proto/transaction.proto`) trước khi gửi.
 
@@ -212,6 +230,7 @@ pub struct CommittedSubDag {
     pub blocks: Vec<CommittedBlock>,
     pub leader: CommittedBlock,
     pub timestamp_ms: u64,
+    pub epoch: u64,  // Epoch number cho block này
 }
 
 pub struct CommittedBlock {
@@ -222,6 +241,23 @@ pub struct CommittedBlock {
 
 pub struct Transaction {
     pub bytes: Vec<u8>, // CHỨA RAW TRANSACTION DATA (Protobuf bytes)
+}
+```
+
+**Go BlockHeader với Epoch Field**:
+```protobuf
+// Định nghĩa trong pkg/proto/block.proto
+message BlockHeader {
+  bytes LastBlockHash = 1;
+  uint64 BlockNumber = 2;
+  bytes AccountStatesRoot = 3;
+  bytes ReceiptRoot = 4;
+  bytes LeaderAddress = 5;
+  bytes AggregateSignature = 6;
+  uint64 TimeStamp = 7;
+  bytes TransactionsRoot = 8;
+  bytes StakeStatesRoot = 9;
+  uint64 Epoch = 10;  // Thêm để track epoch transitions trong state
 }
 ```
 
@@ -947,6 +983,7 @@ message CommittedEpochData {
   repeated CommittedBlock blocks = 1;
   uint64 global_exec_index = 2;  // Block number in Go
   uint32 commit_index = 3;       // Commit index in epoch
+  uint64 epoch = 4;              // Epoch number cho commit này
 }
 
 message CommittedBlock {
@@ -960,6 +997,29 @@ message TransactionExe {
   uint32 worker_id = 2;
 }
 ```
+
+**Go BlockHeader Format với Epoch Field**:
+```protobuf
+// Định nghĩa trong pkg/proto/block.proto
+message BlockHeader {
+  bytes LastBlockHash = 1;
+  uint64 BlockNumber = 2;        // global_exec_index từ CommittedEpochData
+  bytes AccountStatesRoot = 3;
+  bytes ReceiptRoot = 4;
+  bytes LeaderAddress = 5;
+  bytes AggregateSignature = 6;
+  uint64 TimeStamp = 7;
+  bytes TransactionsRoot = 8;
+  bytes StakeStatesRoot = 9;
+  uint64 Epoch = 10;             // Epoch từ CommittedEpochData.epoch
+}
+```
+
+**Cách sử dụng Epoch Field**:
+- **Trong Block Creation**: Khi Go Master tạo Block từ CommittedEpochData, field `BlockHeader.Epoch` được set bằng `CommittedEpochData.epoch`
+- **Trong State Persistence**: Epoch được lưu trong block header để track epoch transitions trong blockchain state
+- **Trong Query APIs**: Clients có thể query epoch của một block cụ thể qua `eth_getBlockByNumber`
+- **Trong Consensus Sync**: Khi Rust node restart, có thể sync epoch info từ Go Master để biết epoch hiện tại
 
 **Critical**: Field `digest` chứa toàn bộ raw transaction data (protobuf bytes), không phải hash.
 
@@ -1050,11 +1110,15 @@ Response: [4 bytes: length (BE)][pb.Response]
 #### Block Delivery (Rust → Go Master)
 ```
 CommittedSubDag (Rust internal) →
-Convert to pb.CommittedEpochData →
+Convert to pb.CommittedEpochData (bao gồm epoch field) →
 Sort transactions by hash →
 Buffer in BTreeMap →
 Send: [Uvarint: length][Protobuf bytes]
 ```
+
+**Epoch Field Mapping**:
+- `CommittedSubDag.epoch` → `CommittedEpochData.epoch` → `BlockHeader.Epoch`
+- Được sử dụng để track epoch transitions trong blockchain state
 
 #### Metadata Query (Rust ← Go Master)
 ```
@@ -1596,7 +1660,9 @@ Hệ thống Mysticeti được thiết kế với kiến trúc layered hybrid �
 - `proto/`: Protocol buffer definitions (`executor.proto`, `transaction.proto`).
 
 ### Communication & Protocols
-- **Protocol Buffers**: `mtn-simple-2025/pkg/proto/executor.proto` - Định nghĩa `CommittedEpochData`, `CommittedBlock`, `TransactionExe`.
+- **Protocol Buffers**:
+- `mtn-simple-2025/pkg/proto/executor.proto` - Định nghĩa `CommittedEpochData`, `CommittedBlock`, `TransactionExe`
+- `mtn-simple-2025/pkg/proto/block.proto` - Định nghĩa `BlockHeader` với `Epoch` field (thêm field epoch để track epoch transitions)
 - **Unix Socket Protocol**: `COMMUNICATION_PROTOCOLS.md` - Chi tiết về socket paths và message framing.
 - **Network Sync**: `SYNC_ANALYSIS.md` + `metanode/src/network_sync.rs` - State sync mechanisms.
 

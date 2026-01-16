@@ -26,5 +26,7 @@ message CommittedEpochData {
     // CRITICAL FORK-SAFETY: commit_index is the epoch-local commit index
     // Used together with global_exec_index to ensure deterministic ordering
     uint32 commit_index = 3;
+    // Epoch number for this commit - used to track epoch transitions
+    uint64 epoch = 4;
 }
 

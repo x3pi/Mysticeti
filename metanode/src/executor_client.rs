@@ -913,6 +913,7 @@ impl ExecutorClient {
             blocks,
             global_exec_index,
             commit_index: subdag.commit_ref.index as u32,
+            epoch,
         };
         
         // Encode to protobuf bytes using prost::Message::encode
