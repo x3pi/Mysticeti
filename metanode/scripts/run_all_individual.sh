@@ -69,10 +69,11 @@ print_info "=========================================="
 print_info "🚀 Khởi động Mysticeti System (Individual Scripts)"
 print_info "=========================================="
 echo ""
+
 print_warn "⚠️  CHÚ Ý: Scripts này KHÔNG xóa dữ liệu cũ!"
 print_warn "   - Giữ nguyên genesis.json và validator keys hiện có"
 print_warn "   - Giữ nguyên sample data và blocks"
-print_warn "   - Chỉ khởi động lại nodes từ state hiện tại"
+print_warn "   - Consensus sẽ tự động sync từ last commit index"
 echo ""
 
 # Step 1: Go Master Node

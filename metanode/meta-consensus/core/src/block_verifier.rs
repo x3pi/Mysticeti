@@ -68,11 +68,23 @@ impl SignedBlockVerifier {
         let committee = &self.context.committee;
         // The block must belong to the current epoch and have valid authority index,
         // before having its signature verified.
+        //
+        // TEMPORARY FIX: Allow blocks from higher epochs to help with epoch sync
+        // This allows newly restarted nodes to catch up with the network epoch
         if block.epoch() != committee.epoch() {
-            return Err(ConsensusError::WrongEpoch {
-                expected: committee.epoch(),
-                actual: block.epoch(),
-            });
+            // Allow blocks from higher epochs (within reasonable range) to help sync
+            let epoch_diff = block.epoch().saturating_sub(committee.epoch());
+            if epoch_diff > 0 && epoch_diff <= 5 { // Allow up to 5 epochs ahead
+                tracing::warn!(
+                    "⚠️ Allowing block from future epoch: block_epoch={}, current_epoch={}, diff={}. This helps with epoch sync for restarted nodes.",
+                    block.epoch(), committee.epoch(), epoch_diff
+                );
+            } else {
+                return Err(ConsensusError::WrongEpoch {
+                    expected: committee.epoch(),
+                    actual: block.epoch(),
+                });
+            }
         }
         if block.round() == 0 {
             return Err(ConsensusError::UnexpectedGenesisBlock);

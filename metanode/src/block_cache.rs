@@ -8,7 +8,7 @@ use consensus_core::{CommittedSubDag, BlockAPI};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn, trace};
+use tracing::{info, trace};
 
 /// Global block cache - per-process in-memory (not shared between processes)
 /// Validators write blocks here, full nodes read from here
@@ -108,6 +108,7 @@ pub async fn store_block(global_exec_index: u64, subdag: &CommittedSubDag) -> Re
 
 /// Get multiple blocks from global cache
 /// Called by full nodes to sync blocks in batches
+#[allow(dead_code)]
 pub async fn get_blocks(from: u64, to: u64) -> Result<Vec<(u64, CommittedSubDag)>> {
     let cache = get_cache()?;
     let cache_guard = cache.read().await;
@@ -115,6 +116,7 @@ pub async fn get_blocks(from: u64, to: u64) -> Result<Vec<(u64, CommittedSubDag)
 }
 
 /// Get latest block index from cache
+#[allow(dead_code)]
 pub async fn get_latest_index() -> Result<u64> {
     let cache = get_cache()?;
     let cache_guard = cache.read().await;

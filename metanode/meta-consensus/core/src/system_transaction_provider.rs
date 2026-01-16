@@ -100,6 +100,16 @@ impl DefaultSystemTransactionProvider {
         }
     }
 
+    /// Get current epoch start timestamp
+    pub async fn epoch_start_timestamp_ms(&self) -> u64 {
+        *self.epoch_start_timestamp_ms.read().unwrap()
+    }
+
+    /// Get current epoch
+    pub async fn current_epoch(&self) -> u64 {
+        *self.current_epoch.read().unwrap()
+    }
+
     /// Update current epoch (called after epoch transition)
     /// CRITICAL: Ensure epoch_start_timestamp_ms is not in the past
     /// If new_timestamp_ms is in the past (due to consensus delay), use current time instead
@@ -148,15 +158,39 @@ impl DefaultSystemTransactionProvider {
             return false;
         }
 
-        // Only check once per commit index to avoid spam
-        let last_checked = *self.last_checked_commit_index.read().unwrap();
-        if current_commit_index <= last_checked {
+        // Log that we're checking for epoch transitions
+        tracing::debug!("⏰ SystemTransactionProvider: Checking for epoch transition (commit_index={}, time_based_enabled={})", current_commit_index, self.time_based_enabled);
+
+        // Always check time-based epoch transitions periodically, even if commit index hasn't changed
+        // This prevents epoch transitions from being stuck when consensus is not progressing
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let epoch_start = *self.epoch_start_timestamp_ms.read().unwrap();
+        let elapsed_seconds = (now_ms - epoch_start) / 1000;
+
+        // If epoch has expired, always check (even if commit index hasn't changed)
+        if elapsed_seconds >= self.epoch_duration_seconds {
             tracing::debug!(
-                "⏰ SystemTransactionProvider: Already checked commit_index {} (last_checked={}), skipping",
-                current_commit_index,
-                last_checked
+                "⏰ SystemTransactionProvider: Epoch expired (elapsed={}s >= duration={}s), forcing check despite commit_index={} <= last_checked",
+                elapsed_seconds,
+                self.epoch_duration_seconds,
+                current_commit_index
             );
-            return false;
+            // Don't return here - continue with normal logic below
+        } else {
+            // Only check once per commit index to avoid spam for non-expired epochs
+            let last_checked = *self.last_checked_commit_index.read().unwrap();
+            if current_commit_index <= last_checked {
+                tracing::debug!(
+                    "⏰ SystemTransactionProvider: Already checked commit_index {} (last_checked={}), skipping",
+                    current_commit_index,
+                    last_checked
+                );
+                return false;
+            }
         }
 
         // Check if enough time has elapsed
@@ -221,11 +255,12 @@ impl DefaultSystemTransactionProvider {
 
 impl SystemTransactionProvider for DefaultSystemTransactionProvider {
     fn get_system_transactions(&self, current_epoch: Epoch, current_commit_index: u32) -> Option<Vec<SystemTransaction>> {
-        tracing::debug!(
-            "🔍 SystemTransactionProvider::get_system_transactions called: epoch={}, commit_index={}, time_based_enabled={}",
+        tracing::info!(
+            "🔍 SystemTransactionProvider::get_system_transactions called: epoch={}, commit_index={}, time_based_enabled={}, last_checked={}",
             current_epoch,
             current_commit_index,
-            self.time_based_enabled
+            self.time_based_enabled,
+            *self.last_checked_commit_index.read().unwrap()
         );
 
         // Check if epoch transition should be triggered FIRST (before updating last_checked)

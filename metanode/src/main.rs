@@ -18,7 +18,6 @@ mod tx_submitter;
 mod checkpoint;
 mod tx_hash;
 mod block_cache;
-mod network_sync;
 
 use config::NodeConfig;
 use node::ConsensusNode;

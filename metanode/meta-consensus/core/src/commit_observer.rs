@@ -174,24 +174,56 @@ impl CommitObserver {
             );
             return;
         }
-        assert!(last_commit_index > replay_after_commit_index);
+
+        // CRITICAL FIX: Sync from the smaller index to ensure consistency
+        // Take the minimum of Go's replay_after_commit_index and Rust's last_commit_index
+        // This ensures we sync from the earliest point that both sides agree on
+        let actual_start_index = replay_after_commit_index.min(last_commit_index);
+
+        if replay_after_commit_index < last_commit_index {
+            info!(
+                "📊 State sync: Using Go's replay_after_commit_index ({}) as start point. \
+                 Rust has extra commits ({}) that will be overwritten/ignored for consistency.",
+                replay_after_commit_index, last_commit_index
+            );
+        } else if last_commit_index < replay_after_commit_index {
+            info!(
+                "📊 State sync: Using Rust's last_commit_index ({}) as start point. \
+                 Will sync from this point to catch up with Go's state ({}).",
+                last_commit_index, replay_after_commit_index
+            );
+        } else {
+            info!(
+                "📊 State sync: Both Go and Rust agree on start index ({}). Perfect sync state.",
+                actual_start_index
+            );
+        }
+
+        if actual_start_index >= last_commit_index {
+            info!(
+                "Nothing to recover for commit observer - start index {} >= last commit index {}",
+                actual_start_index, last_commit_index
+            );
+            return;
+        }
 
         info!(
-            "Recovering commit observer in the range [{}..={last_commit_index}]",
-            replay_after_commit_index + 1,
+            "Recovering commit observer in the range [{}..={}]",
+            actual_start_index + 1,
+            last_commit_index
         );
 
         // To avoid scanning too many commits at once and load in memory,
         // we limit the batch size to 250 and iterate over.
         const COMMIT_RECOVERY_BATCH_SIZE: u32 = if cfg!(test) { 3 } else { 250 };
 
-        let mut last_sent_commit_index = replay_after_commit_index;
+        let mut last_sent_commit_index = actual_start_index;
 
         // Make sure that there is no pending commits to be written to the store.
         self.dag_state.read().ensure_commits_to_write_is_empty();
 
         let mut seen_unfinalized_commit = false;
-        for start_index in (replay_after_commit_index + 1..=last_commit_index)
+        for start_index in (actual_start_index + 1..=last_commit_index)
             .step_by(COMMIT_RECOVERY_BATCH_SIZE as usize)
         {
             let end_index = start_index
@@ -290,7 +322,7 @@ impl CommitObserver {
 
         info!(
             "Commit observer recovery [{}..={}] completed, took {:?}",
-            replay_after_commit_index + 1,
+            actual_start_index + 1,
             last_commit_index,
             now.elapsed()
         );

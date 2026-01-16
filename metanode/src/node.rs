@@ -7,6 +7,7 @@ use consensus_config::{AuthorityIndex, Committee, Authority};
 use consensus_core::{
     ConsensusAuthority, NetworkType, Clock,
     CommitConsumerArgs, ReconfigState, SystemTransaction,
+    storage::Store, CommitAPI,
 };
 use consensus_config::{AuthorityPublicKey, ProtocolPublicKey, NetworkPublicKey};
 use fastcrypto::ed25519;
@@ -346,9 +347,11 @@ impl ConsensusNode {
         for (i, auth) in sorted_authorities.iter().enumerate() {
             info!("🔧 DEBUG: Authority[{}]: stake={}, address={}", i, auth.stake, auth.address);
         }
-        let committee = Committee::new(0, sorted_authorities); // epoch 0 for genesis
-        let current_epoch = committee.epoch();
-        info!("✅ Loaded committee from Go state with {} authorities, epoch={}", committee.size(), current_epoch);
+        // Start with epoch 0, will auto-sync when receiving blocks from network
+        let current_epoch = 0;
+
+        let committee = Committee::new(current_epoch, sorted_authorities);
+        info!("✅ Loaded committee with {} authorities, epoch={}", committee.size(), current_epoch);
 
         // Capture paths needed for epoch transition
         // NOTE: Không còn require committee_path vì chúng ta không lưu committee ra file
@@ -388,8 +391,35 @@ impl ConsensusNode {
             last_global_exec_index as u32, // replay_after_commit_index: only replay commits after Go's last executed block
             last_global_exec_index as u32, // consumer_last_processed_commit_index: same as replay_after
         );
-        info!("✅ [STARTUP] Commit consumer created - will skip Rust storage commits <= {}, only replay commits > {}", 
+        info!("✅ [STARTUP] Commit consumer created - will skip Rust storage commits <= {}, only replay commits > {}",
             last_global_exec_index, last_global_exec_index);
+
+        // CRITICAL FIX: Sync commit processor next_expected_index with actual consensus state
+        // Commit processor was initialized with next_expected_index=1, but we need to sync it
+        // with the actual last commit index from consensus storage to prevent out-of-order issues
+        let actual_next_expected_index = {
+            // Create temporary store to read last commit
+            let db_path = config.storage_path.join(format!("epochs/epoch_{}/consensus_db", 0));
+            if db_path.exists() {
+                let db_path_str = db_path.to_str().unwrap_or("");
+                let temp_store = consensus_core::storage::rocksdb_store::RocksDBStore::new(db_path_str);
+                match temp_store.read_last_commit() {
+                    Ok(Some(last_commit)) => {
+                        let last_commit_index = last_commit.index();
+                        info!("🔄 [COMMIT SYNC] Found last commit index {} in storage, setting next_expected_index={}",
+                            last_commit_index, last_commit_index + 1);
+                        last_commit_index + 1
+                    }
+                    _ => {
+                        info!("🔄 [COMMIT SYNC] No commits found in storage, using next_expected_index=1");
+                        1
+                    }
+                }
+            } else {
+                info!("🔄 [COMMIT SYNC] Consensus DB does not exist, starting fresh with next_expected_index=1");
+                1
+            }
+        };
 
         // Load keypairs (kept for in-process restart)
         let protocol_keypair = config.load_protocol_keypair()?;
@@ -483,8 +513,8 @@ impl ConsensusNode {
         // Create shared last global exec index for commit processor
         let shared_last_global_exec_index = Arc::new(tokio::sync::Mutex::new(last_global_exec_index));
 
-        // Create ordered commit processor
-        let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
+        // Create ordered commit processor with correct next_expected_index
+        let mut commit_processor = crate::commit_processor::CommitProcessor::new_with_next_expected_index(commit_receiver, actual_next_expected_index)
             .with_commit_index_callback(move |index| {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
             })
@@ -806,13 +836,63 @@ impl ConsensusNode {
             enable_lvm_snapshot: config.enable_lvm_snapshot,
             lvm_snapshot_bin_path: lvm_snapshot_bin_path_for_node,
             lvm_snapshot_delay_seconds: config.lvm_snapshot_delay_seconds,
-            system_transaction_provider,
+            system_transaction_provider: system_transaction_provider.clone(),
             // TODO: Future enhancement - notification channels
             // commit_complete_sender: tokio::sync::watch::channel(false).0,
             // commit_complete_receiver: tokio::sync::watch::channel(false).1,
-            epoch_transition_sender: epoch_tx_sender_for_node,
+            epoch_transition_sender: epoch_tx_sender_for_node.clone(),
             sync_task_handle: None,
         };
+
+        // Spawn epoch monitoring task to detect expired epochs and trigger transitions
+        // This ensures epoch transitions happen even when consensus is stuck
+        eprintln!("🔄 [NODE] Setting up epoch monitoring task..."); // Use eprintln to ensure it shows
+        warn!("🔄 [NODE] Setting up epoch monitoring task...");
+        let epoch_monitor_system_transaction_provider = system_transaction_provider.clone();
+        let epoch_monitor_epoch_tx_sender = epoch_tx_sender_for_node.clone();
+        let epoch_monitor_epoch_duration = config.epoch_duration_seconds.unwrap_or(600);
+
+        eprintln!("🔄 [NODE] Spawning epoch monitoring task...");
+        warn!("🔄 [NODE] Spawning epoch monitoring task...");
+        tokio::spawn(async move {
+            info!("⏰ [EPOCH MONITOR] Starting epoch expiration monitor (duration: {}s)", epoch_monitor_epoch_duration);
+            info!("⏰ [EPOCH MONITOR] Epoch start timestamp: {}ms", epoch_monitor_system_transaction_provider.epoch_start_timestamp_ms().await);
+
+            // Wait a bit for the node to be fully initialized and registered
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await; // Check every 10 seconds
+
+                // Check if epoch has expired
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
+                let epoch_start = epoch_monitor_system_transaction_provider.epoch_start_timestamp_ms().await;
+                let elapsed_seconds = (now_ms - epoch_start) / 1000;
+
+                if elapsed_seconds >= epoch_monitor_epoch_duration {
+                    let current_epoch_val = epoch_monitor_system_transaction_provider.current_epoch().await;
+                    let new_epoch = current_epoch_val + 1;
+                    let new_timestamp_ms = epoch_start + (epoch_monitor_epoch_duration * 1000);
+
+                    warn!(
+                        "⏰ [EPOCH MONITOR] Epoch {} expired (elapsed: {}s >= duration: {}s). Triggering automatic transition to epoch {} at timestamp {}",
+                        current_epoch_val, elapsed_seconds, epoch_monitor_epoch_duration, new_epoch, new_timestamp_ms
+                    );
+
+                    // Trigger epoch transition
+                    if let Err(e) = epoch_monitor_epoch_tx_sender.send((new_epoch, new_timestamp_ms, 0)) {
+                        error!("❌ [EPOCH MONITOR] Failed to trigger epoch transition: {}", e);
+                    } else {
+                        info!("✅ [EPOCH MONITOR] Epoch transition request sent for epoch {}", new_epoch);
+                        break; // Exit monitor after triggering transition
+                    }
+                }
+            }
+        });
 
         // Spawn transition handler task
         // This task will process transition requests and call transition function
@@ -1183,11 +1263,14 @@ impl ConsensusNode {
         Ok(())
     }
 
-    // FIX: Updated to loop infinitely until success
+    // FIX: Add timeout and fallback logic for when Go is busy processing blocks
     async fn build_committee_from_go_validators_at_block(
         executor_client: &Arc<ExecutorClient>,
         block_number: u64,
     ) -> Result<Committee> {
+        let max_retries = 5; // 5 retries * 2s = 10 seconds timeout for faster testing
+        let mut retry_count = 0;
+
         loop {
             // Get validators from Go at specific block
             match executor_client.get_validators_at_block(block_number).await {
@@ -1201,12 +1284,121 @@ impl ConsensusNode {
                     }
                 },
                 Err(e) => {
-                    error!("❌ [COMMITTEE FETCH] Failed to connect to Go: {}. Retrying in 2s...", e);
+                    retry_count += 1;
+                    if retry_count >= max_retries {
+                        warn!("⚠️ [COMMITTEE FETCH] Failed to fetch committee from Go after {} retries. Go executor may be busy processing blocks. Falling back to genesis committee.", retry_count);
+                        // Fallback: Build committee from genesis validators (from config)
+                        // This allows the node to start consensus even when Go is temporarily unavailable
+                        return Self::build_committee_from_genesis_config().await;
+                    }
+                    error!("❌ [COMMITTEE FETCH] Failed to connect to Go (attempt {}/{}): {}. Retrying in 2s...", retry_count, max_retries, e);
                 }
             }
             // Wait before retry
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+    }
+
+    // Fallback function to build committee from hardcoded genesis config when Go is unavailable
+    async fn build_committee_from_genesis_config() -> Result<Committee> {
+        info!("🔄 [COMMITTEE FALLBACK] Building committee from hardcoded genesis configuration...");
+
+        // Hardcoded genesis committee for 4 nodes (same as in config files)
+        // This is a fallback when Go executor is busy and cannot provide committee
+        let mut authorities = Vec::new();
+
+        // Node 0
+        authorities.push(Authority {
+            stake: 1000,
+            address: "/ip4/127.0.0.1/tcp/9000".parse()?,
+            hostname: "node-0".to_string(),
+            authority_key: AuthorityPublicKey::new(
+                bls12381::min_sig::BLS12381PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("tYul89zUYMlyibSJrJCT0sEJBSalXnmqmXTmlPFNmj1SU3qAivVZ24XEJ5ElQ7J1BOdH6GFMbjqUMDGWMoIoURhKVDJjktVPQiqA23RIHHyirsjwZ+6/x4ZXwwZ3a4Jy")?
+                )?
+            ),
+            protocol_key: ProtocolPublicKey::new(
+                ed25519::Ed25519PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("rLLOdT7WwBhZOL1qm6LIZZN24kkPILd1iRpMSSoBnb4=")?
+                )?
+            ),
+            network_key: NetworkPublicKey::new(
+                ed25519::Ed25519PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("cZ8b8XPrTfs59Ul44wAq1Y3Lo4puQybSdx5SfG6WjxA=")?
+                )?
+            ),
+        });
+
+        // Node 1
+        authorities.push(Authority {
+            stake: 1000,
+            address: "/ip4/127.0.0.1/tcp/9001".parse()?,
+            hostname: "node-1".to_string(),
+            authority_key: AuthorityPublicKey::new(
+                bls12381::min_sig::BLS12381PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("q1KJh+npQQi5uTMbyg53RrGT+145ELlQAWNvlBWbuWfJ4g+J/HvXrVQuhxnj9RsECr9a2ABv6q/ROhpi3U1Ya7RX5RH5W5K2F8X6vcTM7bpM+Jtl1rlm/BNvcR00ykia")?
+                )?
+            ),
+            protocol_key: ProtocolPublicKey::new(
+                ed25519::Ed25519PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("kl/oEv8qoIEDt9UJmB7hFokbMIVOMuRwgvGvHwku5MM=")?
+                )?
+            ),
+            network_key: NetworkPublicKey::new(
+                ed25519::Ed25519PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("inMHdwNgfCJueS232fx+yBECI7RkLiFv2t2Eu410rrU=")?
+                )?
+            ),
+        });
+
+        // Node 2
+        authorities.push(Authority {
+            stake: 1000,
+            address: "/ip4/127.0.0.1/tcp/9002".parse()?,
+            hostname: "node-2".to_string(),
+            authority_key: AuthorityPublicKey::new(
+                bls12381::min_sig::BLS12381PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("pJCVUzyXpdusFzE1vaBs491UDTsdDE/T/ePOOTuiPhMRBhjivtdu4L/KvMeToP/DFuBxecGJjAEEY8h90gAPAc0i+pteLgF8292ADA2LOLgfduqXs/13l7YcQMIb78W6")?
+                )?
+            ),
+            protocol_key: ProtocolPublicKey::new(
+                ed25519::Ed25519PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("csgqpMS7MARq0Q0vt4cyqFpgKv3Z1SuBtukv+/7TDQk=")?
+                )?
+            ),
+            network_key: NetworkPublicKey::new(
+                ed25519::Ed25519PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("Ed5bueRWe7ykWjT5M2VvB6OUIaOZ2J4IwZ1IaTUvZyo=")?
+                )?
+            ),
+        });
+
+        // Node 3
+        authorities.push(Authority {
+            stake: 1000,
+            address: "/ip4/127.0.0.1/tcp/9003".parse()?,
+            hostname: "node-3".to_string(),
+            authority_key: AuthorityPublicKey::new(
+                bls12381::min_sig::BLS12381PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("h+QA5TZqQ5tb6KAIl0tTpYyP/j/mUBcp0zK6Sftz5gd9HOI46INDsluu/h3i7sF8FV6VRAvxg8hodlgOkZrwZVNMjjwaa37WiKgNznq2NM3m/RQ/faSQF/R27cPvqlFj")?
+                )?
+            ),
+            protocol_key: ProtocolPublicKey::new(
+                ed25519::Ed25519PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("isdf5xTcPZN5zHhJjswSPcoKnu1gtZME12nETDgOtgI=")?
+                )?
+            ),
+            network_key: NetworkPublicKey::new(
+                ed25519::Ed25519PublicKey::from_bytes(
+                    &general_purpose::STANDARD.decode("xZoYTp3VxO3OjlD9ptE7Oaq87tOOlLTDirNNpDJmXns=")?
+                )?
+            ),
+        });
+
+        let committee = Committee::new(0, authorities);
+        info!("✅ [COMMITTEE FALLBACK] Successfully built committee with {} validators from hardcoded genesis config",
+              committee.size());
+        Ok(committee)
     }
 
     #[allow(dead_code)]
@@ -1815,7 +2007,7 @@ impl ConsensusNode {
             }
         }
         // #endregion
-        let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
+        let mut commit_processor = crate::commit_processor::CommitProcessor::new_with_next_expected_index(commit_receiver, 1) // New epoch starts from commit index 1
             .with_commit_index_callback(move |index| {
                 commit_index_for_callback.store(index, Ordering::SeqCst);
             })

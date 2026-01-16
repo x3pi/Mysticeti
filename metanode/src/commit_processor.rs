@@ -46,9 +46,15 @@ pub struct CommitProcessor {
 
 impl CommitProcessor {
     pub fn new(receiver: UnboundedReceiver<CommittedSubDag>) -> Self {
+        Self::new_with_next_expected_index(receiver, 1)
+    }
+
+    /// Create commit processor with custom next expected index
+    /// Used when restarting to sync with Go Master state
+    pub fn new_with_next_expected_index(receiver: UnboundedReceiver<CommittedSubDag>, next_expected_index: u32) -> Self {
         Self {
             receiver,
-            next_expected_index: 1, // First commit has index 1 (consensus doesn't create commit with index 0)
+            next_expected_index, // Can be set based on Go state for restart sync
             pending_commits: BTreeMap::new(),
             commit_index_callback: None,
             global_exec_index_callback: None,
