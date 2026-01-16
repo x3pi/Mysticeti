@@ -17,6 +17,8 @@ mod clock_sync;
 mod tx_submitter;
 mod checkpoint;
 mod tx_hash;
+mod block_cache;
+mod network_sync;
 
 use config::NodeConfig;
 use node::ConsensusNode;
@@ -92,6 +94,11 @@ async fn main() -> Result<()> {
             };
 
             let registry_service_arc = registry_service.as_ref().map(|rs| Arc::new(rs.clone()));
+
+            // Initialize global block cache for fast full node synchronization
+            // Cache stores blocks when validators send them to Go Master
+            // Full nodes can then sync from this cache instead of network requests
+            block_cache::init_block_cache(10000); // Keep last 10k blocks in cache
             
             // Create the ConsensusNode wrapped in a Mutex for safe concurrent access
             // We use Arc<Mutex<>> because multiple tasks (RPC, UDS) need access to the node

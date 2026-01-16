@@ -1,174 +1,220 @@
-# Mysticeti Metanode
+# Mysticeti Blockchain - Hệ thống Blockchain lai Go/Rust
 
-Mysticeti là một high-performance consensus engine được viết bằng Rust, tích hợp với execution engine Go (Simple Chain) để tạo thành một blockchain hoàn chỉnh.
+## Tổng quan
 
-## Kiến Trúc Tổng Quan
+Mysticeti là hệ thống blockchain lai sử dụng kiến trúc hybrid Go/Rust với:
+- **Go Master**: Quản lý state và execute transactions
+- **Rust Metanodes**: Chạy consensus algorithm và tạo blocks
+- **Go Sub**: Client applications submit transactions
+
+Hệ thống hỗ trợ dynamic node roles: nodes có thể chuyển đổi giữa **Sync-only** (chỉ đồng bộ) và **Validator** (tham gia consensus) dựa trên committee membership.
+
+## Kiến trúc tổng thể
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   Rust Nodes    │     │   Go Execution   │     │   State DB      │
-│   (Consensus)   │◄───►│   Engine         │◄───►│   (RocksDB)     │
-│                 │     │   (Simple Chain) │     │                 │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-         │                           │                     │
-         │ Send Committed Blocks     │                     │
-         │ ─────────────────────────►│                     │
-         │ executor{N}.sock          │                     │
-         │                           │                     │
-         │ Request State Info        │                     │
-         │◄──────────────────────────│                     │
-         │ rust-go.sock_{N+1}        │                     │
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│     Go Sub      │────│  Rust Metanodes  │────│    Go Master    │
+│ (Applications)  │    │  (Consensus)     │    │   (Execution)   │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+        │                        │                        │
+        ▼                        ▼                        ▼
+   Submit txs ───────────►    Create blocks ───────────► Execute txs
+   (RPC/Unix)            DAG Consensus              State updates
 ```
 
-## Thành Phần Chính
+## Components chính
 
-### Consensus Engine (Rust)
-- **Mysticeti DAG**: High-throughput consensus algorithm
-- **Multi-node**: Hỗ trợ 4 nodes với Byzantine fault tolerance
-- **Epoch Management**: Tự động chuyển đổi epoch dựa trên thời gian
-- **Network Layer**: gRPC-based peer-to-peer communication
+### 1. Go Master (Go Executor)
+- **Chức năng**: Execute transactions, manage state, persist data
+- **Cổng**: Unix socket (`/tmp/rust-go.sock_1`)
+- **Nhiệm vụ**:
+  - Nhận committed blocks từ Rust
+  - Execute transactions theo thứ tự
+  - Update account balances, contract state
+  - Persist to database
 
-### Execution Engine (Go)
-- **Simple Chain**: Transaction processing và state management
-- **Master-Sub Architecture**: 1 master + 3 sub nodes
-- **State Synchronization**: Sync state giữa các sub nodes
-- **Unix Socket API**: Giao tiếp với consensus engine
+### 2. Rust Metanodes (Consensus Nodes)
+- **Chức năng**: Chạy consensus, tạo và commit blocks
+- **2 chế độ hoạt động**:
+  - **Validator**: Tham gia consensus đầy đủ
+  - **Sync-only**: Chỉ đồng bộ data, không tạo blocks
 
-## Giao Tiếp Giữa Components
+### 3. Go Sub (Client Applications)
+- **Chức năng**: Submit transactions tới mạng
+- **Kết nối**: RPC HTTP hoặc Unix Domain Socket
+- **Ví dụ**: Wallets, dApps, smart contract interactions
 
-Chi tiết về các luồng giao tiếp, socket paths và cấu hình được mô tả trong [COMMUNICATION_PROTOCOLS.md](./COMMUNICATION_PROTOCOLS.md).
+## Quá trình tạo block
 
-### Socket Paths Chính
+### Phase 1: Submit Transactions
+```
+Go Sub ──RPC──► Rust Metanode ──► Consensus Pool
+```
+1. Go Sub tạo transaction (transfer, contract call, etc.)
+2. Submit qua RPC HTTP (port 9100-9104) hoặc Unix socket
+3. Transaction vào consensus pool của validator nodes
 
-| Component | Send Socket | Receive Socket | Mục đích |
-|-----------|-------------|----------------|----------|
-| **Node 0** | `/tmp/executor0.sock` | `/tmp/rust-go.sock_1` | Gửi blocks, đọc state |
-| **Go Master** | `/tmp/rust-go.sock_1` | `/tmp/executor0.sock` | Nhận blocks, gửi state |
+### Phase 2: Consensus & Block Creation
+```
+Consensus Pool ──► DAG Consensus ──► Block Creation ──► Commit
+```
+1. **Leader election**: Chọn leader cho round
+2. **Block proposal**: Leader tạo block chứa transactions
+3. **Voting**: Nodes vote cho block
+4. **Finalization**: Quorum certificates
+5. **Commit**: Block được commit và broadcast
 
-## Quick Start
+### Phase 3: Execution
+```
+Committed Block ──Unix Socket──► Go Master ──► State Update
+```
+1. Commit processor gửi block tới Go Master
+2. Go Master execute transactions theo thứ tự
+3. Update state và persist data
+4. Return confirmation
 
-### 1. Build và Setup
+## Node Roles & Dynamic Switching
 
+### Validator Nodes
+- **Điều kiện**: Node nằm trong committee (được bầu làm validator)
+- **Chức năng**:
+  - Tham gia consensus đầy đủ
+  - Tạo và vote blocks
+  - Gửi committed blocks tới Go Master
+  - Chạy RPC/UDS servers để nhận transactions
+- **Config**: `initial_node_mode = "Validator"` (tùy chọn)
+
+### Sync-only Nodes
+- **Điều kiện**: Node không nằm trong committee
+- **Chức năng**:
+  - Đồng bộ data từ Go Master
+  - Không tạo blocks hoặc tham gia voting
+  - Không chạy RPC/UDS servers
+- **Config**: `initial_node_mode = "SyncOnly"` (tùy chọn)
+
+### Epoch Transitions
+Mỗi epoch kết thúc, committee có thể thay đổi:
+1. **EndOfEpoch transaction** được tạo
+2. **Committee mới** được fetch từ Go Master
+3. **Node roles cập nhật**:
+   - Node mới vào committee → Chuyển `SyncOnly` → `Validator`
+   - Node bị loại khỏi committee → Chuyển `Validator` → `SyncOnly`
+4. **Authority recreation**: Validator mới tạo consensus authority
+
+## Configuration
+
+### Node Configuration (node_*.toml)
+```toml
+[network]
+node_id = 0
+network_address = "127.0.0.1:9000"
+metrics_port = 9100
+
+[consensus]
+initial_node_mode = "Validator"  # "Validator" hoặc "SyncOnly"
+db_path = "config/storage/node_0/consensus_db"
+
+[executor]
+send_socket_path = "/tmp/executor0.sock"
+receive_socket_path = "/tmp/rust-go.sock_1"
+executor_commit_enabled = true
+executor_read_enabled = true
+
+[epoch_transition]
+epoch_transition_optimization = "balanced"
+enable_gradual_shutdown = true
+```
+
+### Committee Configuration
+- Committee được quản lý bởi Go Master
+- Tự động fetch qua Unix socket mỗi lần startup
+- Bao gồm: authorities, stakes, network info
+
+## Installation & Setup
+
+### Prerequisites
+- Rust 1.70+
+- Go 1.19+
+- Unix domain sockets enabled
+- Ports 9000-9004, 9100-9104 available
+
+### Build
 ```bash
-# Build Rust consensus engine
+# Build Rust metanodes
 cd metanode
 cargo build --release
 
-# Build Go execution engine
-cd ../../mtn-simple-2025
-go build -o mtn-simple ./cmd/simple_chain
+# Build Go components (nếu có)
+cd ../go-components
+go build
 ```
 
-### 2. Cấu Hình
-
+### Run System
 ```bash
-# Tạo cấu hình cho single node testing
-cd metanode
-./target/release/metanode generate --single-node
+# Start Go Master
+./go-master
 
-# Hoặc cấu hình multi-node
-./target/release/metanode generate --multi-node
+# Start Go Sub (optional)
+./go-sub
+
+# Start Rust nodes
+./scripts/run_full_system.sh
 ```
 
-### 3. Chạy Nodes
-
-```bash
-# Terminal 1: Go Master Node
-cd ../../mtn-simple-2025
-./mtn-simple --config cmd/simple_chain/config_sv/config-master.json
-
-# Terminal 2: Rust Node 0
-cd metanode
-./target/release/metanode start --config config_single/node_0.toml
-```
-
-## Cấu Hình Environment
-
-### Development Mode
-```bash
-export LOCALHOST_TESTING=1  # Bypass network health checks
-export SINGLE_NODE=1        # Force single-node consensus
-```
-
-### Production Mode
-- Đảm bảo tất cả 4 nodes chạy
-- Network connectivity giữa các nodes
-- Shared storage cho epoch data
-
-## Monitoring
+## Monitoring & Debugging
 
 ### Logs
-- **Consensus Logs**: `metanode/logs/latest/node_*.log`
-- **Execution Logs**: Xem trong Go application logs
-- **Epoch Logs**: `metanode/logs/latest/node_*.epoch.log`
+- **Node logs**: `logs/latest/node_*.log`
+- **Consensus logs**: Authority startup, block creation, commits
+- **Executor logs**: Transaction execution, state updates
 
-### Metrics
-- Prometheus metrics trên port 9090 (nếu enable)
-- Health checks qua HTTP endpoints
-
-## Troubleshooting
+### Key Metrics
+- Block production rate
+- Transaction throughput
+- Epoch transition time
+- Network latency
 
 ### Common Issues
+1. **Port conflicts**: Đảm bảo ports không bị sử dụng
+2. **Socket permissions**: Unix sockets cần quyền read/write
+3. **Committee sync**: Nodes cần sync committee từ Go Master
+4. **Epoch transitions**: Có thể mất vài giây để chuyển đổi
 
-1. **Epoch không chuyển đổi**
-   - Kiểm tra network connectivity giữa nodes
-   - Đảm bảo quorum đạt được (2f+1 votes)
-   - Check `LOCALHOST_TESTING=1` cho local dev
+## Architecture Benefits
 
-2. **Socket connection errors**
-   - Xóa socket files cũ: `rm /tmp/executor*.sock /tmp/rust-go.sock_*`
-   - Đảm bảo Go master chạy trước Rust nodes
-   - Check socket permissions
+### Hybrid Go/Rust Design
+- **Go**: Mature ecosystem, rich tooling, proven execution
+- **Rust**: High performance, memory safety, modern consensus
 
-3. **Buffer overflow**
-   - Tăng resources cho Go execution engine
-   - Giảm consensus block production rate
-   - Check backpressure mechanism hoạt động
+### Dynamic Node Roles
+- **Scalability**: Thêm/bớt nodes mà không restart toàn hệ thống
+- **Cost efficiency**: Sync-only nodes tiết kiệm resources
+- **Fault tolerance**: Nodes có thể recover roles tự động
 
-### Debug Commands
+### Sequential Consistency
+- **Global execution index**: Đảm bảo transaction ordering
+- **Block buffering**: Handle out-of-order commits
+- **Fork prevention**: Duplicate index detection
 
+## Development
+
+### Adding New Features
+1. **Consensus changes**: Modify `meta-consensus/` crate
+2. **Execution logic**: Update Go Master components
+3. **Client APIs**: Extend RPC/UDS interfaces
+
+### Testing
 ```bash
-# Check socket connections
-ls -la /tmp/executor*.sock /tmp/rust-go.sock_*
+# Unit tests
+cargo test
 
-# Monitor consensus state
-tail -f metanode/logs/latest/node_0.log | grep EPOCH
+# Integration tests
+./scripts/run_integration_tests.sh
 
-# Check Go state
-curl http://localhost:8080/health  # Nếu có health endpoint
+# Load testing
+./scripts/load_test.sh
 ```
 
-## Architecture Details
+---
 
-### Consensus Algorithm
-- **Naru+Mysticeti**: DAG-based consensus
-- **Leaderless**: Tất cả nodes đều có thể propose blocks
-- **Byzantine Fault Tolerant**: Chịu được f/3 faulty nodes
-
-### Epoch Management
-- **Time-based**: Chuyển epoch sau N giây (mặc định 180s)
-- **State Persistence**: Epoch data lưu trong RocksDB
-- **Fork Safety**: Đảm bảo không có fork khi chuyển epoch
-
-### Execution Model
-- **Sequential Processing**: Blocks được execute theo thứ tự
-- **State Commitments**: Atomic state updates
-- **Validator Management**: Dynamic validator set
-
-## Contributing
-
-### Development Setup
-1. Clone repository
-2. Setup Rust toolchain (1.70+)
-3. Setup Go (1.21+)
-4. Build both components
-5. Run tests: `cargo test` và `go test`
-
-### Code Organization
-- `metanode/src/`: Rust consensus engine
-- `metanode/meta-consensus/`: Core consensus library
-- `../mtn-simple-2025/`: Go execution engine
-
-## License
-
-Copyright 2024 Chain-N Project. All rights reserved.
+*Tài liệu này mô tả hệ thống Mysticeti blockchain hiện tại. Các thông tin có thể thay đổi theo development progress.*

@@ -219,7 +219,7 @@ impl CommitProcessor {
                         let total_txs_in_commit = subdag.blocks.iter().map(|b| b.transactions().len()).sum::<usize>();
 
                         // Check for EndOfEpoch system transactions
-                        let has_system_tx = subdag.extract_end_of_epoch_transaction().is_some();
+                        let _has_system_tx = subdag.extract_end_of_epoch_transaction().is_some();
                         if let Some((_block_ref, system_tx)) = subdag.extract_end_of_epoch_transaction() {
                             if let Some((new_epoch, new_epoch_timestamp_ms, _commit_index_from_tx)) = system_tx.as_end_of_epoch() {
                                 info!(
@@ -416,10 +416,22 @@ impl CommitProcessor {
         let has_system_tx = subdag.extract_end_of_epoch_transaction().is_some();
 
         if total_transactions > 0 || has_system_tx {
+            // Log detailed transaction count per block
+            let block_tx_counts: Vec<usize> = subdag.blocks.iter()
+                .map(|b| b.transactions().len())
+                .collect();
+            
             info!(
                 "🔷 [Global Index: {}] Executing commit #{} (epoch={}): {} blocks, {} txs, has_system_tx={}",
                 global_exec_index, commit_index, epoch, subdag.blocks.len(), total_transactions, has_system_tx
             );
+            
+            // Log transaction count per block
+            for (block_idx, tx_count) in block_tx_counts.iter().enumerate() {
+                if *tx_count > 0 {
+                    info!("  📦 Block[{}]: {} transactions", block_idx, tx_count);
+                }
+            }
 
             if let Some(ref client) = executor_client {
                 // FIXED: Wrapped in a loop to retry system transactions
@@ -427,6 +439,14 @@ impl CommitProcessor {
                 loop {
                     match client.send_committed_subdag(subdag, epoch, global_exec_index).await {
                         Ok(_) => {
+                            // Store block in global cache for full node sync
+                            info!("📦 [BLOCK CACHE] Attempting to store block {} in cache", global_exec_index);
+                            if let Err(e) = crate::block_cache::store_block(global_exec_index, subdag).await {
+                                warn!("⚠️ [BLOCK CACHE] Failed to store block {} in cache: {}", global_exec_index, e);
+                            } else {
+                                info!("✅ [BLOCK CACHE] Successfully stored block {} in cache", global_exec_index);
+                            }
+
                             info!("✅ [TX FLOW] Successfully sent committed subdag: global_exec_index={}, commit_index={}",
                                 global_exec_index, commit_index);
 
@@ -480,6 +500,14 @@ impl CommitProcessor {
              if let Some(ref client) = executor_client {
                 match client.send_committed_subdag(subdag, epoch, global_exec_index).await {
                     Ok(_) => {
+                        // Store block in global cache for full node sync (even empty commits)
+                        info!("📦 [BLOCK CACHE] Attempting to store empty block {} in cache", global_exec_index);
+                        if let Err(e) = crate::block_cache::store_block(global_exec_index, subdag).await {
+                            warn!("⚠️ [BLOCK CACHE] Failed to store empty block {} in cache: {}", global_exec_index, e);
+                        } else {
+                            info!("✅ [BLOCK CACHE] Successfully stored empty block {} in cache", global_exec_index);
+                        }
+
                         info!("✅ [TX FLOW] Successfully sent empty commit: global_exec_index={}, commit_index={}",
                             global_exec_index, commit_index);
 

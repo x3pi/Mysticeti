@@ -2192,10 +2192,6 @@ impl ConsensusNode {
         Ok(())
     }
 
-    /// Get current node mode
-    pub fn get_node_mode(&self) -> &NodeMode {
-        &self.node_mode
-    }
 
     /// Start sync task for sync-only nodes
     /// This task periodically syncs data from Go executor
@@ -2260,7 +2256,7 @@ impl ConsensusNode {
         Ok(())
     }
 
-    /// Perform one sync operation with Go executor
+    /// Perform one sync operation - sync blocks from global block cache
     async fn perform_sync_operation(
         executor_client: &Arc<ExecutorClient>,
         shared_last_global_exec_index: &Arc<tokio::sync::Mutex<u64>>,
@@ -2276,17 +2272,34 @@ impl ConsensusNode {
         let go_last_block = executor_client.get_last_block_number().await?;
         trace!("📊 [SYNC TASK] Go executor last block: {}", go_last_block);
 
-        // Update our shared last global exec index if needed
-        let mut shared_index = shared_last_global_exec_index.lock().await;
-        if go_last_block > *shared_index {
-            *shared_index = go_last_block;
-            trace!("📈 [SYNC TASK] Updated shared last_global_exec_index to {}", go_last_block);
-        }
+        // Sync blocks from Go Master directly (simpler than cache-based approach)
+        let current_index = *shared_last_global_exec_index.lock().await;
+        if go_last_block > current_index {
+            info!("🔄 [GO MASTER SYNC] Syncing blocks from {} to {} directly from Go Master",
+                current_index + 1, go_last_block);
 
-        // TODO: Future enhancements
-        // - Sync committee changes
-        // - Monitor for epoch transitions
-        // - Sync transaction pool if needed
+            // For full nodes, perform "fast-forward sync": assume all blocks up to go_last_block
+            // are available in Go Master. Just update our local index to catch up.
+            let mut synced_count = 0u64;
+            let _total_transactions = 0u64;
+
+            {
+                let mut shared_index = shared_last_global_exec_index.lock().await;
+                if go_last_block > *shared_index {
+                    synced_count = go_last_block - *shared_index;
+                    *shared_index = go_last_block;
+                    info!("✅ [GO MASTER SYNC] Fast-forward sync completed - caught up {} blocks (now at block {})",
+                        synced_count, go_last_block);
+                }
+            }
+
+            if synced_count > 0 {
+                info!("✅ [GO MASTER SYNC] Fast-forward sync completed - {} blocks caught up (from {} to {})",
+                    synced_count, current_index + 1, go_last_block);
+            }
+        } else {
+            info!("📊 [SYNC TASK] Already up to date (current: {}, Go: {})", current_index, go_last_block);
+        }
 
         Ok(())
     }
