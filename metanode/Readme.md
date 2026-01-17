@@ -226,7 +226,7 @@ metrics_port = 9100
 # Performance tuning
 speed_multiplier = 0.2
 time_based_epoch_change = true
-epoch_duration_seconds = 300
+epoch_duration_seconds = 600
 max_clock_drift_seconds = 5
 ```
 
