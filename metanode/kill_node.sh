@@ -1,1 +1,0 @@
-scripts/node/kill_node.sh

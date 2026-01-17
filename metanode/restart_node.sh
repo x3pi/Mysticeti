@@ -1,1 +1,0 @@
-scripts/node/restart_node.sh

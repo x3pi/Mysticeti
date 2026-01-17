@@ -1,1 +1,0 @@
-scripts/node/run_nodes.sh

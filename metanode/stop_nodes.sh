@@ -1,1 +1,0 @@
-scripts/node/stop_nodes.sh

@@ -1,1 +1,0 @@
-scripts/node/start_node.sh
