@@ -2004,6 +2004,89 @@ impl ConsensusNode {
         // Reset reconfiguration state to clean state for new epoch
         self.reset_reconfig_state().await;
 
+        // LVM Snapshot creation after successful epoch transition
+        if self.enable_lvm_snapshot {
+            info!("📸 [LVM SNAPSHOT] Node is configured to create snapshots after epoch transitions");
+
+            // Spawn task to create snapshot asynchronously (don't block epoch transition)
+            let config_clone = config.clone();
+            let lvm_snapshot_bin_path = self.lvm_snapshot_bin_path.clone();
+            let lvm_snapshot_delay_seconds = self.lvm_snapshot_delay_seconds;
+
+            tokio::spawn(async move {
+                info!("📸 [LVM SNAPSHOT] Starting snapshot creation task for epoch {} (delay: {}s)", new_epoch, lvm_snapshot_delay_seconds);
+
+                // Wait for the configured delay to allow Go executor to finish processing
+                if lvm_snapshot_delay_seconds > 0 {
+                    info!("⏳ [LVM SNAPSHOT] Waiting {}s before creating snapshot to allow Go executor to stabilize", lvm_snapshot_delay_seconds);
+                    tokio::time::sleep(Duration::from_secs(lvm_snapshot_delay_seconds)).await;
+                }
+
+                // Check Go Master's last block to ensure data persistence
+                // Create a new executor client for this check
+                let executor_client = Arc::new(crate::executor_client::ExecutorClient::new(
+                    config_clone.executor_read_enabled,
+                    config_clone.executor_commit_enabled,
+                    config_clone.executor_send_socket_path.clone(),
+                    config_clone.executor_receive_socket_path.clone(),
+                ));
+
+                let go_last_block = match executor_client.get_last_block_number().await {
+                    Ok(block_num) => {
+                        info!("✅ [LVM SNAPSHOT] Go Master last block: {}", block_num);
+                        Some(block_num)
+                    }
+                    Err(e) => {
+                        warn!("⚠️  [LVM SNAPSHOT] Failed to get Go Master last block: {}. Continuing with snapshot creation.", e);
+                        None
+                    }
+                };
+
+                if let Some(block_num) = go_last_block {
+                    info!("📊 [LVM SNAPSHOT] Verified Go Master has processed up to block {}", block_num);
+                }
+
+                // Create LVM snapshot using lvm-snap-rsync binary
+                if let Some(bin_path) = lvm_snapshot_bin_path {
+                    info!("🚀 [LVM SNAPSHOT] Creating LVM snapshot for epoch {} using binary: {}", new_epoch, bin_path.display());
+
+                    // Get the directory containing the binary (where config.toml should be)
+                    let bin_dir = bin_path.parent().unwrap_or(&std::path::PathBuf::from(".")).to_path_buf();
+                    info!("📁 [LVM SNAPSHOT] Running binary from directory: {}", bin_dir.display());
+
+                    match tokio::process::Command::new("sudo")
+                        .arg(&bin_path)
+                        .current_dir(bin_dir)
+                        .arg("--id")
+                        .arg(new_epoch.to_string())
+                        .output()
+                        .await
+                    {
+                        Ok(output) => {
+                            if output.status.success() {
+                                info!("✅ [LVM SNAPSHOT] Successfully created LVM snapshot for epoch {}", new_epoch);
+                                if let Ok(stdout) = String::from_utf8(output.stdout) {
+                                    if !stdout.trim().is_empty() {
+                                        info!("📋 [LVM SNAPSHOT] Output: {}", stdout.trim());
+                                    }
+                                }
+                            } else {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                error!("❌ [LVM SNAPSHOT] Failed to create LVM snapshot for epoch {}: {}", new_epoch, stderr);
+                            }
+                        }
+                        Err(e) => {
+                            error!("❌ [LVM SNAPSHOT] Failed to execute lvm-snap-rsync binary: {}", e);
+                        }
+                    }
+                } else {
+                    warn!("⚠️  [LVM SNAPSHOT] No lvm_snapshot_bin_path configured, skipping snapshot creation");
+                }
+            });
+        } else {
+            info!("ℹ️  [LVM SNAPSHOT] Node is not configured to create snapshots (enable_lvm_snapshot = false)");
+        }
+
         Ok(())
     }
 

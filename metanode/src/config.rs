@@ -265,7 +265,7 @@ impl NodeConfig {
                 leader_timeout_ms: None,
                 min_round_delay_ms: None,
                 time_based_epoch_change: true, // Enabled by default
-                epoch_duration_seconds: Some(600), // Default: 10 minutes (10 * 60 seconds)
+                epoch_duration_seconds: Some(300), // Default: 5 minutes (5 * 60 seconds)
                 max_clock_drift_seconds: 5,
                 enable_ntp_sync: false, // Disabled by default (enable for production)
                 ntp_servers: default_ntp_servers(),
@@ -281,7 +281,7 @@ impl NodeConfig {
                 adaptive_delay_enabled: default_adaptive_delay(),
                 enable_lvm_snapshot: false,
                 lvm_snapshot_bin_path: None,
-                lvm_snapshot_delay_seconds: 120,
+                lvm_snapshot_delay_seconds: 20,
                 epoch_transition_optimization: "balanced".to_string(),
                 enable_gradual_shutdown: true,
                 initial_node_mode: default_node_mode(),
