@@ -317,17 +317,17 @@ print_step "Bước 3: Kiểm tra và setup Move dependencies..."
 
 SETUP_SCRIPT="$MYSTICETI_ROOT/scripts/setup_move_dependencies.sh"
 
-if [ -f "$SETUP_SCRIPT" ]; then
-    print_info "Đang kiểm tra Move dependencies..."
-    bash "$SETUP_SCRIPT" || {
-        print_warn "⚠️  Không thể setup Move dependencies tự động"
-        print_warn "   Bạn có thể chạy thủ công: bash $SETUP_SCRIPT"
-        print_warn "   Hoặc clone Sui repository: git clone --depth=1 https://github.com/MystenLabs/sui.git $MYSTICETI_ROOT/sui"
-    }
-else
-    print_warn "⚠️  Script setup Move dependencies không tìm thấy tại $SETUP_SCRIPT"
-    print_warn "   Đảm bảo các Move crates đã được setup tại: $MYSTICETI_ROOT/sui/external-crates/move/crates/"
-fi
+# if [ -f "$SETUP_SCRIPT" ]; then
+#     print_info "Đang kiểm tra Move dependencies..."
+#     bash "$SETUP_SCRIPT" || {
+#         print_warn "⚠️  Không thể setup Move dependencies tự động"
+#         print_warn "   Bạn có thể chạy thủ công: bash $SETUP_SCRIPT"
+#         print_warn "   Move dependencies đã được copy vào: $MYSTICETI_ROOT/external-crates/move/"
+#     }
+# else
+#     print_warn "⚠️  Script setup Move dependencies không tìm thấy tại $SETUP_SCRIPT"
+#     print_warn "   Move dependencies đã được copy vào: $MYSTICETI_ROOT/external-crates/move/"
+# fi
 
 # Step 4: Build Rust binary (luôn build lại để đảm bảo code mới nhất)
 print_step "Bước 4: Build Rust binary và tạo committee mới..."

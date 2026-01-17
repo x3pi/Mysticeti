@@ -9,11 +9,116 @@ use std::{
 
 use clap::*;
 use fastcrypto::encoding::{Base58, Encoding, Hex};
-use move_binary_format::{
-    binary_config::{BinaryConfig, TableConfig},
-    file_format_common::VERSION_1,
-};
-use move_vm_config::verifier::VerifierConfig;
+
+// Local definitions to replace Move dependencies
+pub const VERSION_1: u32 = 1;
+pub const VARIANT_COUNT_MAX: u64 = 127;
+
+#[derive(Debug, Clone)]
+pub struct TableConfig {
+    pub module_handles: u16,
+    pub datatype_handles: u16,
+    pub function_handles: u16,
+    pub function_instantiations: u16,
+    pub signatures: u16,
+    pub constant_pool: u16,
+    pub identifiers: u16,
+    pub address_identifiers: u16,
+    pub struct_defs: u16,
+    pub struct_def_instantiations: u16,
+    pub function_defs: u16,
+    pub field_handles: u16,
+    pub field_instantiations: u16,
+    pub friend_decls: u16,
+    pub enum_defs: u16,
+    pub enum_def_instantiations: u16,
+    pub variant_handles: u16,
+    pub variant_instantiation_handles: u16,
+}
+
+impl TableConfig {
+    pub fn legacy() -> Self {
+        TableConfig {
+            module_handles: u16::MAX,
+            datatype_handles: u16::MAX,
+            function_handles: u16::MAX,
+            function_instantiations: u16::MAX,
+            signatures: u16::MAX,
+            constant_pool: u16::MAX,
+            identifiers: u16::MAX,
+            address_identifiers: u16::MAX,
+            struct_defs: u16::MAX,
+            struct_def_instantiations: u16::MAX,
+            function_defs: u16::MAX,
+            field_handles: u16::MAX,
+            field_instantiations: u16::MAX,
+            friend_decls: u16::MAX,
+            enum_defs: u16::MAX,
+            enum_def_instantiations: u16::MAX,
+            variant_handles: 1024,
+            variant_instantiation_handles: 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BinaryConfig {
+    pub max_binary_format_version: u32,
+    pub min_binary_format_version: u32,
+    pub check_no_extraneous_bytes: bool,
+    pub deprecate_global_storage_ops: bool,
+    pub table_config: TableConfig,
+    allow_unpublishable: bool,
+}
+
+impl BinaryConfig {
+    pub fn new(
+        max_binary_format_version: u32,
+        min_binary_format_version: u32,
+        check_no_extraneous_bytes: bool,
+        deprecate_global_storage_ops: bool,
+        table_config: TableConfig,
+    ) -> Self {
+        Self {
+            max_binary_format_version,
+            min_binary_format_version,
+            check_no_extraneous_bytes,
+            deprecate_global_storage_ops,
+            table_config,
+            allow_unpublishable: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifierConfig {
+    pub max_loop_depth: Option<usize>,
+    pub max_function_parameters: Option<usize>,
+    pub max_generic_instantiation_length: Option<usize>,
+    pub max_basic_blocks: Option<usize>,
+    pub max_value_stack_size: usize,
+    pub max_type_nodes: Option<usize>,
+    pub max_push_size: Option<usize>,
+    pub max_dependency_depth: Option<usize>,
+    pub max_data_definitions: Option<usize>,
+    pub max_fields_in_struct: Option<usize>,
+    pub max_function_definitions: Option<usize>,
+    pub max_constant_vector_len: Option<u64>,
+    pub max_back_edges_per_function: Option<usize>,
+    pub max_back_edges_per_module: Option<usize>,
+    pub max_basic_blocks_in_script: Option<usize>,
+    pub max_identifier_len: Option<u64>,
+    pub disallow_self_identifier: bool,
+    pub allow_receiving_object_id: bool,
+    pub reject_mutable_random_on_entry_functions: bool,
+    pub bytecode_version: u32,
+    pub max_variants_in_enum: Option<u64>,
+    pub additional_borrow_checks: bool,
+    pub better_loader_errors: bool,
+    pub private_generics_verifier_v2: bool,
+    pub sanity_check_with_regex_reference_safety: Option<u128>,
+    pub deprecate_global_storage_ops: bool,
+}
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use meta_protocol_config_macros::{
@@ -4147,7 +4252,7 @@ impl ProtocolConfig {
                 }
                 86 => {
                     cfg.feature_flags.type_tags_in_object_runtime = true;
-                    cfg.max_move_enum_variants = Some(move_core_types::VARIANT_COUNT_MAX);
+                    cfg.max_move_enum_variants = Some(VARIANT_COUNT_MAX);
 
                     // Set a stake_weighted_median_threshold for congestion control.
                     cfg.feature_flags.per_object_congestion_control_mode =
