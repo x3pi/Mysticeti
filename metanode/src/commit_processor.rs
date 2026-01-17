@@ -219,7 +219,7 @@ impl CommitProcessor {
                         let total_txs_in_commit = subdag.blocks.iter().map(|b| b.transactions().len()).sum::<usize>();
 
                         // Check for EndOfEpoch system transactions
-                        let has_system_tx = subdag.extract_end_of_epoch_transaction().is_some();
+                        let _has_system_tx = subdag.extract_end_of_epoch_transaction().is_some();
                         if let Some((_block_ref, system_tx)) = subdag.extract_end_of_epoch_transaction() {
                             if let Some((new_epoch, new_epoch_timestamp_ms, _commit_index_from_tx)) = system_tx.as_end_of_epoch() {
                                 info!(

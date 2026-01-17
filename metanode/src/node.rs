@@ -2193,9 +2193,9 @@ impl ConsensusNode {
     }
 
     /// Get current node mode
-    pub fn get_node_mode(&self) -> &NodeMode {
-        &self.node_mode
-    }
+    // pub fn get_node_mode(&self) -> &NodeMode {
+    //     &self.node_mode
+    // }
 
     /// Start sync task for sync-only nodes
     /// This task periodically syncs data from Go executor

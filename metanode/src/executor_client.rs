@@ -909,10 +909,12 @@ impl ExecutorClient {
         
         // Create CommittedEpochData message using generated protobuf code
         // CRITICAL FORK-SAFETY: Include global_exec_index and commit_index for deterministic ordering
+        // EPOCH TRACKING: Include epoch number for block header population in Go Master
         let epoch_data = CommittedEpochData {
             blocks,
             global_exec_index,
             commit_index: subdag.commit_ref.index as u32,
+            epoch,
         };
         
         // Encode to protobuf bytes using prost::Message::encode

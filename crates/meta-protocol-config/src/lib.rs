@@ -68,7 +68,6 @@ pub struct BinaryConfig {
     pub check_no_extraneous_bytes: bool,
     pub deprecate_global_storage_ops: bool,
     pub table_config: TableConfig,
-    allow_unpublishable: bool,
 }
 
 impl BinaryConfig {
@@ -85,7 +84,6 @@ impl BinaryConfig {
             check_no_extraneous_bytes,
             deprecate_global_storage_ops,
             table_config,
-            allow_unpublishable: false,
         }
     }
 }
