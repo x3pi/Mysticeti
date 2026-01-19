@@ -308,6 +308,7 @@ impl ConsensusNode {
             }
         } else {
             // For epochs > 0, use timestamp from Go state
+            // This timestamp marks when the epoch was created and should not be changed
             info!("📅 Using epoch_timestamp_ms from Go state: {} (epoch {})", _go_epoch_timestamp_ms, current_epoch);
             _go_epoch_timestamp_ms
         };
@@ -1993,7 +1994,7 @@ impl ConsensusNode {
             }
         }
         self.authority = authority;
-        
+
         // OPTIMIZED: Adaptive delay for authority ready check based on optimization level
         // This prevents transactions from being lost if epoch transition is too fast
         // Authority needs time to initialize network connections, start consensus, etc.
@@ -2406,6 +2407,7 @@ impl ConsensusNode {
 
         self.sync_task_handle = Some(sync_task);
         info!("✅ [SYNC TASK] Sync task started successfully");
+
         Ok(())
     }
 

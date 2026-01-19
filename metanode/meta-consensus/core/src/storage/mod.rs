@@ -67,6 +67,7 @@ pub trait Store: Send + Sync {
         &self,
         commit_ref: CommitRef,
     ) -> ConsensusResult<Option<BTreeMap<BlockRef, Vec<TransactionIndex>>>>;
+
 }
 
 /// Represents data to be written to the store together atomically.
