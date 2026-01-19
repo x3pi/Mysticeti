@@ -33,6 +33,7 @@ struct Inner {
     commit_info: BTreeMap<(CommitIndex, CommitDigest), CommitInfo>,
     finalized_commits:
         BTreeMap<(CommitIndex, CommitDigest), BTreeMap<BlockRef, Vec<TransactionIndex>>>,
+    genesis_blocks: BTreeMap<u64, Vec<BlockRef>>,
 }
 
 impl MemStore {
@@ -45,6 +46,7 @@ impl MemStore {
                 commit_votes: BTreeSet::new(),
                 commit_info: BTreeMap::new(),
                 finalized_commits: BTreeMap::new(),
+                genesis_blocks: BTreeMap::new(),
             }),
         }
     }
@@ -231,5 +233,16 @@ impl Store for MemStore {
             .finalized_commits
             .get(&(commit_ref.index, commit_ref.digest))
             .cloned())
+    }
+
+    fn read_genesis_blocks(&self, epoch: u64) -> ConsensusResult<Option<Vec<BlockRef>>> {
+        let inner = self.inner.read();
+        Ok(inner.genesis_blocks.get(&epoch).cloned())
+    }
+
+    fn write_genesis_blocks(&self, epoch: u64, genesis_blocks: Vec<BlockRef>) -> ConsensusResult<()> {
+        let mut inner = self.inner.write();
+        inner.genesis_blocks.insert(epoch, genesis_blocks);
+        Ok(())
     }
 }

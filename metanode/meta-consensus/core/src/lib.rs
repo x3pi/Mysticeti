@@ -65,7 +65,7 @@ pub use reconfiguration::{ReconfigCertStatus, ReconfigState};
 
 /// Exported API for testing and tools.
 pub use block::{TestBlock, Transaction, VerifiedBlock};
-pub use commit::{CommitAPI, CommitDigest, CommitIndex, CommitRange, CommitRef, CommittedSubDag};
+pub use commit::{CommitAPI, CommitDigest, CommitIndex, CommitRange, CommitRef, CommittedSubDag, load_committed_subdag_from_store};
 pub use system_transaction::{SystemTransaction, SystemTransactionKind};
 pub use system_transaction_provider::{SystemTransactionProvider, DefaultSystemTransactionProvider};
 pub use commit_consumer::{CommitConsumerArgs, CommitConsumerMonitor};

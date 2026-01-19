@@ -43,6 +43,8 @@ pub struct RocksDBStore {
     /// Maps finalized commits to the transactions rejected in the commit.
     finalized_commits:
         DBMap<(CommitIndex, CommitDigest), BTreeMap<BlockRef, Vec<TransactionIndex>>>,
+    /// Stores genesis block refs for each epoch: epoch -> Vec<BlockRef>
+    genesis_blocks: DBMap<u64, Vec<BlockRef>>,
 }
 
 impl RocksDBStore {
@@ -208,6 +210,7 @@ impl Store for RocksDBStore {
                 )
                 .map_err(ConsensusError::RocksDBFailure)?;
         }
+
 
         batch.write()?;
         fail_point!("consensus-store-after-write");
@@ -379,5 +382,17 @@ impl Store for RocksDBStore {
             .finalized_commits
             .get(&(commit_ref.index, commit_ref.digest))?;
         Ok(result)
+    }
+
+    fn read_genesis_blocks(&self, epoch: u64) -> ConsensusResult<Option<Vec<BlockRef>>> {
+        // Store all genesis blocks for an epoch in a single entry
+        let blocks = self.genesis_blocks.get(&epoch)?;
+        Ok(blocks)
+    }
+
+    fn write_genesis_blocks(&self, epoch: u64, genesis_blocks: Vec<BlockRef>) -> ConsensusResult<()> {
+        // Store all genesis block refs for an epoch in a single entry
+        self.genesis_blocks.insert(&epoch, &genesis_blocks)?;
+        Ok(())
     }
 }

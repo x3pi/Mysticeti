@@ -106,15 +106,64 @@ pub struct DagState {
 }
 
 impl DagState {
+    /// Get genesis block references for block verification.
+    pub fn get_genesis_block_refs(&self) -> std::collections::BTreeSet<BlockRef> {
+        self.genesis.keys().cloned().collect()
+    }
+
     /// Initializes DagState from storage.
     pub fn new(context: Arc<Context>, store: Arc<dyn Store>) -> Self {
         let cached_rounds = context.parameters.dag_state_cached_rounds as Round;
         let num_authorities = context.committee.size();
 
-        let genesis = genesis_blocks(context.as_ref())
-            .into_iter()
-            .map(|block| (block.reference(), block))
-            .collect();
+        // Try to load persisted genesis block refs first, fallback to generating
+        let genesis = if let Some(stored_genesis_refs) = store.read_genesis_blocks(context.committee.epoch())
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to read genesis block refs from storage: {:?}", e);
+                None
+            }) {
+            tracing::info!("✅ Loaded {} genesis block refs from storage for epoch {}", stored_genesis_refs.len(), context.committee.epoch());
+
+            // Load actual blocks from storage using the refs
+            let full_blocks = store.read_blocks(&stored_genesis_refs)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to read full genesis blocks from storage: {:?}", e);
+                    vec![]
+                });
+
+            // Create map from refs to blocks, using available blocks
+            let mut genesis_map = BTreeMap::new();
+            for (i, block_ref) in stored_genesis_refs.into_iter().enumerate() {
+                if let Some(Some(block)) = full_blocks.get(i) {
+                    genesis_map.insert(block_ref, block.clone());
+                } else {
+                    tracing::warn!("Missing genesis block for ref {:?}", block_ref);
+                }
+            }
+
+            // If we have incomplete genesis blocks, regenerate them
+            if genesis_map.len() != context.committee.size() {
+                tracing::warn!("Incomplete genesis blocks in storage ({} vs {}), regenerating",
+                    genesis_map.len(), context.committee.size());
+                let generated_genesis = genesis_blocks(context.as_ref());
+                generated_genesis.into_iter().map(|block| (block.reference(), block)).collect()
+            } else {
+                genesis_map
+            }
+        } else {
+            // Generate and persist genesis blocks
+            let generated_genesis = genesis_blocks(context.as_ref());
+            tracing::info!("🔄 Generated {} genesis blocks for epoch {} - persisting to storage",
+                generated_genesis.len(), context.committee.epoch());
+
+            // Persist block refs, not full blocks (to avoid serialization issues)
+            let genesis_refs: Vec<BlockRef> = generated_genesis.iter().map(|b| b.reference()).collect();
+            if let Err(e) = store.write_genesis_blocks(context.committee.epoch(), genesis_refs) {
+                tracing::warn!("Failed to persist genesis block refs: {:?}", e);
+            }
+
+            generated_genesis.into_iter().map(|block| (block.reference(), block)).collect()
+        };
 
         let threshold_clock = ThresholdClock::new(1, context.clone());
 

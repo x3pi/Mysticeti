@@ -68,6 +68,12 @@ pub trait Store: Send + Sync {
         commit_ref: CommitRef,
     ) -> ConsensusResult<Option<BTreeMap<BlockRef, Vec<TransactionIndex>>>>;
 
+    /// Reads genesis block refs for the current epoch.
+    fn read_genesis_blocks(&self, epoch: u64) -> ConsensusResult<Option<Vec<BlockRef>>>;
+
+    /// Writes genesis block refs for a specific epoch.
+    fn write_genesis_blocks(&self, epoch: u64, genesis_blocks: Vec<BlockRef>) -> ConsensusResult<()>;
+
 }
 
 /// Represents data to be written to the store together atomically.

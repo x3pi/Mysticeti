@@ -490,7 +490,7 @@ impl fmt::Debug for CommittedSubDag {
 }
 
 // Recovers the full CommittedSubDag from block store, based on Commit.
-pub(crate) fn load_committed_subdag_from_store(
+pub fn load_committed_subdag_from_store(
     store: &dyn Store,
     commit: TrustedCommit,
     reputation_scores_desc: Vec<(AuthorityIndex, u64)>,
