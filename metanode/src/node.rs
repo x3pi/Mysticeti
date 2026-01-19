@@ -383,16 +383,47 @@ impl ConsensusNode {
         // Committee sẽ được fetch từ Go state mỗi lần khởi động
         let storage_path = config.storage_path.clone();
         
-        // UNIFIED BLOCK NUMBERING: Always sync with Go's executed blocks
-        // last_global_exec_index represents the highest block number that Go has executed
-        // Rust consensus can commit blocks > last_global_exec_index (when Go is slow)
+        // UNIFIED BLOCK NUMBERING: Sync from Go's executed blocks with conflict detection
+        // last_global_exec_index must reflect Go's actual execution state
+        // But prevent conflicts with running nodes by checking storage state
         let last_global_exec_index = if config.executor_read_enabled {
             match executor_client.get_last_block_number().await {
                 Ok(go_last_block) => {
-                    info!("📊 [STARTUP] UNIFIED BLOCK NUMBERING: Synced last_global_exec_index={} from Go's executed blocks", go_last_block);
-                    // This represents blocks that Go has actually executed
-                    // Rust can continue committing new blocks > this index
-                    go_last_block
+                    // Check if we have local storage that might indicate conflicts with running nodes
+                    let db_path = config.storage_path
+                        .join("epochs")
+                        .join(format!("epoch_{}", current_epoch))
+                        .join("consensus_db");
+
+                    if db_path.exists() {
+                        let temp_store = RocksDBStore::new(db_path.to_str().unwrap());
+                        match temp_store.read_last_commit_info() {
+                            Ok(Some((last_commit_ref, _))) => {
+                                let storage_index = last_commit_ref.index as u64;
+
+                                // If storage index is significantly behind Go state,
+                                // it means running nodes are using lower index
+                                // Use storage index to avoid conflicts
+                                if storage_index < go_last_block && (go_last_block - storage_index) > 5 {
+                                    warn!("🚨 [STARTUP] INDEX CONFLICT DETECTED: Go has {} but storage has {} - using storage index to match running nodes",
+                                        go_last_block, storage_index);
+                                    storage_index
+                                } else {
+                                    info!("📊 [STARTUP] CONSISTENT STATE: Go has {}, storage has {} - using Go state {}", go_last_block, storage_index, go_last_block);
+                                    go_last_block
+                                }
+                            },
+                            _ => {
+                                // No commit info in storage
+                                info!("📊 [STARTUP] NO COMMIT INFO: Using last_global_exec_index={} from Go state", go_last_block);
+                                go_last_block
+                            }
+                        }
+                    } else {
+                        // No storage at all
+                        info!("📊 [STARTUP] NO EPOCH STORAGE: Using last_global_exec_index={} from Go state", go_last_block);
+                        go_last_block
+                    }
                 },
                 Err(e) => {
                     // CRITICAL: If cannot sync with Go, reset to 0 to prevent conflicts
