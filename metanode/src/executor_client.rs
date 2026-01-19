@@ -22,7 +22,7 @@ pub mod proto {
 // All proto files with package "proto" are merged into one proto.rs file
 // So we can use the same proto module for all messages
 
-use proto::{CommittedBlock, CommittedEpochData, TransactionExe, GetActiveValidatorsRequest, GetValidatorsAtBlockRequest, Request, Response, ValidatorInfo};
+use proto::{CommittedBlock, CommittedEpochData, TransactionExe, GetActiveValidatorsRequest, GetValidatorsAtBlockRequest, GetCurrentEpochRequest, AdvanceEpochRequest, Request, Response, ValidatorInfo};
 use std::collections::BTreeMap;
 
 /// Client to send committed blocks to Go executor via Unix Domain Socket
@@ -1164,6 +1164,15 @@ impl ExecutorClient {
                 Some(proto::response::Payload::LastBlockNumberResponse(_)) => {
                     warn!("🔍 [EXECUTOR-REQ] Payload is LastBlockNumberResponse (not expected for GetValidatorsAtBlockRequest)");
                 }
+                Some(proto::response::Payload::GetCurrentEpochResponse(_)) => {
+                    info!("🔍 [EXECUTOR-REQ] Payload is GetCurrentEpochResponse (handled below)");
+                }
+                Some(proto::response::Payload::GetEpochStartTimestampResponse(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is GetEpochStartTimestampResponse (not expected for this request)");
+                }
+                Some(proto::response::Payload::AdvanceEpochResponse(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is AdvanceEpochResponse (not expected for this request)");
+                }
                 None => {
                     warn!("🔍 [EXECUTOR-REQ] Payload is None - response structure may be incorrect");
                     warn!("🔍 [EXECUTOR-REQ] Full response debug: {:?}", response);
@@ -1203,8 +1212,210 @@ impl ExecutorClient {
                 Some(proto::response::Payload::LastBlockNumberResponse(_)) => {
                     return Err(anyhow::anyhow!("Unexpected LastBlockNumberResponse response (expected ValidatorInfoList)"));
                 }
+                Some(proto::response::Payload::GetCurrentEpochResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected GetCurrentEpochResponse response (expected ValidatorInfoList)"));
+                }
+                Some(proto::response::Payload::GetEpochStartTimestampResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected GetEpochStartTimestampResponse response (expected ValidatorInfoList)"));
+                }
+                Some(proto::response::Payload::AdvanceEpochResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected AdvanceEpochResponse response (expected ValidatorInfoList)"));
+                }
                 None => {
                     return Err(anyhow::anyhow!("Unexpected response type from Go. Response payload: None. Response bytes (hex): {}", hex::encode(&response_buf)));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Request connection is not available"));
+        }
+    }
+
+    /// Get current epoch from Go state
+    /// Used to determine which epoch the network is currently in
+    pub async fn get_current_epoch(&self) -> Result<u64> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Connect to Go request socket if needed
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        // Create GetCurrentEpochRequest
+        let request = Request {
+            payload: Some(proto::request::Payload::GetCurrentEpochRequest(
+                GetCurrentEpochRequest {}
+            )),
+        };
+
+        // Encode request to protobuf bytes
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        // Send request via UDS
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            // Write 4-byte length prefix (big-endian)
+            let len = request_buf.len() as u32;
+            let len_bytes = len.to_be_bytes();
+            stream.write_all(&len_bytes).await?;
+
+            // Write request data
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+
+            info!("📤 [EXECUTOR-REQ] Sent GetCurrentEpochRequest to Go (size: {} bytes)",
+                request_buf.len());
+
+            // Read response (4-byte length prefix + response data)
+            use tokio::io::AsyncReadExt;
+            use tokio::time::{timeout, Duration};
+
+            // Set timeout for reading response (5 seconds)
+            let read_timeout = Duration::from_secs(5);
+
+            let mut len_buf = [0u8; 4];
+            timeout(read_timeout, stream.read_exact(&mut len_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response length: {}", e))??;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+
+            if response_len == 0 {
+                return Err(anyhow::anyhow!("Received zero-length response from Go"));
+            }
+            if response_len > 10_000_000 { // 10MB limit
+                return Err(anyhow::anyhow!("Response too large: {} bytes", response_len));
+            }
+
+            let mut response_buf = vec![0u8; response_len];
+            timeout(read_timeout, stream.read_exact(&mut response_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response data: {}", e))??;
+
+            info!("📥 [EXECUTOR-REQ] Received {} bytes from Go, decoding...", response_buf.len());
+
+            // Decode response
+            let response = Response::decode(&response_buf[..])
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to decode response from Go: {}. Response length: {} bytes. Response bytes (hex): {}. Response bytes (first 100): {:?}",
+                        e,
+                        response_buf.len(),
+                        hex::encode(&response_buf),
+                        &response_buf[..response_buf.len().min(100)]
+                    )
+                })?;
+
+            info!("🔍 [EXECUTOR-REQ] Decoded response successfully");
+            info!("🔍 [EXECUTOR-REQ] Response payload type: {:?}", response.payload);
+
+            match response.payload {
+                Some(proto::response::Payload::GetCurrentEpochResponse(get_current_epoch_response)) => {
+                    let current_epoch = get_current_epoch_response.epoch;
+                    info!("✅ [EXECUTOR-REQ] Received current epoch from Go: {}", current_epoch);
+                    return Ok(current_epoch);
+                }
+                Some(proto::response::Payload::Error(error_msg)) => {
+                    return Err(anyhow::anyhow!("Go returned error: {}", error_msg));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unexpected response payload type"));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Request connection is not available"));
+        }
+    }
+
+    /// Advance epoch in Go state (Sui-style epoch transition)
+    pub async fn advance_epoch(&self, new_epoch: u64, epoch_start_timestamp_ms: u64) -> Result<()> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Connect to Go request socket if needed
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        // Create AdvanceEpochRequest
+        let request = Request {
+            payload: Some(proto::request::Payload::AdvanceEpochRequest(
+                AdvanceEpochRequest {
+                    new_epoch,
+                    epoch_start_timestamp_ms,
+                }
+            )),
+        };
+
+        // Encode request to protobuf bytes
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        // Send request via UDS
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            // Write 4-byte length prefix (big-endian)
+            let len = request_buf.len() as u32;
+            let len_bytes = len.to_be_bytes();
+            stream.write_all(&len_bytes).await?;
+
+            // Write request data
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+
+            info!("📤 [EXECUTOR-REQ] Sent AdvanceEpochRequest to Go (new_epoch={}, timestamp_ms={}, size: {} bytes)",
+                new_epoch, epoch_start_timestamp_ms, request_buf.len());
+
+            // Read response (4-byte length prefix + response data)
+            use tokio::io::AsyncReadExt;
+            use tokio::time::{timeout, Duration};
+
+            // Set timeout for reading response (5 seconds)
+            let read_timeout = Duration::from_secs(5);
+
+            let mut len_buf = [0u8; 4];
+            timeout(read_timeout, stream.read_exact(&mut len_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response length: {}", e))??;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+
+            if response_len == 0 {
+                return Err(anyhow::anyhow!("Received zero-length response from Go"));
+            }
+            if response_len > 10_000_000 { // 10MB limit
+                return Err(anyhow::anyhow!("Response too large: {} bytes", response_len));
+            }
+
+            let mut response_buf = vec![0u8; response_len];
+            timeout(read_timeout, stream.read_exact(&mut response_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response data: {}", e))??;
+
+            info!("📥 [EXECUTOR-REQ] Received {} bytes from Go, decoding...", response_buf.len());
+
+            // Decode response
+            let response = Response::decode(&response_buf[..])
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to decode response from Go: {}. Response length: {} bytes. Response bytes (hex): {}. Response bytes (first 100): {:?}",
+                        e,
+                        response_buf.len(),
+                        hex::encode(&response_buf),
+                        &response_buf[..response_buf.len().min(100)]
+                    )
+                })?;
+
+            info!("🔍 [EXECUTOR-REQ] Decoded response successfully");
+            info!("🔍 [EXECUTOR-REQ] Response payload type: {:?}", response.payload);
+
+            match response.payload {
+                Some(proto::response::Payload::AdvanceEpochResponse(_advance_epoch_response)) => {
+                    info!("✅ [EXECUTOR-REQ] Go successfully advanced to epoch {}", new_epoch);
+                    return Ok(());
+                }
+                Some(proto::response::Payload::Error(error_msg)) => {
+                    return Err(anyhow::anyhow!("Go returned error during epoch advance: {}", error_msg));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unexpected response payload type for AdvanceEpoch"));
                 }
             }
         } else {

@@ -240,10 +240,10 @@ impl ConsensusNode {
     ) -> Result<Self> {
         info!("Initializing consensus node {}...", config.node_id);
 
-        // FIX: Always fetch committee from Go state via Unix Domain Socket. Do NOT load from file.
-        info!("🚀 [STARTUP] Loading committee from Go state via Unix Domain Socket (block 0/genesis)...");
+        // FIX: Fetch current epoch and committee from Go state via Unix Domain Socket
+        info!("🚀 [STARTUP] Loading latest block, epoch and committee from Go state...");
 
-        // Create executor client for fetching committee from Go
+        // Create executor client for fetching epoch and committee from Go
         // Always enable executor client for committee fetching during startup
         let executor_client = Arc::new(ExecutorClient::new(
             true, // Always enable for committee fetching
@@ -252,41 +252,63 @@ impl ConsensusNode {
             config.executor_receive_socket_path.clone(),
         ));
 
-        // Fetch validators from Go at block 0 (genesis)
-        let (validators, _go_epoch_timestamp_ms) = executor_client.get_validators_at_block(0).await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch committee from Go state: {}", e))?;
+        // First: Load the latest block from Go
+        let latest_block_number = executor_client.get_last_block_number().await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch latest block number from Go state: {}", e))?;
 
-        // Load epoch_timestamp_ms from genesis.json instead of Go state for consistency
-        let genesis_path = std::path::Path::new("../../mtn-simple-2025/cmd/simple_chain/genesis.json");
-        let epoch_timestamp_ms = if genesis_path.exists() {
-            match std::fs::read_to_string(genesis_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<serde_json::Value>(&content) {
-                        Ok(json) => {
-                            match json.get("config").and_then(|c| c.get("epoch_timestamp_ms")).and_then(|ts| ts.as_u64()) {
-                                Some(ts) => {
-                                    info!("📅 Using epoch_timestamp_ms from genesis.json: {}", ts);
-                                    ts
-                                },
-                                None => {
-                                    warn!("⚠️  Could not find epoch_timestamp_ms in genesis.json, using Go timestamp: {}", _go_epoch_timestamp_ms);
-                                    _go_epoch_timestamp_ms
+        info!("📊 [STARTUP] Latest block number from Go state: {}", latest_block_number);
+
+        // Second: Get current epoch from the latest block
+        let current_epoch = executor_client.get_current_epoch().await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch current epoch from Go state: {}", e))?;
+
+        info!("📊 [STARTUP] Current epoch from Go state (based on latest block {}): {}", latest_block_number, current_epoch);
+
+        // Third: Get committee (validators) for the current epoch using the latest block
+        info!("📋 [STARTUP] Fetching committee validators from Go at latest block {} (for epoch {})",
+              latest_block_number, current_epoch);
+
+        let (validators, _go_epoch_timestamp_ms) = executor_client.get_validators_at_block(latest_block_number).await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch committee from Go state at latest block {}: {}", latest_block_number, e))?;
+
+        // Use epoch timestamp from Go response, with fallback to genesis.json for epoch 0
+        let epoch_timestamp_ms = if current_epoch == 0 {
+            // For genesis epoch, prefer genesis.json for consistency
+            let genesis_path = std::path::Path::new("../../mtn-simple-2025/cmd/simple_chain/genesis.json");
+            if genesis_path.exists() {
+                match std::fs::read_to_string(genesis_path) {
+                    Ok(content) => {
+                        match serde_json::from_str::<serde_json::Value>(&content) {
+                            Ok(json) => {
+                                match json.get("config").and_then(|c| c.get("epoch_timestamp_ms")).and_then(|ts| ts.as_u64()) {
+                                    Some(ts) => {
+                                        info!("📅 Using epoch_timestamp_ms from genesis.json: {}", ts);
+                                        ts
+                                    },
+                                    None => {
+                                        warn!("⚠️  Could not find epoch_timestamp_ms in genesis.json, using Go timestamp: {}", _go_epoch_timestamp_ms);
+                                        _go_epoch_timestamp_ms
+                                    }
                                 }
+                            },
+                            Err(e) => {
+                                warn!("⚠️  Failed to parse genesis.json: {}, using Go timestamp: {}", e, _go_epoch_timestamp_ms);
+                                _go_epoch_timestamp_ms
                             }
-                        },
-                        Err(e) => {
-                            warn!("⚠️  Failed to parse genesis.json: {}, using Go timestamp: {}", e, _go_epoch_timestamp_ms);
-                            _go_epoch_timestamp_ms
                         }
+                    },
+                    Err(e) => {
+                        warn!("⚠️  Failed to read genesis.json: {}, using Go timestamp: {}", e, _go_epoch_timestamp_ms);
+                        _go_epoch_timestamp_ms
                     }
-                },
-                Err(e) => {
-                    warn!("⚠️  Failed to read genesis.json: {}, using Go timestamp: {}", e, _go_epoch_timestamp_ms);
-                    _go_epoch_timestamp_ms
                 }
+            } else {
+                warn!("⚠️  genesis.json not found at {:?}, using Go timestamp: {}", genesis_path, _go_epoch_timestamp_ms);
+                _go_epoch_timestamp_ms
             }
         } else {
-            warn!("⚠️  genesis.json not found at {:?}, using Go timestamp: {}", genesis_path, _go_epoch_timestamp_ms);
+            // For epochs > 0, use timestamp from Go state
+            info!("📅 Using epoch_timestamp_ms from Go state: {} (epoch {})", _go_epoch_timestamp_ms, current_epoch);
             _go_epoch_timestamp_ms
         };
 
@@ -342,13 +364,13 @@ impl ConsensusNode {
         sorted_authorities.sort_by(|a, b| a.address.cmp(&b.address));
 
         // Create committee from Go state (now sorted by address)
-        info!("🔧 DEBUG: Creating committee with {} authorities", sorted_authorities.len());
+        info!("🔧 DEBUG: Creating committee with {} authorities for epoch {}", sorted_authorities.len(), current_epoch);
         for (i, auth) in sorted_authorities.iter().enumerate() {
             info!("🔧 DEBUG: Authority[{}]: stake={}, address={}", i, auth.stake, auth.address);
         }
-        let committee = Committee::new(0, sorted_authorities); // epoch 0 for genesis
-        let current_epoch = committee.epoch();
-        info!("✅ Loaded committee from Go state with {} authorities, epoch={}", committee.size(), current_epoch);
+        let committee = Committee::new(current_epoch, sorted_authorities);
+        let committee_epoch = committee.epoch();
+        info!("✅ Loaded committee from Go state with {} authorities, epoch={}", committee.size(), committee_epoch);
 
         // Capture paths needed for epoch transition
         // NOTE: Không còn require committee_path vì chúng ta không lưu committee ra file
@@ -639,6 +661,16 @@ impl ConsensusNode {
             .join("epochs")
             .join(format!("epoch_{}", current_epoch))
             .join("consensus_db");
+
+        // CRITICAL: Clear any existing consensus database to ensure clean state
+        // Rust must load COMPLETELY from Go state, no local state recovery
+        if db_path.exists() {
+            info!("🧹 [STARTUP] Clearing existing consensus database at {:?} to ensure clean state load from Go", db_path);
+            if let Err(e) = std::fs::remove_dir_all(&db_path) {
+                warn!("⚠️  Failed to clear consensus database: {}", e);
+            }
+        }
+
         std::fs::create_dir_all(&db_path)?;
         parameters.db_path = db_path;
         
@@ -1543,6 +1575,16 @@ impl ConsensusNode {
             .join("epochs")
             .join(format!("epoch_{}", new_epoch))
             .join("consensus_db");
+
+        // CRITICAL: Clear any existing consensus database for new epoch
+        // Ensure clean state for new epoch, no local state carry-over
+        if db_path.exists() {
+            info!("🧹 [EPOCH TRANSITION] Clearing consensus database for epoch {} at {:?}", new_epoch, db_path);
+            if let Err(e) = std::fs::remove_dir_all(&db_path) {
+                warn!("⚠️  Failed to clear consensus database for epoch {}: {}", new_epoch, e);
+            }
+        }
+
         std::fs::create_dir_all(&db_path)?;
 
         // Wait for committee fetching to complete
@@ -1732,6 +1774,16 @@ impl ConsensusNode {
             .join("epochs")
             .join(format!("epoch_{}", new_epoch))
             .join("consensus_db");
+
+        // CRITICAL: Clear any existing consensus database for new epoch
+        // Ensure clean state for new epoch, no local state carry-over
+        if db_path.exists() {
+            info!("🧹 [EPOCH TRANSITION] Clearing consensus database for epoch {} at {:?}", new_epoch, db_path);
+            if let Err(e) = std::fs::remove_dir_all(&db_path) {
+                warn!("⚠️  Failed to clear consensus database for epoch {}: {}", new_epoch, e);
+            }
+        }
+
         std::fs::create_dir_all(&db_path)?;
         
         // Create new commit processor
@@ -2085,6 +2137,32 @@ impl ConsensusNode {
             });
         } else {
             info!("ℹ️  [LVM SNAPSHOT] Node is not configured to create snapshots (enable_lvm_snapshot = false)");
+        }
+
+        // CRITICAL: Notify Go about epoch transition to keep states synchronized
+        // This ensures Go executor advances to the same epoch as Rust consensus
+        {
+            info!("🔄 [EPOCH SYNC] Notifying Go executor about epoch transition: {} -> {}", old_epoch, new_epoch);
+
+            // Create a temporary executor client for epoch sync
+            // Use same socket paths as configured
+            let executor_client = Arc::new(crate::executor_client::ExecutorClient::new(
+                true, // Enable reading
+                false, // Don't commit
+                config.executor_send_socket_path.clone(),
+                config.executor_receive_socket_path.clone(),
+            ));
+
+            match executor_client.advance_epoch(new_epoch, new_epoch_timestamp_ms).await {
+                Ok(()) => {
+                    info!("✅ [EPOCH SYNC] Successfully notified Go executor about epoch transition to {}", new_epoch);
+                }
+                Err(e) => {
+                    error!("❌ [EPOCH SYNC] Failed to notify Go executor about epoch transition: {}", e);
+                    // Continue despite error - epoch transition is still valid in Rust
+                    // Go will be out of sync but can be fixed by restarting or manual sync
+                }
+            }
         }
 
         Ok(())
