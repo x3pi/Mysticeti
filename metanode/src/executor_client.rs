@@ -145,11 +145,12 @@ impl ExecutorClient {
         }
     }
 
-    /// Connect to executor socket (lazy connection with retry)
+    /// Connect to executor socket (lazy connection with persistent retry)
     /// Just connects, doesn't query Go - Rust sends blocks continuously, Go buffers and processes sequentially
+    /// CRITICAL: Persistent connection - keeps trying until socket becomes available (Go Master starts)
     async fn connect(&self) -> Result<()> {
         let mut conn_guard = self.connection.lock().await;
-        
+
         // Check if already connected and still valid
         if let Some(ref mut stream) = *conn_guard {
             // Try to peek at the stream to check if it's still alive
@@ -161,40 +162,47 @@ impl ExecutorClient {
                 }
                 Err(e) => {
                     // Connection is dead, close it
-                    warn!("⚠️  [EXECUTOR] Existing connection to {} is dead: {}, reconnecting...", 
+                    warn!("⚠️  [EXECUTOR] Existing connection to {} is dead: {}, reconnecting...",
                         self.socket_path, e);
                     *conn_guard = None;
                 }
             }
         }
 
-        // Connect to socket with retry logic
-        const MAX_RETRIES: u32 = 3;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-        
-        for attempt in 1..=MAX_RETRIES {
+        // CRITICAL: Persistent connection with exponential backoff
+        // Keeps trying until Go Master creates the socket
+        let mut attempt: u32 = 0;
+        let mut delay = std::time::Duration::from_millis(500); // Start with 500ms
+        const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5); // Cap at 5 seconds
+
+        loop {
+            attempt += 1;
+
             match UnixStream::connect(&self.socket_path).await {
                 Ok(stream) => {
-                    info!("🔌 [EXECUTOR] Connected to executor at {} (attempt {}/{})", 
-                        self.socket_path, attempt, MAX_RETRIES);
+                    info!("🔌 [EXECUTOR] ✅ Connected to executor at {} (attempt {}, after {:.2}s waiting)",
+                        self.socket_path, attempt, delay.as_secs_f32() * (attempt - 1) as f32);
                     *conn_guard = Some(stream);
                     return Ok(());
                 }
                 Err(e) => {
-                    if attempt < MAX_RETRIES {
-                        warn!("⚠️  [EXECUTOR] Failed to connect to executor at {} (attempt {}/{}): {}, retrying...", 
-                            self.socket_path, attempt, MAX_RETRIES, e);
-                        tokio::time::sleep(RETRY_DELAY).await;
-                    } else {
-                        warn!("⚠️  [EXECUTOR] Failed to connect to executor at {} after {} attempts: {}", 
-                            self.socket_path, MAX_RETRIES, e);
-                        return Err(e.into());
+                    // CRITICAL: Don't give up - keep trying with exponential backoff
+                    // This ensures Rust can connect even if Go Master starts later
+                    if attempt == 1 {
+                        info!("🔄 [EXECUTOR] Waiting for Go Master to create executor socket at {}...", self.socket_path);
+                    } else if attempt % 10 == 0 {
+                        // Log every 10 attempts to avoid spam
+                        warn!("⏳ [EXECUTOR] Still waiting for Go Master socket {} (attempt {}, delay {}ms): {}",
+                            self.socket_path, attempt, delay.as_millis(), e);
                     }
+
+                    tokio::time::sleep(delay).await;
+
+                    // Exponential backoff: double delay, cap at MAX_DELAY
+                    delay = std::cmp::min(delay * 2, MAX_DELAY);
                 }
             }
         }
-        
-        unreachable!()
     }
 
     /// Send committed sub-DAG to executor
