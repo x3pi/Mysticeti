@@ -687,11 +687,11 @@ impl ConsensusNode {
         if speed_multiplier != 1.0 {
             info!("Applying speed multiplier: {}x", speed_multiplier);
             let leader_timeout = config.leader_timeout_ms
-                .map(|ms| Duration::from_millis(ms))
+                .map(Duration::from_millis)
                 .unwrap_or_else(|| Duration::from_millis((200.0 / speed_multiplier) as u64));
             
             let min_round_delay = config.min_round_delay_ms
-                .map(|ms| Duration::from_millis(ms))
+                .map(Duration::from_millis)
                 .unwrap_or_else(|| Duration::from_millis((50.0 / speed_multiplier) as u64));
             
             let max_forward_time_drift = Duration::from_millis((500.0 / speed_multiplier) as u64);
@@ -2424,7 +2424,6 @@ impl ConsensusNode {
     // pub fn get_node_mode(&self) -> &NodeMode {
     //     &self.node_mode
     // }
-
     /// Start sync task for sync-only nodes
     /// This task periodically syncs data from Go executor
     pub async fn start_sync_task(&mut self, config: &NodeConfig) -> Result<()> {
@@ -2669,7 +2668,7 @@ impl ConsensusNode {
                         // RECOVERY VERIFICATION: Check that Go received this specific block
                         match executor_client.get_last_block_number().await {
                             Ok(go_last_after) => {
-                                if go_last_after >= current_global_exec_index as u64 {
+                                if go_last_after >= current_global_exec_index {
                                     info!("✅ [RECOVERY VERIFICATION] Go confirmed receipt of block {}", current_global_exec_index);
                                     blocks_resent += commit.blocks().len();
                                 } else {

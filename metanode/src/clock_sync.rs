@@ -93,7 +93,7 @@ impl ClockSyncManager {
             if line.starts_with("System time") {
                 // Extract "...: <value> seconds fast|slow of NTP time"
                 // Split on ':' then parse first token as f64 seconds.
-                let rhs = line.splitn(2, ':').nth(1)?.trim();
+                let rhs = line.split_once(':')?.1.trim();
                 let mut parts = rhs.split_whitespace();
                 let secs_str = parts.next()?;
                 let secs: f64 = secs_str.parse().ok()?;
@@ -113,7 +113,7 @@ impl ClockSyncManager {
         for line in tracking_output.lines() {
             let line = line.trim();
             if line.starts_with("Last offset") {
-                let rhs = line.splitn(2, ':').nth(1)?.trim();
+                let rhs = line.split_once(':')?.1.trim();
                 let mut parts = rhs.split_whitespace();
                 let signed_secs_str = parts.next()?; // may include '+'/'-'
                 let secs: f64 = signed_secs_str.parse().ok()?;
@@ -143,7 +143,7 @@ impl ClockSyncManager {
 
     /// Check if clock drift is too large
     pub fn check_clock_drift(&self) -> Result<()> {
-        let drift_ms = self.clock_offset_ms.abs() as u64;
+        let drift_ms = self.clock_offset_ms.unsigned_abs();
         if drift_ms > self.max_clock_drift_ms {
             anyhow::bail!("Clock drift too large: {}ms > {}ms", 
                 drift_ms, self.max_clock_drift_ms);
