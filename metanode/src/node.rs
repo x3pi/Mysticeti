@@ -149,7 +149,10 @@ pub struct ConsensusNode {
     sync_task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+// ===== CONSTRUCTOR & INITIALIZATION METHODS =====
 impl ConsensusNode {
+    // ===== UTILITY METHODS =====
+
     /// Calculate adaptive timeout based on system load
     fn calculate_adaptive_timeout(base_timeout: u64, system_load: f64) -> u64 {
         // Increase timeout when system load is high (above 1.0)
@@ -887,7 +890,9 @@ impl ConsensusNode {
         Ok(node)
     }
 
-    #[allow(dead_code)] 
+    // ===== TRANSACTION MANAGEMENT METHODS =====
+
+    #[allow(dead_code)]
     pub fn transaction_submitter(&self) -> Option<Arc<dyn TransactionSubmitter>> {
         self.transaction_client_proxy.as_ref().map(|proxy| proxy.clone() as Arc<dyn TransactionSubmitter>)
     }
@@ -1366,6 +1371,8 @@ impl ConsensusNode {
     }
 
     /// Transition to new epoch from EndOfEpoch system transaction
+    // ===== EPOCH TRANSITION METHODS =====
+
     pub async fn transition_to_epoch_from_system_tx(
         &mut self,
         new_epoch: u64,
@@ -2176,6 +2183,8 @@ impl ConsensusNode {
         }
     }
 
+    // ===== CONFIGURATION & STATUS METHODS =====
+
     /// Reset reconfiguration state to clean state after successful transition
     pub async fn reset_reconfig_state(&self) {
         let mut state = self.reconfig_state.write().await;
@@ -2266,6 +2275,8 @@ impl ConsensusNode {
 
     /// Check if node should be in validator mode based on committee membership
     /// and update mode accordingly
+    // ===== NODE MODE MANAGEMENT METHODS =====
+
     pub async fn check_and_update_node_mode(&mut self, committee: &consensus_config::Committee, config: &NodeConfig) -> Result<()> {
         // Use hostname from config (node-{id}) instead of system hostname
         // This ensures correct matching with committee hostnames
@@ -2327,6 +2338,8 @@ impl ConsensusNode {
     // }
     /// Start sync task for sync-only nodes
     /// This task periodically syncs data from Go executor
+    // ===== SYNC OPERATIONS METHODS =====
+
     pub async fn start_sync_task(&mut self, config: &NodeConfig) -> Result<()> {
         if !matches!(self.node_mode, NodeMode::SyncOnly) {
             info!("🔄 [SYNC TASK] Skipping sync task start - node is in {:?} mode", self.node_mode);
