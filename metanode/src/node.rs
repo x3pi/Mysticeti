@@ -51,7 +51,7 @@ pub enum NodeMode {
 // This allows transition handler task to call transition function on the node
 static TRANSITION_HANDLER_REGISTRY: tokio::sync::OnceCell<Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<ConsensusNode>>>>>> = tokio::sync::OnceCell::const_new();
 
-async fn get_transition_handler_node() -> Option<Arc<tokio::sync::Mutex<ConsensusNode>>> {
+pub async fn get_transition_handler_node() -> Option<Arc<tokio::sync::Mutex<ConsensusNode>>> {
     if let Some(registry) = TRANSITION_HANDLER_REGISTRY.get() {
         let registry_guard = registry.lock().await;
         registry_guard.clone()
@@ -533,21 +533,7 @@ impl ConsensusNode {
         // Callback sends transition request via channel, which will be handled by a task
         // NOTE: Do NOT set is_transitioning flag here - it will be set in transition_to_epoch_from_system_tx
         // Setting it here causes race condition where handler sees flag=true and skips transition
-        let epoch_transition_callback = {
-            let tx_clone = epoch_tx_sender.clone();
-            move |new_epoch, new_epoch_timestamp_ms, commit_index| {
-                info!("🎯 [SYSTEM TX CALLBACK] EndOfEpoch detected: epoch={}, timestamp={}, commit_index={}",
-                    new_epoch, new_epoch_timestamp_ms, commit_index);
-                
-                // Send transition request via channel
-                // is_transitioning flag will be set in transition_to_epoch_from_system_tx when transition actually starts
-                if let Err(e) = tx_clone.send((new_epoch, new_epoch_timestamp_ms, commit_index)) {
-                    error!("Failed to send epoch transition request: {}", e);
-                    return Err(anyhow::anyhow!("Failed to send epoch transition request: {}", e));
-                }
-                Ok(())
-            }
-        };
+        let epoch_transition_callback = crate::commit_callbacks::create_epoch_transition_callback(epoch_tx_sender.clone());
         
         // Create notification channel for commit processor completion
         let (_commit_complete_sender, _commit_complete_receiver) = tokio::sync::watch::channel(false);
@@ -557,29 +543,8 @@ impl ConsensusNode {
 
         // Create ordered commit processor
         let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
-            .with_commit_index_callback(move |index| {
-                commit_index_for_callback.store(index, Ordering::SeqCst);
-            })
-            .with_global_exec_index_callback({
-                let shared_index = shared_last_global_exec_index.clone();
-                move |global_exec_index| {
-                    // Update shared last global exec index via spawn to avoid blocking runtime
-                    // This ensures next commit gets the correct sequential block number
-                    // CRITICAL FIX: Use spawn instead of block_on to prevent "Cannot start a runtime from within a runtime" panic
-                    if let Ok(_rt) = tokio::runtime::Handle::try_current() {
-                        let shared_index_clone = shared_index.clone();
-                        _rt.spawn(async move {
-                            let mut index_guard = shared_index_clone.lock().await;
-                            *index_guard = global_exec_index;
-                            info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} after successful commit", global_exec_index);
-                        });
-                    } else {
-                        // Fallback: If no runtime handle available, log warning
-                        // The update will happen in process_commit() anyway via shared_last_global_exec_index
-                        warn!("⚠️  [GLOBAL_EXEC_INDEX] No runtime handle available for callback update. Update will happen in process_commit()");
-                    }
-                }
-            })
+            .with_commit_index_callback(crate::commit_callbacks::create_commit_index_callback(commit_index_for_callback))
+            .with_global_exec_index_callback(crate::commit_callbacks::create_global_exec_index_callback(shared_last_global_exec_index.clone()))
             .with_get_last_global_exec_index({
                 let shared_index = shared_last_global_exec_index.clone();
                 move || {
@@ -896,41 +861,14 @@ impl ConsensusNode {
             sync_task_handle: None,
         };
 
-        // Spawn transition handler task
+        // Start epoch transition handler task
         // This task will process transition requests and call transition function
         // The node will be registered in global registry after it's wrapped in Arc<Mutex<>> in main.rs
-        
-        tokio::spawn(async move {
-            let mut receiver = epoch_tx_receiver_for_handler;
-            while let Some((new_epoch, new_epoch_timestamp_ms, commit_index)) = receiver.recv().await {
-                info!("🚀 [EPOCH TRANSITION HANDLER] Processing transition request: epoch={}, timestamp={}, commit_index={}",
-                    new_epoch, new_epoch_timestamp_ms, commit_index);
-                
-                // Update system transaction provider
-                system_transaction_provider_for_handler.update_epoch(
-                    new_epoch,
-                    new_epoch_timestamp_ms
-                ).await;
-                
-                // Try to get node from global registry and call transition function
-                if let Some(node_arc) = get_transition_handler_node().await {
-                    let mut node_guard = node_arc.lock().await;
-                    if let Err(e) = node_guard.transition_to_epoch_from_system_tx(
-                        new_epoch,
-                        new_epoch_timestamp_ms,
-                        commit_index,
-                        &config_for_handler,
-                    ).await {
-                        error!("❌ [EPOCH TRANSITION HANDLER] Failed to transition epoch: {}", e);
-                    } else {
-                        info!("✅ [EPOCH TRANSITION HANDLER] Successfully transitioned to epoch {}", new_epoch);
-                    }
-                } else {
-                    warn!("⚠️ [EPOCH TRANSITION HANDLER] Node not registered in global registry yet - transition will be handled when node is available");
-                    // Transition will be handled when node is registered
-                }
-            }
-        });
+        crate::epoch_transition::start_epoch_transition_handler(
+            epoch_tx_receiver_for_handler,
+            system_transaction_provider_for_handler,
+            config_for_handler,
+        );
 
         // Check and update node mode based on initial committee membership
         // This ensures node starts in correct mode (SyncOnly vs Validator) based on genesis committee
@@ -1882,24 +1820,7 @@ impl ConsensusNode {
         // This callback will send transition request via channel
         // CRITICAL FIX: Do NOT set is_transitioning here - let transition_to_epoch_from_system_tx do it
         // This prevents race condition where transition is skipped because flag is already set
-        let epoch_tx_sender_for_next_epoch = self.epoch_transition_sender.clone();
-        let epoch_transition_callback = {
-            move |new_epoch_cb, new_epoch_timestamp_ms, commit_index| {
-                info!("🎯 [SYSTEM TX CALLBACK] EndOfEpoch detected in new epoch: epoch={}, timestamp={}, commit_index={}",
-                    new_epoch_cb, new_epoch_timestamp_ms, commit_index);
-                
-                // DON'T set is_transitioning here - let transition_to_epoch_from_system_tx do it
-                // Setting it here causes race condition where transition_to_epoch_from_system_tx
-                // sees flag already set and skips the transition
-                
-                // Send transition request via channel
-                if let Err(e) = epoch_tx_sender_for_next_epoch.send((new_epoch_cb, new_epoch_timestamp_ms, commit_index)) {
-                    error!("Failed to send epoch transition request: {}", e);
-                    return Err(anyhow::anyhow!("Failed to send epoch transition request: {}", e));
-                }
-                Ok(())
-            }
-        };
+        let epoch_transition_callback = crate::commit_callbacks::create_epoch_transition_callback(self.epoch_transition_sender.clone());
         
         // #region agent log
         {
@@ -1919,28 +1840,8 @@ impl ConsensusNode {
         }
         // #endregion
         let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
-            .with_commit_index_callback(move |index| {
-                commit_index_for_callback.store(index, Ordering::SeqCst);
-            })
-            .with_global_exec_index_callback({
-                let shared_index = self.shared_last_global_exec_index.clone();
-                move |global_exec_index| {
-                    // Update shared last global exec index via spawn to avoid blocking runtime
-                    // CRITICAL FIX: Use spawn instead of block_on to prevent "Cannot start a runtime from within a runtime" panic
-                    if let Ok(_rt) = tokio::runtime::Handle::try_current() {
-                        let shared_index_clone = shared_index.clone();
-                        _rt.spawn(async move {
-                            let mut index_guard = shared_index_clone.lock().await;
-                            *index_guard = global_exec_index;
-                            info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} for new epoch", global_exec_index);
-                        });
-                    } else {
-                        // Fallback: If no runtime handle available, log warning
-                        // The update will happen in process_commit() anyway via shared_last_global_exec_index
-                        warn!("⚠️  [GLOBAL_EXEC_INDEX] No runtime handle available for callback update in epoch transition. Update will happen in process_commit()");
-                    }
-                }
-            })
+            .with_commit_index_callback(crate::commit_callbacks::create_commit_index_callback(commit_index_for_callback))
+            .with_global_exec_index_callback(crate::commit_callbacks::create_global_exec_index_callback(self.shared_last_global_exec_index.clone()))
             .with_get_last_global_exec_index({
                 let shared_index = self.shared_last_global_exec_index.clone();
                 move || {
