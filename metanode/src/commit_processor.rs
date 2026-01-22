@@ -225,39 +225,17 @@ impl CommitProcessor {
 
                         let total_txs_in_commit = subdag.blocks.iter().map(|b| b.transactions().len()).sum::<usize>();
 
-                        // Check for EndOfEpoch system transactions
-                        if let Some((_block_ref, system_tx)) = subdag.extract_end_of_epoch_transaction() {
-                            if let Some((new_epoch, new_epoch_timestamp_ms, _commit_index_from_tx)) = system_tx.as_end_of_epoch() {
-                                info!(
-                                    "🎯 [SYSTEM TX] EndOfEpoch transaction detected in commit {}: epoch {} -> {}, total_txs_in_commit={}",
-                                    commit_index, current_epoch, new_epoch, total_txs_in_commit
-                                );
-                                
-                                if let Some(ref callback) = epoch_transition_callback {
-                                    info!(
-                                        "🚀 [EPOCH TRANSITION] Triggering epoch transition immediately: commit_index={}, new_epoch={}",
-                                        commit_index, new_epoch
-                                    );
-                                    
-                                    if let Err(e) = callback(new_epoch, new_epoch_timestamp_ms, commit_index) {
-                                        warn!("❌ Failed to trigger epoch transition from system transaction: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                        
-                        // Process commit normally
-                        // Note: We still pass shared_last_global_exec_index to process_commit so it can update it for external monitoring/RPC
+                        // CRITICAL FIX: Process commit FIRST before triggering epoch transition
+                        // This ensures Go receives the EndOfEpoch commit before Rust starts transition
                         Self::process_commit(
-                            &subdag, 
-                            global_exec_index, 
-                            current_epoch, 
-                            executor_client.clone(), 
-                            pending_transactions_queue.clone(), 
+                            &subdag,
+                            global_exec_index,
+                            current_epoch,
+                            executor_client.clone(),
+                            pending_transactions_queue.clone(),
                             self.shared_last_global_exec_index.clone()
                         ).await?;
 
-                        // --- [FORK SAFETY UPDATE] ---
                         // Update local tracker immediately after successful processing.
                         // The next iteration is GUARANTEED to see this updated value.
                         tracked_last_global_exec_index = global_exec_index;
@@ -269,9 +247,30 @@ impl CommitProcessor {
                         if let Some(ref callback) = commit_index_callback {
                             callback(commit_index);
                         }
-                        
+
                         next_expected_index += 1;
-                        
+
+                        // Check for EndOfEpoch system transactions AFTER commit is sent to Go
+                        if let Some((_block_ref, system_tx)) = subdag.extract_end_of_epoch_transaction() {
+                            if let Some((new_epoch, new_epoch_timestamp_ms, _commit_index_from_tx)) = system_tx.as_end_of_epoch() {
+                                info!(
+                                    "🎯 [SYSTEM TX] EndOfEpoch transaction detected in commit {}: epoch {} -> {}, total_txs_in_commit={}",
+                                    commit_index, current_epoch, new_epoch, total_txs_in_commit
+                                );
+
+                                if let Some(ref callback) = epoch_transition_callback {
+                                    info!(
+                                        "🚀 [EPOCH TRANSITION] Triggering epoch transition AFTER commit sent to Go: commit_index={}, new_epoch={}, global_exec_index={}",
+                                        commit_index, new_epoch, global_exec_index
+                                    );
+
+                                    if let Err(e) = callback(new_epoch, new_epoch_timestamp_ms, commit_index) {
+                                        warn!("❌ Failed to trigger epoch transition from system transaction: {}", e);
+                                    }
+                                }
+                            }
+                        }
+
                         // Process pending out-of-order commits
                         while let Some(pending) = pending_commits.remove(&next_expected_index) {
                             let pending_commit_index = next_expected_index;

@@ -14,20 +14,54 @@ use std::time::Duration;
 
 pub async fn build_committee_from_go_validators_at_block_with_epoch(
     executor_client: &Arc<ExecutorClient>,
-    block_number: u64,
+    requested_block: u64,
     epoch: u64,
 ) -> Result<Committee> {
+    let mut attempt = 0;
+    let max_attempts = 10; // Prevent infinite loop
+    let mut current_block = requested_block;
+
     loop {
-        match executor_client.get_validators_at_block(block_number).await {
+        attempt += 1;
+
+        match executor_client.get_validators_at_block(current_block).await {
             Ok((validators, _)) => {
                 if !validators.is_empty() {
+                    tracing::info!("✅ [COMMITTEE] Successfully got {} validators for block {} (epoch {})",
+                        validators.len(), current_block, epoch);
                     return build_committee_from_validator_list(validators, epoch);
                 } else {
-                    tracing::warn!("⏳ [COMMITTEE] Go returned 0 validators. Retrying...");
+                    tracing::warn!("⏳ [COMMITTEE] Go returned 0 validators for block {}. Retrying... (attempt {}/{})",
+                        current_block, attempt, max_attempts);
                 }
             },
-            Err(e) => tracing::error!("❌ [COMMITTEE] Failed to connect to Go: {}. Retrying...", e),
+            Err(e) => {
+                // Check if it's the specific "block not committed" error
+                if e.to_string().contains("not been committed to DB yet") || e.to_string().contains("not committed") {
+                    // Try to get the last committed block and use that instead
+                    if let Ok(last_committed) = executor_client.get_last_block_number().await {
+                        if last_committed < current_block && last_committed > 0 && current_block == requested_block {
+                            // Only fallback once, to prevent infinite fallback loop
+                            tracing::warn!("⚠️ [COMMITTEE] Block {} not committed yet, falling back to last committed block {} (attempt {}/{})",
+                                current_block, last_committed, attempt, max_attempts);
+                            current_block = last_committed;
+                            continue; // Retry with the last committed block
+                        }
+                    }
+                }
+
+                tracing::error!("❌ [COMMITTEE] Failed to get validators for block {}: {} (attempt {}/{})",
+                    current_block, e, attempt, max_attempts);
+            },
         }
+
+        if attempt >= max_attempts {
+            return Err(anyhow::anyhow!(
+                "Failed to get committee after {} attempts for block {} (epoch {})",
+                max_attempts, current_block, epoch
+            ));
+        }
+
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }

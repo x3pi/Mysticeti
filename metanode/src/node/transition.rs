@@ -42,13 +42,31 @@ pub async fn transition_to_epoch_from_system_tx(
     let timeout_secs = if config.epoch_transition_optimization == "fast" { 5 } else { 10 };
     let _ = wait_for_commit_processor_completion(node, commit_index, timeout_secs).await;
     
-    // Deterministic calc using commit_index from EndOfEpoch
-    let last_global_exec_index_at_transition = crate::checkpoint::calculate_global_exec_index(
+    // CRITICAL FIX: Get last committed block from Go BEFORE calculating anything
+    // This ensures we use the actual committed state, not speculative calculations
+    let executor_client = if config.executor_read_enabled {
+        Arc::new(ExecutorClient::new(true, false, config.executor_send_socket_path.clone(), config.executor_receive_socket_path.clone()))
+    } else { anyhow::bail!("Executor read disabled"); };
+
+    let synced_index = if let Ok(go_last) = executor_client.get_last_block_number().await {
+        info!("📊 [SYNC] Go last committed block: {}", go_last);
+        go_last
+    } else {
+        warn!("❌ [SYNC] Failed to get last block from Go, using node last_global_exec_index {}", node.last_global_exec_index);
+        node.last_global_exec_index
+    };
+
+    info!("📊 Snapshot: Last committed block from Go: {}", synced_index);
+
+    // Deterministic calc for verification only - should match Go's last block
+    let calculated_last_block = crate::checkpoint::calculate_global_exec_index(
         node.current_epoch, commit_index, node.last_global_exec_index
     );
-    
-    info!("📊 Snapshot: Last block of epoch {}: {}", node.current_epoch, last_global_exec_index_at_transition);
-    // No additional sleep needed - commit processor completion already waited above
+
+    if calculated_last_block != synced_index + 1 {
+        warn!("⚠️ [SYNC] Calculated last block {} doesn't match Go's last block {} + 1. Using Go's value.",
+            calculated_last_block, synced_index);
+    }
 
     // Stop old authority
     if let Some(auth) = node.authority.take() {
@@ -58,17 +76,6 @@ pub async fn transition_to_epoch_from_system_tx(
     // Update state
     node.current_epoch = new_epoch;
     node.current_commit_index.store(0, Ordering::SeqCst);
-    
-    // Sync with Go
-    let executor_client = if config.executor_read_enabled {
-        Arc::new(ExecutorClient::new(true, false, config.executor_send_socket_path.clone(), config.executor_receive_socket_path.clone()))
-    } else { anyhow::bail!("Executor read disabled"); };
-    
-    let synced_index = if let Ok(go_last) = executor_client.get_last_block_number().await {
-        if go_last >= last_global_exec_index_at_transition { go_last } else { last_global_exec_index_at_transition }
-    } else {
-        last_global_exec_index_at_transition
-    };
 
     {
         let mut g = node.shared_last_global_exec_index.lock().await;
@@ -83,8 +90,20 @@ pub async fn transition_to_epoch_from_system_tx(
     if db_path.exists() { let _ = std::fs::remove_dir_all(&db_path); }
     std::fs::create_dir_all(&db_path)?;
 
-    // Fetch committee
-    let committee = crate::node::committee::build_committee_from_go_validators_at_block_with_epoch(&executor_client, synced_index, new_epoch).await?;
+    // Fetch committee - CRITICAL FIX: Use Go's last committed block to avoid race condition
+    // The synced_index might be ahead of what Go has committed, causing deadlock
+    let committee_block = match executor_client.get_last_block_number().await {
+        Ok(last_committed) => {
+            info!("✅ [COMMITTEE] Using Go's last committed block {} for committee fetch", last_committed);
+            last_committed
+        },
+        Err(e) => {
+            warn!("⚠️ [COMMITTEE] Failed to get last committed block from Go ({}), falling back to synced_index {}", e, synced_index);
+            synced_index
+        }
+    };
+
+    let committee = crate::node::committee::build_committee_from_go_validators_at_block_with_epoch(&executor_client, committee_block, new_epoch).await?;
     node.check_and_update_node_mode(&committee, config).await?;
 
     let node_hostname = format!("node-{}", config.node_id);
