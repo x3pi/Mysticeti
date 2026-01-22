@@ -84,7 +84,7 @@ pub async fn transition_to_epoch_from_system_tx(
     std::fs::create_dir_all(&db_path)?;
 
     // Fetch committee
-    let committee = crate::node::committee::build_committee_from_go_validators_at_block(&executor_client, synced_index).await?;
+    let committee = crate::node::committee::build_committee_from_go_validators_at_block_with_epoch(&executor_client, synced_index, new_epoch).await?;
     node.check_and_update_node_mode(&committee, config).await?;
 
     let node_hostname = format!("node-{}", config.node_id);
@@ -156,10 +156,44 @@ pub async fn transition_to_epoch_from_system_tx(
     let _ = node.submit_queued_transactions().await;
 
     node.reset_reconfig_state().await;
-    
+
     // Notify Go
     let _ = executor_client.advance_epoch(new_epoch, new_epoch_timestamp_ms).await;
-    
+
+    // FORK-SAFETY: Sync timestamp from Go to ensure consistency
+    // CRITICAL: Retry with delay to allow Go to update its state
+    // Avoid using stale timestamp from old epoch
+    let go_epoch_timestamp_ms = match sync_epoch_timestamp_from_go(&executor_client, new_epoch, new_epoch_timestamp_ms).await {
+        Ok(timestamp) => {
+            if timestamp != new_epoch_timestamp_ms {
+                warn!(
+                    "⚠️ [EPOCH TIMESTAMP SYNC] Timestamp mismatch after transition: \
+                     Local calculated: {}ms, Go reported: {}ms, diff: {}ms. \
+                     Using Go's timestamp to prevent fork.",
+                    new_epoch_timestamp_ms,
+                    timestamp,
+                    (timestamp as i64 - new_epoch_timestamp_ms as i64).abs()
+                );
+                timestamp
+            } else {
+                info!("✅ [EPOCH TIMESTAMP SYNC] Timestamp consistent between local and Go: {}ms", new_epoch_timestamp_ms);
+                timestamp
+            }
+        }
+        Err(e) => {
+            // Check if this is a "not implemented" error (endpoint missing)
+            if e.to_string().contains("not found") || e.to_string().contains("Unexpected response") {
+                info!("ℹ️ [EPOCH TIMESTAMP SYNC] Go endpoint not implemented yet, using local calculation: {}ms", new_epoch_timestamp_ms);
+            } else {
+                warn!("⚠️ [EPOCH TIMESTAMP SYNC] Failed to sync timestamp from Go: {}. Using local calculation.", e);
+            }
+            new_epoch_timestamp_ms
+        }
+    };
+
+    // Update SystemTransactionProvider with verified timestamp
+    node.system_transaction_provider.update_epoch(new_epoch, go_epoch_timestamp_ms).await;
+
     Ok(())
 }
 
@@ -204,4 +238,86 @@ async fn test_consensus_readiness(node: &ConsensusNode) -> bool {
              Err(_) => false,
         }
     } else { false }
+}
+
+/// Sync epoch timestamp from Go with retry logic to avoid stale timestamps
+/// CRITICAL: Prevents using timestamp from old epoch after transition
+async fn sync_epoch_timestamp_from_go(
+    executor_client: &ExecutorClient,
+    expected_epoch: u64,
+    expected_timestamp: u64,
+) -> Result<u64> {
+    const MAX_RETRIES: u32 = 5;
+    const RETRY_DELAY_MS: u64 = 200;
+
+    for attempt in 1..=MAX_RETRIES {
+        // First check if Go has transitioned to expected epoch
+        match executor_client.get_current_epoch().await {
+            Ok(go_current_epoch) => {
+                if go_current_epoch != expected_epoch {
+                    if attempt == MAX_RETRIES {
+                        return Err(anyhow::anyhow!(
+                            "Go still in epoch {} after {} attempts, expected epoch {}",
+                            go_current_epoch, MAX_RETRIES, expected_epoch
+                        ));
+                    }
+                    warn!(
+                        "⚠️ [EPOCH SYNC] Go still in epoch {} (attempt {}/{}), expected {}. Retrying...",
+                        go_current_epoch, attempt, MAX_RETRIES, expected_epoch
+                    );
+                    sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                    continue;
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ [EPOCH SYNC] Failed to get current epoch from Go (attempt {}/{}): {}", attempt, MAX_RETRIES, e);
+                if attempt == MAX_RETRIES {
+                    return Err(anyhow::anyhow!("Failed to verify Go epoch after transition: {}", e));
+                }
+                sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                continue;
+            }
+        }
+
+        // Now get timestamp and validate it's reasonable
+        match executor_client.get_epoch_start_timestamp().await {
+            Ok(go_timestamp) => {
+                // Validate timestamp is not from old epoch (should be close to expected)
+                // Timestamp should be within reasonable range of expected timestamp
+                let timestamp_diff = (go_timestamp as i64 - expected_timestamp as i64).abs() as u64;
+
+                if timestamp_diff > 10000 { // 10 seconds tolerance
+                    warn!(
+                        "⚠️ [EPOCH SYNC] Go timestamp {}ms differs from expected {}ms by {}ms (attempt {}/{}). \
+                         This may indicate stale timestamp from old epoch.",
+                        go_timestamp, expected_timestamp, timestamp_diff, attempt, MAX_RETRIES
+                    );
+
+                    if attempt == MAX_RETRIES {
+                        // At final attempt, accept the timestamp but log warning
+                        warn!("⚠️ [EPOCH SYNC] Using Go timestamp despite large difference. \
+                               This may cause epoch timing issues.");
+                        return Ok(go_timestamp);
+                    }
+
+                    sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                    continue;
+                }
+
+                info!("✅ [EPOCH SYNC] Successfully synced timestamp from Go: {}ms (diff: {}ms)",
+                      go_timestamp, timestamp_diff);
+                return Ok(go_timestamp);
+            }
+            Err(e) => {
+                warn!("⚠️ [EPOCH SYNC] Failed to get timestamp from Go (attempt {}/{}): {}", attempt, MAX_RETRIES, e);
+                if attempt == MAX_RETRIES {
+                    return Err(anyhow::anyhow!("Failed to get timestamp from Go after transition: {}", e));
+                }
+                sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                continue;
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("Failed to sync epoch timestamp from Go after {} attempts", MAX_RETRIES))
 }

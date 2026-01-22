@@ -22,7 +22,7 @@ pub mod proto {
 // All proto files with package "proto" are merged into one proto.rs file
 // So we can use the same proto module for all messages
 
-use proto::{CommittedBlock, CommittedEpochData, TransactionExe, GetValidatorsAtBlockRequest, GetCurrentEpochRequest, AdvanceEpochRequest, Request, Response, ValidatorInfo};
+use proto::{CommittedBlock, CommittedEpochData, TransactionExe, GetValidatorsAtBlockRequest, GetCurrentEpochRequest, GetEpochStartTimestampRequest, AdvanceEpochRequest, Request, Response, ValidatorInfo};
 use std::collections::BTreeMap;
 
 /// Client to send committed blocks to Go executor via Unix Domain Socket
@@ -1270,6 +1270,101 @@ impl ExecutorClient {
                 _ => {
                     return Err(anyhow::anyhow!("Unexpected response payload type"));
                 }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Request connection is not available"));
+        }
+    }
+
+    /// Get epoch start timestamp from Go state
+    /// Used to sync timestamp after epoch transitions
+    /// NOTE: This endpoint may not be implemented in Go yet - returns error in that case
+    pub async fn get_epoch_start_timestamp(&self) -> Result<u64> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Connect to Go request socket if needed
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        // Create GetEpochStartTimestampRequest
+        let request = Request {
+            payload: Some(proto::request::Payload::GetEpochStartTimestampRequest(
+                GetEpochStartTimestampRequest {}
+            )),
+        };
+
+        // Encode request to protobuf bytes
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        // Send request via UDS
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            // Write 4-byte length prefix (big-endian)
+            let len = request_buf.len() as u32;
+            let len_bytes = len.to_be_bytes();
+            stream.write_all(&len_bytes).await?;
+
+            // Write request data
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+
+            info!("📤 [EXECUTOR-REQ] Sent GetEpochStartTimestampRequest to Go (size: {} bytes)",
+                request_buf.len());
+
+            // Read response (4-byte length prefix + response data)
+            use tokio::io::AsyncReadExt;
+            use tokio::time::{timeout, Duration};
+
+            // Set timeout for reading response (5 seconds)
+            let read_timeout = Duration::from_secs(5);
+
+            let mut len_buf = [0u8; 4];
+            timeout(read_timeout, stream.read_exact(&mut len_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response length: {}", e))??;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+
+            if response_len == 0 {
+                return Err(anyhow::anyhow!("Received zero-length response from Go"));
+            }
+            if response_len > 10_000_000 { // 10MB limit
+                return Err(anyhow::anyhow!("Response too large: {} bytes", response_len));
+            }
+
+            let mut response_buf = vec![0u8; response_len];
+            timeout(read_timeout, stream.read_exact(&mut response_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response data: {}", e))??;
+
+            info!("📥 [EXECUTOR-REQ] Received {} bytes from Go, decoding...", response_buf.len());
+
+            // Decode response
+            let response = Response::decode(&response_buf[..])
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to decode response: {}. Raw bytes: {:?}",
+                        e, &response_buf[..std::cmp::min(100, response_buf.len())]
+                    )
+                })?;
+
+            if let Some(payload) = response.payload {
+                match payload {
+                    proto::response::Payload::GetEpochStartTimestampResponse(get_epoch_start_timestamp_response) => {
+                        let epoch_start_timestamp_ms = get_epoch_start_timestamp_response.timestamp_ms;
+                        info!("✅ [EXECUTOR-REQ] Received epoch start timestamp from Go: {}ms", epoch_start_timestamp_ms);
+                        return Ok(epoch_start_timestamp_ms);
+                    }
+                    proto::response::Payload::Error(error_msg) => {
+                        return Err(anyhow::anyhow!("Go returned error: {}", error_msg));
+                    }
+                    _ => {
+                        return Err(anyhow::anyhow!("Unexpected response payload type"));
+                    }
+                }
+            } else {
+                return Err(anyhow::anyhow!("Request connection is not available"));
             }
         } else {
             return Err(anyhow::anyhow!("Request connection is not available"));

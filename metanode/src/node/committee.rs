@@ -16,11 +16,19 @@ pub async fn build_committee_from_go_validators_at_block(
     executor_client: &Arc<ExecutorClient>,
     block_number: u64,
 ) -> Result<Committee> {
+    build_committee_from_go_validators_at_block_with_epoch(executor_client, block_number, 0).await
+}
+
+pub async fn build_committee_from_go_validators_at_block_with_epoch(
+    executor_client: &Arc<ExecutorClient>,
+    block_number: u64,
+    epoch: u64,
+) -> Result<Committee> {
     loop {
         match executor_client.get_validators_at_block(block_number).await {
             Ok((validators, _)) => {
                 if !validators.is_empty() {
-                    return build_committee_from_validator_list(validators, 0);
+                    return build_committee_from_validator_list(validators, epoch);
                 } else {
                     tracing::warn!("⏳ [COMMITTEE] Go returned 0 validators. Retrying...");
                 }

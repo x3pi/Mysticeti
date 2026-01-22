@@ -41,7 +41,7 @@ message GetCurrentEpochResponse {
 }
 
 message GetEpochStartTimestampRequest {
-    uint64 epoch = 1;  // Epoch to query timestamp for
+    // Empty request - get timestamp of current epoch
 }
 
 message GetEpochStartTimestampResponse {

@@ -101,25 +101,24 @@ impl DefaultSystemTransactionProvider {
     }
 
     /// Update current epoch (called after epoch transition)
-    /// CRITICAL: Ensure epoch_start_timestamp_ms is not in the past
-    /// If new_timestamp_ms is in the past (due to consensus delay), use current time instead
+    /// FORK-SAFETY: When syncing from Go, prioritize Go's timestamp over local calculation
+    /// Only override if timestamp is significantly in the past (consensus delay scenario)
     pub async fn update_epoch(&self, new_epoch: Epoch, new_timestamp_ms: u64) {
         // Use blocking write from async context (safe - we're not blocking the runtime thread)
         *self.current_epoch.write().unwrap() = new_epoch;
-        
-        // CRITICAL FIX: If new_timestamp_ms is in the past (due to consensus delay),
-        // use current time instead to prevent immediate epoch transition
+
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
-        // If new_timestamp_ms is more than 1 second in the past, use current time
-        // This prevents rapid epoch transitions when consensus has delays
-        let adjusted_timestamp_ms = if new_timestamp_ms < now_ms.saturating_sub(1000) {
+
+        // FORK-SAFETY: More lenient check for Go-synced timestamps
+        // Only override if timestamp is more than 5 seconds in the past
+        // This allows for reasonable clock differences between Go and Rust
+        let adjusted_timestamp_ms = if new_timestamp_ms < now_ms.saturating_sub(5000) {
             warn!(
-                "⚠️  [EPOCH TIMING] SystemTransactionProvider::update_epoch: new_timestamp_ms {}ms is in the past (now={}ms, diff={}ms). \
-                 Using current time instead to prevent immediate epoch transition.",
+                "⚠️  [EPOCH TIMING] SystemTransactionProvider::update_epoch: new_timestamp_ms {}ms is significantly in the past (now={}ms, diff={}ms). \
+                 This may indicate clock sync issues. Using current time to prevent rapid transitions.",
                 new_timestamp_ms,
                 now_ms,
                 now_ms.saturating_sub(new_timestamp_ms)
@@ -128,10 +127,10 @@ impl DefaultSystemTransactionProvider {
         } else {
             new_timestamp_ms
         };
-        
+
         *self.epoch_start_timestamp_ms.write().unwrap() = adjusted_timestamp_ms;
         *self.last_checked_commit_index.write().unwrap() = 0;
-        
+
         info!(
             "📅 SystemTransactionProvider::update_epoch: epoch={}, epoch_start_timestamp_ms={}ms (from new_timestamp_ms={}ms, now={}ms)",
             new_epoch,
