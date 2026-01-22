@@ -72,24 +72,48 @@ pub async fn submit_queued_transactions(node: &mut ConsensusNode) -> Result<usiz
     if original_count == 0 {
         return Ok(0);
     }
-    
+
     info!("📤 [TX FLOW] Submitting {} queued transactions", original_count);
-    
-    // Dedup
-    let mut transactions_with_hash: Vec<(Vec<u8>, Vec<u8>)> = queue.iter()
-        .map(|tx| (tx.clone(), crate::tx_hash::calculate_transaction_hash(tx)))
+
+    // Load committed transaction hashes to avoid resubmitting already committed transactions
+    let committed_hashes = {
+        let hashes_guard = node.committed_transaction_hashes.lock().await;
+        hashes_guard.clone()
+    };
+    info!("📋 [TX FLOW] Loaded {} committed transaction hashes from current epoch", committed_hashes.len());
+
+    // Filter out transactions that were already committed
+    let mut filtered_transactions = Vec::new();
+    let mut skipped_duplicates = 0;
+
+    for tx_data in &*queue {
+        let tx_hash = crate::tx_hash::calculate_transaction_hash(tx_data);
+        if committed_hashes.contains(&tx_hash) {
+            skipped_duplicates += 1;
+            let hash_hex = hex::encode(&tx_hash);
+            info!("⏭️ [TX FLOW] Skipping already committed transaction: {}", hash_hex);
+        } else {
+            filtered_transactions.push(tx_data.clone());
+        }
+    }
+
+    // Dedup among remaining transactions
+    let mut transactions_with_hash: Vec<(Vec<u8>, Vec<u8>)> = filtered_transactions.into_iter()
+        .map(|tx| (tx.clone(), crate::tx_hash::calculate_transaction_hash(&tx)))
         .collect();
-    
+
     transactions_with_hash.sort_by(|(_, a), (_, b)| a.cmp(b));
     transactions_with_hash.dedup_by(|a, b| a.1 == b.1);
-    
+
     let transactions: Vec<Vec<u8>> = transactions_with_hash.into_iter().map(|(tx, _)| tx).collect();
     queue.clear();
     drop(queue); // Release lock
 
+    info!("🔄 [TX FLOW] Filtered {} duplicates, submitting {} unique transactions", skipped_duplicates, transactions.len());
+
     let mut successful_count = 0;
     let mut requeued_count = 0;
-    
+
     for tx_data in transactions {
         if SystemTransaction::from_bytes(&tx_data).is_ok() || !crate::tx_hash::verify_transaction_protobuf(&tx_data) {
             continue;
@@ -101,16 +125,20 @@ pub async fn submit_queued_transactions(node: &mut ConsensusNode) -> Result<usiz
              requeued_count += 1;
              continue;
         }
-        
+
         let mut retry = 0;
         let max_retries = 20;
         let mut submitted = false;
-        
+
         while retry < max_retries {
             match node.transaction_client_proxy.as_ref().unwrap().submit(vec![tx_data.clone()]).await {
                 Ok(_) => {
                     successful_count += 1;
                     submitted = true;
+
+                    // NOTE: Hash tracking moved to commit processor
+                    // Queue submissions are just temporary - only commit processing truly commits transactions
+
                     break;
                 },
                 Err(e) => {
@@ -121,7 +149,7 @@ pub async fn submit_queued_transactions(node: &mut ConsensusNode) -> Result<usiz
                 }
             }
         }
-        
+
         if !submitted {
              error!("❌ Failed to submit tx after retries. Re-queuing.");
              let mut q = node.pending_transactions_queue.lock().await;

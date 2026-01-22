@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration; // [Added] Import Duration
 use tokio::time::sleep;  // [Added] Import sleep for retry mechanism
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, trace};
 use hex;
 
 use crate::checkpoint::calculate_global_exec_index;
@@ -427,6 +427,44 @@ impl CommitProcessor {
                                 let mut index_guard = shared_index.lock().await;
                                 *index_guard = global_exec_index;
                                 info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} after successful send", global_exec_index);
+                            }
+
+                            // Track committed transaction hashes to prevent duplicates during epoch transitions
+                            // CRITICAL: Only track when commit is actually processed, not just submitted
+                            if let Some(node_arc) = crate::node::get_transition_handler_node().await {
+                                let node_guard = node_arc.lock().await;
+                                let mut hashes_guard = node_guard.committed_transaction_hashes.lock().await;
+
+                                let mut tracked_count = 0;
+                                for block in &subdag.blocks {
+                                    for tx in block.transactions() {
+                                        let tx_hash = crate::tx_hash::calculate_transaction_hash(tx.data());
+                                        let hash_hex = hex::encode(&tx_hash);
+
+                                        // Special debug logging for the problematic transaction
+                                        if hash_hex.starts_with("44a535f2") {
+                                            warn!("🔍 [DEBUG] Committing problematic transaction {} in commit #{} (global_exec_index={})",
+                                                  hash_hex, commit_index, global_exec_index);
+                                        }
+
+                                        hashes_guard.insert(tx_hash.clone());
+                                        tracked_count += 1;
+
+                                        // Also save to persistent storage for epoch transition recovery
+                                        if let Err(e) = crate::node::transition::save_committed_transaction_hash(
+                                            &node_guard.storage_path, epoch, &tx_hash
+                                        ).await {
+                                            warn!("⚠️ [TX TRACKING] Failed to persist committed hash after commit: {}", e);
+                                        } else {
+                                            trace!("💾 [TX TRACKING] Persisted committed hash: {} for epoch {}", hash_hex, epoch);
+                                        }
+                                    }
+                                }
+
+                                if tracked_count > 0 {
+                                    info!("💾 [TX TRACKING] Tracked {} committed transaction hashes after processing commit #{} (global_exec_index={})",
+                                          tracked_count, commit_index, global_exec_index);
+                                }
                             }
 
                             break;

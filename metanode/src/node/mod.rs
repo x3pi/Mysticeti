@@ -102,6 +102,8 @@ pub struct ConsensusNode {
     pub(crate) executor_client: Option<Arc<ExecutorClient>>,
     /// Transactions submitted in current epoch that may need recovery during epoch transition
     pub(crate) epoch_pending_transactions: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    /// Transaction hashes that have been committed in current epoch (for duplicate prevention)
+    pub(crate) committed_transaction_hashes: Arc<tokio::sync::Mutex<std::collections::HashSet<Vec<u8>>>>,
 }
 
 impl ConsensusNode {
@@ -239,6 +241,13 @@ impl ConsensusNode {
             info!("💾 Loaded {} persisted transactions", persisted_queue.len());
         }
         let pending_transactions_queue = Arc::new(tokio::sync::Mutex::new(persisted_queue));
+
+        // Load committed transaction hashes from current epoch for duplicate prevention
+        let committed_hashes = crate::node::transition::load_committed_transaction_hashes(&storage_path, current_epoch).await;
+        if !committed_hashes.is_empty() {
+            info!("💾 Loaded {} committed transaction hashes from epoch {}", committed_hashes.len(), current_epoch);
+        }
+        let committed_transaction_hashes = Arc::new(tokio::sync::Mutex::new(committed_hashes));
         
         let (epoch_tx_sender, epoch_tx_receiver) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, u32)>();
         let epoch_transition_callback = crate::commit_callbacks::create_epoch_transition_callback(epoch_tx_sender.clone());
@@ -420,6 +429,7 @@ impl ConsensusNode {
             sync_task_handle: None,
             executor_client: Some(executor_client_for_proc),
             epoch_pending_transactions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            committed_transaction_hashes,
         };
 
         crate::epoch_transition::start_epoch_transition_handler(

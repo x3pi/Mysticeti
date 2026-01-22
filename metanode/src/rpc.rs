@@ -442,8 +442,12 @@ impl RpcServer {
 
         match client.submit(transactions_to_submit.clone()).await {
             Ok((block_ref, indices, _)) => {
-                info!("✅ [TX FLOW] Transaction(s) included in block: first_hash={}, block={:?}, indices={:?}, count={}", 
+                info!("✅ [TX FLOW] Transaction(s) included in block: first_hash={}, block={:?}, indices={:?}, count={}",
                     first_tx_hash, block_ref, indices, transactions_to_submit.len());
+
+                // NOTE: Hash tracking moved to commit processor to ensure only truly committed transactions are tracked
+                // This prevents false positives where submitted-but-not-committed transactions get tracked
+
                 // Log chi tiết từng transaction đã được submit
                 for (i, tx_data) in transactions_to_submit.iter().enumerate() {
                     let tx_hash = calculate_transaction_hash_hex(tx_data);
@@ -454,7 +458,7 @@ impl RpcServer {
                         } else {
                             hex::encode(&tx.from_address)
                         };
-                        info!("   ✅ TX[{}] included: hash={}, from={}, nonce={}, block_index={}", 
+                        info!("   ✅ TX[{}] included: hash={}, from={}, nonce={}, block_index={}",
                             i, tx_hash, from_addr, hex::encode(&tx.nonce), index);
                     } else {
                         info!("   ✅ TX[{}] included: hash={}, block_index={}", i, tx_hash, index);
