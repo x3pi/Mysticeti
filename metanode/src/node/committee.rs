@@ -12,13 +12,6 @@ use fastcrypto::traits::ToFromBytes;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::time::Duration;
 
-pub async fn build_committee_from_go_validators_at_block(
-    executor_client: &Arc<ExecutorClient>,
-    block_number: u64,
-) -> Result<Committee> {
-    build_committee_from_go_validators_at_block_with_epoch(executor_client, block_number, 0).await
-}
-
 pub async fn build_committee_from_go_validators_at_block_with_epoch(
     executor_client: &Arc<ExecutorClient>,
     block_number: u64,

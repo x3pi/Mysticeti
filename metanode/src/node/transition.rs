@@ -152,6 +152,9 @@ pub async fn transition_to_epoch_from_system_tx(
         info!("✅ Consensus ready.");
     }
 
+    // Recover transactions from previous epoch that were not committed
+    let _ = recover_epoch_pending_transactions(node).await;
+
     node.is_transitioning.store(false, Ordering::SeqCst);
     let _ = node.submit_queued_transactions().await;
 
@@ -242,6 +245,62 @@ async fn test_consensus_readiness(node: &ConsensusNode) -> bool {
 
 /// Sync epoch timestamp from Go with retry logic to avoid stale timestamps
 /// CRITICAL: Prevents using timestamp from old epoch after transition
+/// Recover transactions that were submitted in the previous epoch but not committed
+async fn recover_epoch_pending_transactions(
+    node: &mut ConsensusNode,
+) -> Result<usize> {
+    let mut epoch_pending = node.epoch_pending_transactions.lock().await;
+    if epoch_pending.is_empty() {
+        return Ok(0);
+    }
+
+    info!("🔄 [EPOCH RECOVERY] Checking {} transactions from previous epoch for recovery", epoch_pending.len());
+
+    let mut transactions_to_recover = Vec::new();
+
+    // During epoch transition, we assume all pending transactions from the old epoch
+    // that were submitted but not committed need to be recovered
+    // This is a conservative approach - better to resubmit than to lose transactions
+    info!("🔄 [EPOCH RECOVERY] Epoch transition detected - recovering all {} pending transactions from previous epoch",
+          epoch_pending.len());
+
+    transactions_to_recover.extend(epoch_pending.iter().cloned());
+
+    // Clear the pending list - we'll resubmit what needs recovery
+    epoch_pending.clear();
+
+    if transactions_to_recover.is_empty() {
+        info!("✅ [EPOCH RECOVERY] No transactions need recovery");
+        return Ok(0);
+    }
+
+    // Resubmit transactions to new epoch
+    info!("🚀 [EPOCH RECOVERY] Resubmitting {} transactions to new epoch", transactions_to_recover.len());
+
+    let mut recovered_count = 0;
+    let total_count = transactions_to_recover.len();
+
+    for tx_data in transactions_to_recover {
+        if let Some(proxy) = &node.transaction_client_proxy {
+            match proxy.submit(vec![tx_data.clone()]).await {
+                Ok(_) => {
+                    recovered_count += 1;
+                    info!("✅ [EPOCH RECOVERY] Successfully recovered transaction");
+                }
+                Err(e) => {
+                    warn!("❌ [EPOCH RECOVERY] Failed to recover transaction: {}", e);
+                    // Put back into pending queue for later retry
+                    let mut pending = node.pending_transactions_queue.lock().await;
+                    pending.push(tx_data);
+                }
+            }
+        }
+    }
+
+    info!("📊 [EPOCH RECOVERY] Recovered {} out of {} transactions", recovered_count, total_count);
+    Ok(recovered_count)
+}
+
 async fn sync_epoch_timestamp_from_go(
     executor_client: &ExecutorClient,
     expected_epoch: u64,

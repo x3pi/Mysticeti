@@ -350,8 +350,17 @@ impl TxSocketServer {
         info!("🚀 [DEBUG] About to call client.submit() with {} transactions", transactions_to_submit.len());
         match client.submit(transactions_to_submit.clone()).await {
             Ok((block_ref, indices, _)) => {
-                info!("✅ [TX FLOW] Transaction(s) included in block via UDS: first_hash={}, block={:?}, indices={:?}, count={}", 
+                info!("✅ [TX FLOW] Transaction(s) included in block via UDS: first_hash={}, block={:?}, indices={:?}, count={}",
                     first_tx_hash, block_ref, indices, transactions_to_submit.len());
+
+                // Track submitted transactions for epoch transition recovery
+                if let Some(ref node_arc) = node.as_ref() {
+                    let node_guard = node_arc.lock().await;
+                    let mut epoch_pending = node_guard.epoch_pending_transactions.lock().await;
+                    for tx_data in &transactions_to_submit {
+                        epoch_pending.push(tx_data.clone());
+                    }
+                }
                 // Log chi tiết từng transaction đã được submit
                 for (i, tx_data) in transactions_to_submit.iter().enumerate() {
                     let tx_hash = tx_hash::calculate_transaction_hash_hex(tx_data);

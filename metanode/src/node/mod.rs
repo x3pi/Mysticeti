@@ -100,6 +100,8 @@ pub struct ConsensusNode {
     pub(crate) epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u32)>,
     pub(crate) sync_task_handle: Option<tokio::task::JoinHandle<()>>,
     pub(crate) executor_client: Option<Arc<ExecutorClient>>,
+    /// Transactions submitted in current epoch that may need recovery during epoch transition
+    pub(crate) epoch_pending_transactions: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
 }
 
 impl ConsensusNode {
@@ -417,6 +419,7 @@ impl ConsensusNode {
             epoch_transition_sender: epoch_tx_sender,
             sync_task_handle: None,
             executor_client: Some(executor_client_for_proc),
+            epoch_pending_transactions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
 
         crate::epoch_transition::start_epoch_transition_handler(
