@@ -140,40 +140,41 @@ impl CommitProcessor {
         let mut pending_commits = self.pending_commits;
         let commit_index_callback = self.commit_index_callback;
         let current_epoch = self.current_epoch;
-        // CRITICAL: We now read directly from shared_last_global_exec_index in the loop
-        // No need to read it here as it will be updated after each commit
         let executor_client = self.executor_client;
         let pending_transactions_queue = self.pending_transactions_queue;
         let epoch_transition_callback = self.epoch_transition_callback;
         
+        // --- [FORK SAFETY FIX] ---
+        // Initialize local tracker. We read from shared state ONLY ONCE at startup.
+        // This ensures sequential consistency within the loop, preventing race conditions
+        // where we might read a stale index from the shared mutex.
+        let mut tracked_last_global_exec_index = if let Some(ref shared_index) = self.shared_last_global_exec_index {
+            let index_guard = shared_index.lock().await;
+            *index_guard
+        } else {
+            // Fallback: try callback if shared index not available
+            if let Some(ref callback) = self.get_last_global_exec_index {
+                callback()
+            } else {
+                0 
+            }
+        };
+
         // #region agent log
         {
             use std::io::Write;
             let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-            // Get initial last_global_exec_index from shared index for logging
-            let initial_last_global_exec_index = if let Some(ref shared_index) = self.shared_last_global_exec_index {
-                let index_guard = shared_index.lock().await;
-                *index_guard
-            } else {
-                0
-            };
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
                 let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:124","message":"COMMIT PROCESSOR STARTED","data":{{"current_epoch":{},"last_global_exec_index":{},"next_expected_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#, 
                     ts.as_secs(), ts.as_nanos() % 1000000,
                     ts.as_millis(),
-                    current_epoch, initial_last_global_exec_index, next_expected_index);
+                    current_epoch, tracked_last_global_exec_index, next_expected_index);
             }
         }
         // #endregion
-        // Get initial last_global_exec_index from shared index for logging
-        let initial_last_global_exec_index = if let Some(ref shared_index) = self.shared_last_global_exec_index {
-            let index_guard = shared_index.lock().await;
-            *index_guard
-        } else {
-            0
-        };
+        
         info!("🚀 [COMMIT PROCESSOR] Started processing commits for epoch {} (last_global_exec_index={}, next_expected_index={})",
-            current_epoch, initial_last_global_exec_index, next_expected_index);
+            current_epoch, tracked_last_global_exec_index, next_expected_index);
         
         let mut last_heartbeat_commit = 0u32;
         let mut last_heartbeat_time = std::time::Instant::now();
@@ -189,21 +190,29 @@ impl CommitProcessor {
                     info!("📥 [COMMIT PROCESSOR] Received committed subdag: commit_index={}, leader={:?}, blocks={}",
                         commit_index, subdag.leader, subdag.blocks.len());
                     
+                    // Heartbeat logic
+                    if commit_index >= last_heartbeat_commit + HEARTBEAT_INTERVAL {
+                        let elapsed = last_heartbeat_time.elapsed().as_secs();
+                        info!("💓 [COMMIT PROCESSOR HEARTBEAT] Processed {} commits (last {} commits in {}s)", 
+                            commit_index, HEARTBEAT_INTERVAL, elapsed);
+                        last_heartbeat_commit = commit_index;
+                        last_heartbeat_time = std::time::Instant::now();
+                    }
+
+                    // Check for stuck processor
+                    let time_since_last_heartbeat = last_heartbeat_time.elapsed().as_secs();
+                    if time_since_last_heartbeat > HEARTBEAT_TIMEOUT_SECS && commit_index == last_heartbeat_commit {
+                        warn!("⚠️  [COMMIT PROCESSOR] Possible stuck detected: No progress for {}s (last commit: {})", 
+                            time_since_last_heartbeat, commit_index);
+                    }
+
                     info!("📊 [COMMIT CONDITION] Checking commit_index={}, next_expected_index={}", commit_index, next_expected_index);
+                    
                     if commit_index == next_expected_index {
-                        // CRITICAL FIX: Read directly from shared_last_global_exec_index instead of callback
-                        // Callback may return 0 if called from async context, causing incorrect global_exec_index calculation
-                        let current_last_global_exec_index = if let Some(ref shared_index) = self.shared_last_global_exec_index {
-                            let index_guard = shared_index.lock().await;
-                            *index_guard
-                        } else {
-                            // Fallback: try callback if shared index not available
-                            if let Some(ref callback) = self.get_last_global_exec_index {
-                                callback()
-                            } else {
-                                0 // final fallback
-                            }
-                        };
+                        // --- [FORK SAFETY IMPLEMENTATION] ---
+                        // Use the LOCAL tracker for calculation. 
+                        // This guarantees deterministic increment: Index(N) = Index(N-1) + Blocks(N-1)
+                        let current_last_global_exec_index = tracked_last_global_exec_index;
 
                         let global_exec_index = calculate_global_exec_index(
                             current_epoch,
@@ -214,12 +223,9 @@ impl CommitProcessor {
                         info!("📊 [GLOBAL_EXEC_INDEX] Calculated: global_exec_index={}, epoch={}, commit_index={}, current_last_global_exec_index={}",
                             global_exec_index, current_epoch, commit_index, current_last_global_exec_index);
 
-                        // Note: shared index will be updated in process_commit after successful send
-                        
                         let total_txs_in_commit = subdag.blocks.iter().map(|b| b.transactions().len()).sum::<usize>();
 
                         // Check for EndOfEpoch system transactions
-                        let _has_system_tx = subdag.extract_end_of_epoch_transaction().is_some();
                         if let Some((_block_ref, system_tx)) = subdag.extract_end_of_epoch_transaction() {
                             if let Some((new_epoch, new_epoch_timestamp_ms, _commit_index_from_tx)) = system_tx.as_end_of_epoch() {
                                 info!(
@@ -241,57 +247,37 @@ impl CommitProcessor {
                         }
                         
                         // Process commit normally
-                        info!("📊 [COMMIT_PROCESSOR] About to call process_commit with shared_index is_some={}", self.shared_last_global_exec_index.is_some());
-                        Self::process_commit(&subdag, global_exec_index, current_epoch, executor_client.clone(), pending_transactions_queue.clone(), self.shared_last_global_exec_index.clone()).await?;
-                        info!("📊 [COMMIT_PROCESSOR] process_commit returned Ok");
+                        // Note: We still pass shared_last_global_exec_index to process_commit so it can update it for external monitoring/RPC
+                        Self::process_commit(
+                            &subdag, 
+                            global_exec_index, 
+                            current_epoch, 
+                            executor_client.clone(), 
+                            pending_transactions_queue.clone(), 
+                            self.shared_last_global_exec_index.clone()
+                        ).await?;
 
-                        // Update global execution index after successful commit
-                        // This ensures next commit gets the correct sequential block number
-                        // NOTE: This callback is for compatibility, but actual update happens in process_commit
+                        // --- [FORK SAFETY UPDATE] ---
+                        // Update local tracker immediately after successful processing.
+                        // The next iteration is GUARANTEED to see this updated value.
+                        tracked_last_global_exec_index = global_exec_index;
+
                         if let Some(ref callback) = self.global_exec_index_callback {
                             callback(global_exec_index);
                         }
-
-                        // NOTE: Shared index is now updated in process_commit for both empty and non-empty commits
-                        // No need to update here again to avoid duplicate updates
 
                         if let Some(ref callback) = commit_index_callback {
                             callback(commit_index);
                         }
                         
-                        // Heartbeat logic
-                        if commit_index >= last_heartbeat_commit + HEARTBEAT_INTERVAL {
-                            let elapsed = last_heartbeat_time.elapsed().as_secs();
-                            info!("💓 [COMMIT PROCESSOR HEARTBEAT] Processed {} commits (last {} commits in {}s)", 
-                                commit_index, HEARTBEAT_INTERVAL, elapsed);
-                            last_heartbeat_commit = commit_index;
-                            last_heartbeat_time = std::time::Instant::now();
-                        }
-                        
-                        let time_since_last_heartbeat = last_heartbeat_time.elapsed().as_secs();
-                        if time_since_last_heartbeat > HEARTBEAT_TIMEOUT_SECS && commit_index == last_heartbeat_commit {
-                            warn!("⚠️  [COMMIT PROCESSOR] Possible stuck detected: No progress for {}s (last commit: {})", 
-                                time_since_last_heartbeat, commit_index);
-                        }
-                        
                         next_expected_index += 1;
                         
+                        // Process pending out-of-order commits
                         while let Some(pending) = pending_commits.remove(&next_expected_index) {
                             let pending_commit_index = next_expected_index;
 
-                            // CRITICAL FIX: Read directly from shared_last_global_exec_index instead of callback
-                            // Callback may return 0 if called from async context, causing incorrect global_exec_index calculation
-                            let current_last_global_exec_index = if let Some(ref shared_index) = self.shared_last_global_exec_index {
-                                let index_guard = shared_index.lock().await;
-                                *index_guard
-                            } else {
-                                // Fallback: try callback if shared index not available
-                                if let Some(ref callback) = self.get_last_global_exec_index {
-                                    callback()
-                                } else {
-                                    0 // final fallback
-                                }
-                            };
+                            // Use LOCAL tracker for pending commits as well
+                            let current_last_global_exec_index = tracked_last_global_exec_index;
 
                             let global_exec_index = calculate_global_exec_index(
                                 current_epoch,
@@ -299,7 +285,17 @@ impl CommitProcessor {
                                 current_last_global_exec_index,
                             );
                             
-                            Self::process_commit(&pending, global_exec_index, current_epoch, executor_client.clone(), pending_transactions_queue.clone(), self.shared_last_global_exec_index.clone()).await?;
+                            Self::process_commit(
+                                &pending, 
+                                global_exec_index, 
+                                current_epoch, 
+                                executor_client.clone(), 
+                                pending_transactions_queue.clone(), 
+                                self.shared_last_global_exec_index.clone()
+                            ).await?;
+
+                            // Update local tracker
+                            tracked_last_global_exec_index = global_exec_index;
                             
                             if let Some(ref callback) = commit_index_callback {
                                 callback(pending_commit_index);
@@ -348,8 +344,6 @@ impl CommitProcessor {
 
                 // Skip EndOfEpoch system transactions - they are epoch-specific
                 if has_end_of_epoch && Self::is_end_of_epoch_transaction(tx_data) {
-                    // NOTE: If we are here, it means the retry loop in process_commit failed or gave up.
-                    // Dropping the EndOfEpoch here implies we are forced to move on without executing it.
                     info!("ℹ️  [TX FLOW] Skipping EndOfEpoch system transaction in failed commit {} (epoch-specific, cannot be queued for next epoch)", commit_index);
                     skipped_count += 1;
                     continue;
@@ -422,7 +416,6 @@ impl CommitProcessor {
             );
 
             if let Some(ref client) = executor_client {
-                // FIXED: Wrapped in a loop to retry system transactions
                 let mut retry_count = 0;
                 loop {
                     match client.send_committed_subdag(subdag, epoch, global_exec_index).await {
@@ -430,13 +423,11 @@ impl CommitProcessor {
                             info!("✅ [TX FLOW] Successfully sent committed subdag: global_exec_index={}, commit_index={}",
                                 global_exec_index, commit_index);
 
-                            // CRITICAL: Update shared last global exec index SYNCHRONOUSLY after successful send
-                            // This ensures next commit gets the correct sequential block number
-                            // We must update immediately, not in a spawned task, to prevent race conditions
+                            // Update shared last global exec index for monitoring visibility
                             if let Some(shared_index) = shared_last_global_exec_index.clone() {
                                 let mut index_guard = shared_index.lock().await;
                                 *index_guard = global_exec_index;
-                                info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} after successful send (synchronous)", global_exec_index);
+                                info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} after successful send", global_exec_index);
                             }
 
                             break;
@@ -446,29 +437,27 @@ impl CommitProcessor {
                             if e.to_string().contains("Duplicate global_exec_index") {
                                 error!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! Skipping commit {} to prevent fork. Error: {}", 
                                     global_exec_index, commit_index, e);
-                                // For duplicates, we break loop and do NOT queue transactions because they are likely already executed
                                 break;
                             }
                             
-                            // Case 2: System Transaction (EndOfEpoch) failed
-                            // We MUST NOT skip this. We retry indefinitely (or until success) because dropping it prevents epoch change.
+                            // Case 2: System Transaction (EndOfEpoch) failed - Retry needed
                             if has_system_tx {
                                 retry_count += 1;
                                 error!("🚨 [CRITICAL] Failed to send commit {} containing EndOfEpoch transaction (Attempt {}). Retrying in 1s... Error: {}", 
                                     commit_index, retry_count, e);
                                 
                                 sleep(Duration::from_secs(1)).await;
-                                continue; // Retry the loop
+                                continue;
                             }
 
-                            // Case 3: Regular transaction failure (Network issue / Executor crash)
+                            // Case 3: Regular transaction failure
                             warn!("⚠️  [TX FLOW] Failed to send committed subdag: {}", e);
                             if let Some(ref queue) = pending_transactions_queue {
                                 Self::queue_commit_transactions_for_next_epoch(subdag, queue, commit_index, global_exec_index, epoch).await;
                             } else {
                                 warn!("⚠️  [TX FLOW] No pending_transactions_queue - transactions may be lost!");
                             }
-                            break; // Exit loop, having queued what we could
+                            break;
                         }
                     }
                 }
@@ -483,13 +472,10 @@ impl CommitProcessor {
                         info!("✅ [TX FLOW] Successfully sent empty commit: global_exec_index={}, commit_index={}",
                             global_exec_index, commit_index);
 
-                        // CRITICAL: Update shared index for empty commits SYNCHRONOUSLY too
-                        // This ensures sequential global_exec_index even for empty commits
-                        // We must update immediately to prevent race conditions
                         if let Some(shared_index) = shared_last_global_exec_index.clone() {
                             let mut index_guard = shared_index.lock().await;
                             *index_guard = global_exec_index;
-                            info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} for empty commit (synchronous)", global_exec_index);
+                            info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} for empty commit", global_exec_index);
                         }
                     },
                     Err(e) => {
