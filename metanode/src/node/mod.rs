@@ -137,27 +137,8 @@ impl ConsensusNode {
         let (validators, _go_epoch_timestamp_ms) = executor_client.get_validators_at_block(latest_block_number).await
             .map_err(|e| anyhow::anyhow!("Failed to fetch committee from Go: {}", e))?;
 
-        let epoch_timestamp_ms = if current_epoch == 0 {
-            let genesis_path = std::path::Path::new("../../mtn-simple-2025/cmd/simple_chain/genesis.json");
-            if genesis_path.exists() {
-                match std::fs::read_to_string(genesis_path) {
-                    Ok(content) => {
-                        match serde_json::from_str::<serde_json::Value>(&content) {
-                            Ok(json) => json.get("config")
-                                .and_then(|c| c.get("epoch_timestamp_ms"))
-                                .and_then(|ts| ts.as_u64())
-                                .unwrap_or(_go_epoch_timestamp_ms),
-                            Err(_) => _go_epoch_timestamp_ms
-                        }
-                    },
-                    Err(_) => _go_epoch_timestamp_ms
-                }
-            } else {
-                _go_epoch_timestamp_ms
-            }
-        } else {
-            _go_epoch_timestamp_ms
-        };
+        // Use epoch timestamp directly from Go state for all epochs
+        let epoch_timestamp_ms = _go_epoch_timestamp_ms;
 
         if validators.is_empty() {
             anyhow::bail!("Go state returned empty validators list");
