@@ -694,7 +694,8 @@ impl ExecutorClient {
             for (block_idx, block) in subdag.blocks.iter().enumerate() {
             // Extract transactions with hash for deterministic sorting
             // CRITICAL FORK-SAFETY: Sort transactions by hash to ensure all nodes send same order
-            let mut transactions_with_hash: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (tx_data, tx_hash)
+            // OPTIMIZATION: Use references during sorting to reduce memory allocations
+            let mut transactions_with_hash: Vec<(&[u8], Vec<u8>)> = Vec::with_capacity(block.transactions().len()); // (tx_data_ref, tx_hash)
             let mut skipped_count = 0;
             let total_tx_in_block = block.transactions().len();
             
@@ -810,8 +811,9 @@ impl ExecutorClient {
                 trace!("🔍 [TX INTEGRITY] Verifying transaction data: hash={}, size={} bytes", 
                     tx_hash_hex, tx_data.len());
                 
-                // Store transaction data with hash for sorting
-                transactions_with_hash.push((tx_data.to_vec(), tx_hash));
+                // Store transaction data reference with hash for sorting
+                // OPTIMIZATION: Avoid first clone by storing reference during sorting
+                transactions_with_hash.push((tx_data, tx_hash));
                 
                 // #region agent log - General transaction tracking
                 {
@@ -854,8 +856,9 @@ impl ExecutorClient {
             // #endregion
             
             // Convert to TransactionExe messages after sorting
+            // OPTIMIZATION: Only clone once here instead of twice (during push + here)
             let mut transactions = Vec::new();
-            for (sorted_idx, (tx_data, tx_hash)) in transactions_with_hash.iter().enumerate() {
+            for (sorted_idx, (tx_data_ref, tx_hash)) in transactions_with_hash.iter().enumerate() {
                 let tx_hash_hex = hex::encode(&tx_hash[..8.min(tx_hash.len())]);
                 info!("📋 [FORK-SAFETY] Sorted transaction in block[{}]: hash={}", block_idx, tx_hash_hex);
                 
@@ -864,10 +867,10 @@ impl ExecutorClient {
                     use std::io::Write;
                     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:657","message":"CREATING TransactionExe","data":{{"global_exec_index":{},"block_idx":{},"sorted_idx":{},"tx_hash":"{}","size":{},"is_first":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
+                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:657","message":"CREATING TransactionExe","data":{{"global_exec_index":{},"block_idx":{},"sorted_idx":{},"tx_hash":"{}","size":{},"is_first":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#,
                             ts.as_secs(), ts.as_nanos() % 1000000,
                             ts.as_millis(),
-                            global_exec_index, block_idx, sorted_idx, tx_hash_hex, tx_data.len(), sorted_idx == 0);
+                            global_exec_index, block_idx, sorted_idx, tx_hash_hex, tx_data_ref.len(), sorted_idx == 0);
                     }
                 }
                 // #endregion
@@ -875,9 +878,9 @@ impl ExecutorClient {
                 // Create TransactionExe message using generated protobuf code
                 // NOTE: We use "digest" field to store transaction data (raw bytes)
                 // Go will unmarshal this as transaction data
-                // IMPORTANT: We create a copy here (clone()) but the data is unchanged
+                // OPTIMIZATION: Only clone once here (instead of during push + here)
                 let tx_exe = TransactionExe {
-                    digest: tx_data.clone(), // Clone Vec<u8> from sorting step
+                    digest: tx_data_ref.to_vec(), // Clone &[u8] to Vec<u8> - the only clone needed
                     worker_id: 0, // Optional, set to 0 for now
                 };
                 transactions.push(tx_exe);
