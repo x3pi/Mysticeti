@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use tracing::{info, warn}; // Removed unused error
+use tracing::{info, warn, trace}; // Removed unused error
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -29,7 +29,7 @@ pub async fn transition_to_epoch_from_system_tx(
     }
 
     info!("🔄 TRANSITION: epoch {} -> {}", node.current_epoch, new_epoch);
-    sleep(Duration::from_millis(500)).await;
+    // No sleep needed here - proceed immediately with transition
 
     // Reset flag guard
     struct Guard(Arc<std::sync::atomic::AtomicBool>);
@@ -48,7 +48,7 @@ pub async fn transition_to_epoch_from_system_tx(
     );
     
     info!("📊 Snapshot: Last block of epoch {}: {}", node.current_epoch, last_global_exec_index_at_transition);
-    sleep(Duration::from_millis(100)).await;
+    // No additional sleep needed - commit processor completion already waited above
 
     // Stop old authority
     if let Some(auth) = node.authority.take() {
@@ -147,9 +147,8 @@ pub async fn transition_to_epoch_from_system_tx(
         node.transaction_client_proxy = None;
     }
 
-    sleep(Duration::from_millis(1000)).await;
-    
-    if test_consensus_readiness(node).await {
+    // Wait for consensus to stabilize with proper synchronization instead of fixed sleep
+    if wait_for_consensus_ready(node).await {
         info!("✅ Consensus ready.");
     }
 
@@ -170,10 +169,33 @@ async fn wait_for_commit_processor_completion(node: &ConsensusNode, target: u32,
         let current = node.current_commit_index.load(Ordering::SeqCst);
         if current >= target { return Ok(()); }
         if start.elapsed().as_secs() >= max_wait { return Err(anyhow::anyhow!("Timeout")); }
+        // Polling sleep: Wait 100ms before checking commit index again
+        // This is acceptable for infrequent epoch transitions where precise timing isn't critical
         sleep(Duration::from_millis(100)).await;
     }
 }
 
+
+/// Wait for consensus to become ready with retries instead of fixed sleep
+/// This replaces the unreliable 1000ms sleep with proper synchronization
+async fn wait_for_consensus_ready(node: &ConsensusNode) -> bool {
+    let max_attempts = 20; // Up to 2 seconds with 100ms intervals
+    let retry_delay = Duration::from_millis(100);
+
+    for attempt in 1..=max_attempts {
+        if test_consensus_readiness(node).await {
+            return true;
+        }
+
+        if attempt < max_attempts {
+            trace!("⏳ Consensus not ready yet (attempt {}/{}), waiting...", attempt, max_attempts);
+            sleep(retry_delay).await;
+        }
+    }
+
+    warn!("⚠️ Consensus failed to become ready after {} attempts", max_attempts);
+    false
+}
 
 async fn test_consensus_readiness(node: &ConsensusNode) -> bool {
     if let Some(proxy) = &node.transaction_client_proxy {
