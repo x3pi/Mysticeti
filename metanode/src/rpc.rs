@@ -139,14 +139,15 @@ impl RpcServer {
                         if data_len > 0 && data_len <= 10 * 1024 * 1024 {
                             // Length-prefixed binary protocol (used by Go txsender client)
                             info!("📥 [TX FLOW] Reading {} bytes of transaction data from {:?}...", data_len, peer_addr);
-                            let mut tx_data = vec![0u8; data_len];
-                            let read_data_result = tokio::time::timeout(
-                                std::time::Duration::from_secs(10), // Giảm từ 30s xuống 10s
-                                stream.read_exact(&mut tx_data)
+
+                            // Use the new codec module to read the frame with timeout
+                            let tx_data_result = crate::codec::read_length_prefixed_frame_with_timeout(
+                                &mut stream,
+                                std::time::Duration::from_secs(10), // Timeout for data reading
                             ).await;
-                            
-                            match read_data_result {
-                                Ok(Ok(_)) => {
+
+                            match tx_data_result {
+                                Ok(tx_data) => {
                                     // Calculate actual transaction hash from protobuf data
                                     let tx_hash_preview = calculate_transaction_hash_hex(&tx_data);
                                     let tx_hash_short = if tx_hash_preview.len() >= 16 {
@@ -154,31 +155,27 @@ impl RpcServer {
                                     } else {
                                         &tx_hash_preview
                                     };
-                                    
-                                    info!("📥 [TX FLOW] Received length-prefixed transaction data via RPC: size={} bytes, hash={}...", 
-                                        data_len, tx_hash_short);
-                                    
+
+                                    info!("📥 [TX FLOW] Received length-prefixed transaction data via RPC: size={} bytes, hash={}...",
+                                        tx_data.len(), tx_hash_short);
+
                                     // Process transaction data
                                     let is_length_prefixed = true; // Mark as length-prefixed protocol
                                     if let Err(e) = Self::process_transaction_data(
                                         &client,
                                         &node,
                                         &mut stream,
-                                        tx_data,
+                                        tx_data.clone(),
                                         is_length_prefixed,
                                     ).await {
-                                        error!("❌ [TX FLOW] Failed to process transaction (size={} bytes, hash_preview={}): {}", 
-                                            data_len, tx_hash_preview, e);
+                                        error!("❌ [TX FLOW] Failed to process transaction (size={} bytes, hash_preview={}): {}",
+                                            tx_data.len(), tx_hash_preview, e);
                                         // Send error response for length-prefixed protocol
                                         let _ = Self::send_binary_response(&mut stream, false, "Failed to process transaction").await;
                                     }
                                 }
-                                Ok(Err(e)) => {
-                                    error!("❌ [TX FLOW] Failed to read length-prefixed transaction data: expected {} bytes, error={}", data_len, e);
-                                    return;
-                                }
-                                Err(_) => {
-                                    error!("❌ [TX FLOW] Timeout reading transaction data: expected {} bytes (timeout after 10s)", data_len);
+                                Err(e) => {
+                                    error!("❌ [TX FLOW] Failed to read length-prefixed transaction data: {}", e);
                                     return;
                                 }
                             }
@@ -187,26 +184,26 @@ impl RpcServer {
                             // Reconstruct the 4 bytes we read as part of HTTP request
                             let mut buffer = Vec::with_capacity(8192);
                             buffer.extend_from_slice(&len_buf);
-                            
+
                             // Read remaining data with timeout
                             let mut remaining = [0u8; 8188];
                             let read_remaining_result = tokio::time::timeout(
                                 std::time::Duration::from_secs(5), // Giảm từ 30s xuống 5s
                                 stream.read(&mut remaining)
                             ).await;
-                            
+
                             match read_remaining_result {
                                 Ok(Ok(n)) => {
                                     buffer.extend_from_slice(&remaining[..n]);
                                     let request = String::from_utf8_lossy(&buffer);
-                                    
+
                                     if request.starts_with("POST /submit") {
                                         // Extract transaction data from HTTP body
                                         let body_start = request.find("\r\n\r\n")
                                             .or_else(|| request.find("\n\n"))
                                             .map(|i| i + 4)
                                             .unwrap_or(0);
-                                        
+
                                         let body = &request[body_start..];
                                         let tx_data = if body.starts_with("0x") || body.chars().all(|c| c.is_ascii_hexdigit()) {
                                             hex::decode(body.trim().trim_start_matches("0x"))
@@ -214,9 +211,9 @@ impl RpcServer {
                                         } else {
                                             body.trim().as_bytes().to_vec()
                                         };
-                                        
+
                                         info!("📥 [TX FLOW] Received HTTP POST transaction data via RPC: size={} bytes", tx_data.len());
-                                        
+
                                         // Process transaction data (HTTP protocol)
                                         let is_length_prefixed = false;
                                         if let Err(e) = Self::process_transaction_data(

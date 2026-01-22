@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing::info;
 
+mod codec;
 mod config;
 mod node;
 mod transaction;

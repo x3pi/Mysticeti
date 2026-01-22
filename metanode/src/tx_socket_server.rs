@@ -4,7 +4,7 @@
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 use crate::tx_submitter::TransactionSubmitter;
@@ -90,48 +90,31 @@ impl TxSocketServer {
         // Điều này cho phép Go client gửi nhiều batches qua cùng một connection
         // Tối ưu cho localhost với throughput cao
         loop {
-            // Read length prefix (4 bytes, big-endian)
-            let mut len_buf = [0u8; 4];
-            let read_result = stream.read_exact(&mut len_buf).await;
-            
-            // Nếu connection đóng (EOF), return bình thường (không phải lỗi)
-            if let Err(e) = read_result {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    info!("🔌 [TX FLOW] UDS connection closed by client (EOF)");
-                    return Ok(());
-                }
-                // Lỗi khác, log và return
-                error!("❌ [TX FLOW] Failed to read length prefix from UDS: {}", e);
-                return Err(e.into());
-            }
-            
-            let data_len = u32::from_be_bytes(len_buf) as usize;
+            // Use the new codec module to read the length-prefixed frame
+            let tx_data_result = crate::codec::read_length_prefixed_frame(&mut stream).await;
 
-            // Validate length (max 10MB per transaction)
-            const MAX_TX_SIZE: usize = 10 * 1024 * 1024;
-            if data_len > MAX_TX_SIZE {
-                let error_response = format!(
-                    r#"{{"success":false,"error":"Transaction too large: {} bytes (max: {})"}}"#,
-                    data_len, MAX_TX_SIZE
-                );
-                if let Err(e) = Self::send_response_string(&mut stream, &error_response).await {
-                    error!("❌ [TX FLOW] Failed to send error response: {}", e);
-                    return Err(e.into());
+            let tx_data = match tx_data_result {
+                Ok(data) => data,
+                Err(e) => {
+                    // Check if it's EOF (connection closed by client)
+                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                        if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
+                            info!("🔌 [TX FLOW] UDS connection closed by client (EOF)");
+                            return Ok(());
+                        }
+                    }
+                    // For other errors, send error response and continue
+                    error!("❌ [TX FLOW] Failed to read length-prefixed frame from UDS: {}", e);
+                    let error_response = format!(r#"{{"success":false,"error":"Failed to read frame: {}"}}"#, e);
+                    if let Err(send_err) = Self::send_response_string(&mut stream, &error_response).await {
+                        error!("❌ [TX FLOW] Failed to send error response: {}", send_err);
+                        return Err(send_err.into());
+                    }
+                    continue; // Tiếp tục xử lý request tiếp theo
                 }
-                continue; // Tiếp tục xử lý request tiếp theo
-            }
+            };
 
-            // Read transaction data
-            let mut tx_data = vec![0u8; data_len];
-            if let Err(e) = stream.read_exact(&mut tx_data).await {
-                error!("❌ [TX FLOW] Failed to read transaction data via UDS: expected {} bytes, error={}", data_len, e);
-                // Nếu là EOF, connection đã đóng, return bình thường
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    info!("🔌 [TX FLOW] UDS connection closed by client while reading data");
-                    return Ok(());
-                }
-                return Err(e.into());
-            }
+            let data_len = tx_data.len();
         
         // 🔍 HASH INTEGRITY CHECK: Calculate actual transaction hash from protobuf data
         use crate::tx_hash;
