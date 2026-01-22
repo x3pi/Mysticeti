@@ -339,7 +339,7 @@ impl ExecutorClient {
     /// Flush buffered blocks in sequential order
     /// This ensures Go executor receives blocks in the correct order even if Rust sends them out-of-order
     /// CRITICAL: This function will send all consecutive commits starting from next_expected_index
-    async fn flush_buffer(&self) -> Result<()> {
+    pub async fn flush_buffer(&self) -> Result<()> {
         // Connect if needed
         if let Err(e) = self.connect().await {
             warn!("⚠️  Executor connection failed, cannot flush buffer: {}", e);

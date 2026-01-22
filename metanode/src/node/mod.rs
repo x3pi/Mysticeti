@@ -99,6 +99,7 @@ pub struct ConsensusNode {
     pub(crate) system_transaction_provider: Arc<DefaultSystemTransactionProvider>,
     pub(crate) epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u32)>,
     pub(crate) sync_task_handle: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) executor_client: Option<Arc<ExecutorClient>>,
 }
 
 impl ConsensusNode {
@@ -286,7 +287,7 @@ impl ConsensusNode {
             executor_client_for_init.initialize_from_go().await;
         });
 
-        commit_processor = commit_processor.with_executor_client(executor_client_for_proc);
+        commit_processor = commit_processor.with_executor_client(executor_client_for_proc.clone());
         
         tokio::spawn(async move {
             if let Err(e) = commit_processor.run().await {
@@ -415,6 +416,7 @@ impl ConsensusNode {
             system_transaction_provider,
             epoch_transition_sender: epoch_tx_sender,
             sync_task_handle: None,
+            executor_client: Some(executor_client_for_proc),
         };
 
         crate::epoch_transition::start_epoch_transition_handler(
@@ -501,6 +503,28 @@ impl ConsensusNode {
 
     pub async fn stop_sync_task(&mut self) -> Result<()> {
         sync::stop_sync_task(self).await
+    }
+
+    /// Flush all buffered blocks to Go Master before shutdown
+    /// This ensures no blocks are lost during shutdown
+    pub async fn flush_blocks_to_go_master(&self) -> Result<()> {
+        if let Some(ref executor_client) = self.executor_client {
+            info!("🔄 [SHUTDOWN] Flushing buffered blocks to Go Master...");
+            match executor_client.flush_buffer().await {
+                Ok(_) => {
+                    info!("✅ [SHUTDOWN] Successfully flushed all blocks to Go Master");
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!("⚠️  [SHUTDOWN] Failed to flush blocks to Go Master: {}", e);
+                    // Don't fail shutdown if flush fails - Go will buffer and process sequentially
+                    Ok(())
+                }
+            }
+        } else {
+            info!("ℹ️  [SHUTDOWN] No executor client configured, skipping block flush");
+            Ok(())
+        }
     }
 
     pub async fn transition_to_epoch_from_system_tx(&mut self, new_epoch: u64, new_epoch_timestamp_ms: u64, commit_index: u32, config: &NodeConfig) -> Result<()> {

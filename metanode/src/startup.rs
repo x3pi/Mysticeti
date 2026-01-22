@@ -121,38 +121,31 @@ impl InitializedNode {
 
     /// Run the main event loop
     pub async fn run_main_loop(self) -> Result<()> {
+        // Chỉ cần wait signal, không cần loop sleep
         info!("Press Ctrl+C to stop the node");
-
-        // --- MAIN LOOP ---
-        loop {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received Ctrl+C, initiating shutdown...");
-                    break;
-                }
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
-                    // Just keep the loop alive - epoch transitions are handled via SystemTransactionProvider
-                }
-            }
-        }
-
-        // --- SHUTDOWN CLEANUP ---
+        tokio::signal::ctrl_c().await?;
+        info!("Received Ctrl+C, initiating shutdown...");
         self.shutdown().await
     }
 
     /// Shutdown the node and all servers
+    /// Thứ tự tắt được tối ưu để đảm bảo data integrity:
+    /// 1. Shutdown consensus connections/tasks (để tránh new blocks)
+    /// 2. Flush remaining blocks to Go Master (đảm bảo không mất blocks)
+    /// 3. Shutdown servers (dừng accept new requests)
     pub async fn shutdown(self) -> Result<()> {
         info!("Shutting down node...");
 
-        // Shutdown server handles
-        if let Some(handle) = self.rpc_server_handle {
-            handle.abort();
-        }
-        if let Some(handle) = self.uds_server_handle {
-            handle.abort();
+        // 1. Flush remaining blocks to Go Master FIRST
+        // Đảm bảo tất cả blocks đã commit được gửi sang Go trước khi shutdown consensus
+        if let Ok(mutex) = Arc::try_unwrap(self.node.clone()) {
+            let node = mutex.into_inner();
+            node.flush_blocks_to_go_master().await?;
+        } else {
+            warn!("Could not unwrap node Arc for flushing, forcing shutdown...");
         }
 
-        // Shutdown the node
+        // 2. Shutdown consensus connections/tasks and node
         if let Ok(mutex) = Arc::try_unwrap(self.node) {
             let node = mutex.into_inner();
             node.shutdown().await?;
@@ -160,7 +153,16 @@ impl InitializedNode {
             warn!("Could not unwrap node Arc, forcing shutdown...");
         }
 
-        info!("Node stopped");
+        // 3. Shutdown servers LAST (sau khi đã flush hết blocks)
+        // Dừng accept new requests từ clients
+        if let Some(handle) = self.rpc_server_handle {
+            handle.abort();
+        }
+        if let Some(handle) = self.uds_server_handle {
+            handle.abort();
+        }
+
+        info!("Node stopped gracefully");
         Ok(())
     }
 }
