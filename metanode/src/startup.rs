@@ -61,14 +61,11 @@ impl InitializedNode {
             registry
         };
 
-        let registry_service_arc = registry_service;
-
         // Create the ConsensusNode wrapped in a Mutex for safe concurrent access
         let node = Arc::new(Mutex::new(
             ConsensusNode::new_with_registry_and_service(
                 node_config.clone(),
                 registry,
-                registry_service_arc,
             ).await?
         ));
 

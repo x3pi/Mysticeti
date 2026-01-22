@@ -22,7 +22,7 @@ pub mod proto {
 // All proto files with package "proto" are merged into one proto.rs file
 // So we can use the same proto module for all messages
 
-use proto::{CommittedBlock, CommittedEpochData, TransactionExe, GetActiveValidatorsRequest, GetValidatorsAtBlockRequest, GetCurrentEpochRequest, AdvanceEpochRequest, Request, Response, ValidatorInfo};
+use proto::{CommittedBlock, CommittedEpochData, TransactionExe, GetValidatorsAtBlockRequest, GetCurrentEpochRequest, AdvanceEpochRequest, Request, Response, ValidatorInfo};
 use std::collections::BTreeMap;
 
 /// Client to send committed blocks to Go executor via Unix Domain Socket
@@ -1000,67 +1000,6 @@ impl ExecutorClient {
         unreachable!()
     }
 
-    pub async fn get_active_validators(&self) -> Result<Vec<ValidatorInfo>> {
-        if !self.is_enabled() {
-            return Err(anyhow::anyhow!("Executor client is not enabled"));
-        }
-
-        // Connect to Go request socket if needed
-        if let Err(e) = self.connect_request().await {
-            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
-        }
-
-        // Create GetActiveValidatorsRequest
-        let request = Request {
-            payload: Some(proto::request::Payload::GetActiveValidatorsRequest(
-                GetActiveValidatorsRequest {}
-            )),
-        };
-
-        // Encode request to protobuf bytes
-        let mut request_buf = Vec::new();
-        request.encode(&mut request_buf)?;
-
-        // Send request via UDS (4-byte length prefix, big-endian, like Go's WriteMessage)
-        let mut conn_guard = self.request_connection.lock().await;
-        if let Some(ref mut stream) = *conn_guard {
-            // Write 4-byte length prefix (big-endian)
-            let len = request_buf.len() as u32;
-            let len_bytes = len.to_be_bytes();
-            stream.write_all(&len_bytes).await?;
-            
-            // Write request data
-            stream.write_all(&request_buf).await?;
-            stream.flush().await?;
-            
-            info!("📤 [EXECUTOR-REQ] Sent GetActiveValidatorsRequest to Go (size: {} bytes)", request_buf.len());
-
-            // Read response (4-byte length prefix + response data)
-            use tokio::io::AsyncReadExt;
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).await?;
-            let response_len = u32::from_be_bytes(len_buf) as usize;
-            
-            let mut response_buf = vec![0u8; response_len];
-            stream.read_exact(&mut response_buf).await?;
-            
-            // Decode response
-            let response = Response::decode(&response_buf[..])?;
-            
-            match response.payload {
-                Some(proto::response::Payload::ValidatorInfoList(validator_info_list)) => {
-                    info!("✅ [EXECUTOR-REQ] Received ValidatorInfoList from Go with {} validators", 
-                        validator_info_list.validators.len());
-                    return Ok(validator_info_list.validators);
-                }
-                _ => {
-                    return Err(anyhow::anyhow!("Unexpected response type from Go"));
-                }
-            }
-        } else {
-            return Err(anyhow::anyhow!("Request connection is not available"));
-        }
-    }
 
     /// Get validators at a specific block number from Go state
     /// Used for startup (block 0) and epoch transition (last_global_exec_index)
