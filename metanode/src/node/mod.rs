@@ -9,8 +9,8 @@ use consensus_core::{
     DefaultSystemTransactionProvider, SystemTransactionProvider, // Added SystemTransactionProvider trait
 };
 // Removed unused imports ProtocolKeyPair, NetworkKeyPair
-use crate::transaction::NoopTransactionVerifier;
-use crate::clock_sync::ClockSyncManager;
+use crate::types::transaction::NoopTransactionVerifier;
+use crate::consensus::clock_sync::ClockSyncManager;
 use prometheus::Registry;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
@@ -20,17 +20,20 @@ use tracing::{info, warn, error}; // Added error
 use tokio::sync::RwLock;
 
 use crate::config::NodeConfig;
-use crate::tx_submitter::{TransactionClientProxy, TransactionSubmitter};
-use crate::executor_client::ExecutorClient;
+use crate::node::tx_submitter::{TransactionClientProxy, TransactionSubmitter};
+use crate::node::executor_client::ExecutorClient;
 use consensus_core::storage::rocksdb_store::RocksDBStore;
 use consensus_core::storage::Store; // Added Store trait
 
 // Declare submodules
 pub mod committee;
+pub mod executor_client;
 pub mod queue;
 pub mod recovery;
+pub mod startup;
 pub mod sync;
 pub mod transition;
+pub mod tx_submitter;
 
 /// Node operation modes
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -250,13 +253,13 @@ impl ConsensusNode {
         let committed_transaction_hashes = Arc::new(tokio::sync::Mutex::new(committed_hashes));
         
         let (epoch_tx_sender, epoch_tx_receiver) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, u32)>();
-        let epoch_transition_callback = crate::commit_callbacks::create_epoch_transition_callback(epoch_tx_sender.clone());
+        let epoch_transition_callback = crate::consensus::commit_callbacks::create_epoch_transition_callback(epoch_tx_sender.clone());
         
         let shared_last_global_exec_index = Arc::new(tokio::sync::Mutex::new(last_global_exec_index));
 
-        let mut commit_processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
-            .with_commit_index_callback(crate::commit_callbacks::create_commit_index_callback(current_commit_index.clone()))
-            .with_global_exec_index_callback(crate::commit_callbacks::create_global_exec_index_callback(shared_last_global_exec_index.clone()))
+        let mut commit_processor = crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
+            .with_commit_index_callback(crate::consensus::commit_callbacks::create_commit_index_callback(current_commit_index.clone()))
+            .with_global_exec_index_callback(crate::consensus::commit_callbacks::create_global_exec_index_callback(shared_last_global_exec_index.clone()))
             .with_get_last_global_exec_index({
                 let shared_index = shared_last_global_exec_index.clone();
                 move || {
@@ -432,7 +435,7 @@ impl ConsensusNode {
             committed_transaction_hashes,
         };
 
-        crate::epoch_transition::start_epoch_transition_handler(
+        crate::consensus::epoch_transition::start_epoch_transition_handler(
             epoch_tx_receiver,
             node.system_transaction_provider.clone(),
             config.clone(),

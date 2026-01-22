@@ -6,24 +6,14 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing::info;
 
-mod codec;
+mod consensus;
+mod network;
+mod types;
 mod config;
 mod node;
-mod transaction;
-mod rpc;
-mod tx_socket_server;
-mod executor_client;
-mod commit_processor;
-mod clock_sync;
-mod tx_submitter;
-mod checkpoint;
-mod tx_hash;
-mod startup;
-mod epoch_transition;
-mod commit_callbacks;
 
 use config::NodeConfig;
-use startup::{StartupConfig, InitializedNode};
+use node::startup::{StartupConfig, InitializedNode};
 
 #[derive(Parser)]
 #[command(name = "metanode")]

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
-use crate::tx_submitter::TransactionSubmitter;
+use crate::node::tx_submitter::TransactionSubmitter;
 use crate::node::ConsensusNode;
 use tokio::sync::Mutex;
 
@@ -91,7 +91,7 @@ impl TxSocketServer {
         // Tối ưu cho localhost với throughput cao
         loop {
             // Use the new codec module to read the length-prefixed frame
-            let tx_data_result = crate::codec::read_length_prefixed_frame(&mut stream).await;
+            let tx_data_result = crate::network::codec::read_length_prefixed_frame(&mut stream).await;
 
             let tx_data = match tx_data_result {
                 Ok(data) => data,
@@ -117,7 +117,7 @@ impl TxSocketServer {
             let data_len = tx_data.len();
         
         // 🔍 HASH INTEGRITY CHECK: Calculate actual transaction hash from protobuf data
-        use crate::tx_hash;
+        use crate::types::tx_hash;
         let tx_hash_preview = tx_hash::calculate_transaction_hash_hex(&tx_data);
         let tx_hash_short = if tx_hash_preview.len() >= 16 {
             &tx_hash_preview[..16]
@@ -212,7 +212,7 @@ impl TxSocketServer {
                 // Queue transactions for next epoch
                 info!("📦 [TX FLOW] Queueing {} transactions for next epoch: {}", transactions_to_submit.len(), reason);
                 for tx_data in &transactions_to_submit {
-                    let tx_hash = crate::tx_hash::calculate_transaction_hash_hex(tx_data);
+                    let tx_hash = crate::types::tx_hash::calculate_transaction_hash_hex(tx_data);
                     info!("📦 [TX FLOW] Queueing transaction: hash={}, reason={}", tx_hash, reason);
                     if let Err(e) = node_guard.queue_transaction_for_next_epoch(tx_data.clone()).await {
                         error!("❌ [TX FLOW] Failed to queue transaction: hash={}, error={}", tx_hash, e);
@@ -234,7 +234,7 @@ impl TxSocketServer {
             
             if !should_accept {
                 for tx_data in &transactions_to_submit {
-                    let tx_hash = crate::tx_hash::calculate_transaction_hash_hex(tx_data);
+                    let tx_hash = crate::types::tx_hash::calculate_transaction_hash_hex(tx_data);
                     warn!("🚫 [TX FLOW] Rejecting transaction: hash={}, reason={}", tx_hash, reason);
                 }
                 warn!("🚫 Transaction rejected via UDS: node not ready - {}", reason);

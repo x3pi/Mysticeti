@@ -4,7 +4,7 @@
 use anyhow::Result;
 use tracing::info; // Removed unused warn, error
 use std::sync::Arc;
-use crate::executor_client::ExecutorClient;
+use crate::node::executor_client::ExecutorClient;
 use consensus_core::{storage::rocksdb_store::RocksDBStore, storage::Store}; // Removed load_committed_subdag_from_store
 
 pub async fn perform_block_recovery_check(

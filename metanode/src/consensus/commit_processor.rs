@@ -12,9 +12,9 @@ use tokio::time::sleep;  // [Added] Import sleep for retry mechanism
 use tracing::{info, warn, error, trace};
 use hex;
 
-use crate::checkpoint::calculate_global_exec_index;
-use crate::executor_client::ExecutorClient;
-use crate::tx_hash::calculate_transaction_hash_hex;
+use crate::consensus::checkpoint::calculate_global_exec_index;
+use crate::node::executor_client::ExecutorClient;
+use crate::types::tx_hash::calculate_transaction_hash_hex;
 
 /// Commit processor that ensures commits are executed in order
 pub struct CommitProcessor {
@@ -353,7 +353,7 @@ impl CommitProcessor {
                 queue.push(tx_data.to_vec());
                 queued_count += 1;
 
-                let tx_hash = crate::tx_hash::calculate_transaction_hash(tx_data);
+                let tx_hash = crate::types::tx_hash::calculate_transaction_hash(tx_data);
                 let tx_hash_hex = hex::encode(&tx_hash[..8]);
 
                 info!("📦 [TX FLOW] Queued failed transaction from commit {} block {} tx {}: hash={} (size={})",
@@ -438,7 +438,7 @@ impl CommitProcessor {
                                 let mut tracked_count = 0;
                                 for block in &subdag.blocks {
                                     for tx in block.transactions() {
-                                        let tx_hash = crate::tx_hash::calculate_transaction_hash(tx.data());
+                                        let tx_hash = crate::types::tx_hash::calculate_transaction_hash(tx.data());
                                         let hash_hex = hex::encode(&tx_hash);
 
                                         // Special debug logging for the problematic transaction

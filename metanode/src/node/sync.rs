@@ -6,7 +6,7 @@ use tracing::{info, trace}; // Removed unused warn
 use std::sync::Arc;
 use std::time::Duration;
 use crate::config::NodeConfig;
-use crate::executor_client::ExecutorClient;
+use crate::node::executor_client::ExecutorClient;
 use crate::node::{ConsensusNode, NodeMode};
 
 pub async fn start_sync_task(node: &mut ConsensusNode, config: &NodeConfig) -> Result<()> {

@@ -8,7 +8,7 @@ use std::path::Path;
 use std::io::{Write, Read};
 use consensus_core::SystemTransaction;
 use crate::node::ConsensusNode;
-use crate::tx_submitter::TransactionSubmitter; // Added TransactionSubmitter trait
+use crate::node::tx_submitter::TransactionSubmitter; // Added TransactionSubmitter trait
 
 pub async fn queue_transaction(
     pending_queue: &Mutex<Vec<Vec<u8>>>,
@@ -87,7 +87,7 @@ pub async fn submit_queued_transactions(node: &mut ConsensusNode) -> Result<usiz
     let mut skipped_duplicates = 0;
 
     for tx_data in &*queue {
-        let tx_hash = crate::tx_hash::calculate_transaction_hash(tx_data);
+        let tx_hash = crate::types::tx_hash::calculate_transaction_hash(tx_data);
         if committed_hashes.contains(&tx_hash) {
             skipped_duplicates += 1;
             let hash_hex = hex::encode(&tx_hash);
@@ -99,7 +99,7 @@ pub async fn submit_queued_transactions(node: &mut ConsensusNode) -> Result<usiz
 
     // Dedup among remaining transactions
     let mut transactions_with_hash: Vec<(Vec<u8>, Vec<u8>)> = filtered_transactions.into_iter()
-        .map(|tx| (tx.clone(), crate::tx_hash::calculate_transaction_hash(&tx)))
+        .map(|tx| (tx.clone(), crate::types::tx_hash::calculate_transaction_hash(&tx)))
         .collect();
 
     transactions_with_hash.sort_by(|(_, a), (_, b)| a.cmp(b));
@@ -115,7 +115,7 @@ pub async fn submit_queued_transactions(node: &mut ConsensusNode) -> Result<usiz
     let mut requeued_count = 0;
 
     for tx_data in transactions {
-        if SystemTransaction::from_bytes(&tx_data).is_ok() || !crate::tx_hash::verify_transaction_protobuf(&tx_data) {
+        if SystemTransaction::from_bytes(&tx_data).is_ok() || !crate::types::tx_hash::verify_transaction_protobuf(&tx_data) {
             continue;
         }
 

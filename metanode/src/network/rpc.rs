@@ -7,8 +7,8 @@ use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{info, error, warn};
-use crate::tx_submitter::TransactionSubmitter;
-use crate::tx_hash::calculate_transaction_hash_hex;
+use crate::node::tx_submitter::TransactionSubmitter;
+use crate::types::tx_hash::calculate_transaction_hash_hex;
 
 /// Simple HTTP RPC server for submitting transactions
 /// Supports both HTTP POST and length-prefixed binary protocols
@@ -141,7 +141,7 @@ impl RpcServer {
                             info!("📥 [TX FLOW] Reading {} bytes of transaction data from {:?}...", data_len, peer_addr);
 
                             // Use the new codec module to read the frame with timeout
-                            let tx_data_result = crate::codec::read_length_prefixed_frame_with_timeout(
+                            let tx_data_result = crate::network::codec::read_length_prefixed_frame_with_timeout(
                                 &mut stream,
                                 std::time::Duration::from_secs(10), // Timeout for data reading
                             ).await;

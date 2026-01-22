@@ -734,7 +734,7 @@ impl ExecutorClient {
                 
                 // 🔍 HASH INTEGRITY CHECK: Verify transaction data integrity by calculating hash
                 // This ensures data hasn't been modified during consensus
-                use crate::tx_hash::calculate_transaction_hash;
+                use crate::types::tx_hash::calculate_transaction_hash;
                 let tx_hash = calculate_transaction_hash(tx_data);
                 let tx_hash_hex = hex::encode(&tx_hash[..8.min(tx_hash.len())]);
                 let tx_hash_full_hex = hex::encode(&tx_hash);
@@ -768,7 +768,7 @@ impl ExecutorClient {
 
                 // CRITICAL: Verify transaction data is valid protobuf before sending to Go
                 // Go executor expects protobuf Transactions or Transaction message
-                use crate::tx_hash::verify_transaction_protobuf;
+                use crate::types::tx_hash::verify_transaction_protobuf;
                 // #region agent log
                 {
                     use std::io::Write;

@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use consensus_config::{Authority, AuthorityPublicKey, Committee, NetworkPublicKey, ProtocolPublicKey};
-use crate::executor_client::ExecutorClient;
+use crate::node::executor_client::ExecutorClient;
 use std::sync::Arc;
 use tracing::info;
 use mysten_network::Multiaddr;
@@ -67,7 +67,7 @@ pub async fn build_committee_from_go_validators_at_block_with_epoch(
 }
 
 pub fn build_committee_from_validator_list(
-    validators: Vec<crate::executor_client::proto::ValidatorInfo>,
+    validators: Vec<crate::node::executor_client::proto::ValidatorInfo>,
     epoch: u64,
 ) -> Result<Committee> {
     let mut sorted_validators: Vec<_> = validators.into_iter().collect();

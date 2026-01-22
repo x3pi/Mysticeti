@@ -11,8 +11,8 @@ use prometheus::Registry;
 
 use crate::config::NodeConfig;
 use crate::node::ConsensusNode;
-use crate::rpc::RpcServer;
-use crate::tx_socket_server::TxSocketServer;
+use crate::network::rpc::RpcServer;
+use crate::network::tx_socket_server::TxSocketServer;
 
 /// Startup configuration and initialization
 pub struct StartupConfig {

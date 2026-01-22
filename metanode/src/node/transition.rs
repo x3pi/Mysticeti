@@ -8,12 +8,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::config::NodeConfig;
-use crate::executor_client::ExecutorClient;
+use crate::node::executor_client::ExecutorClient;
 use crate::node::{ConsensusNode, NodeMode};
 use consensus_core::{ConsensusAuthority, NetworkType, CommitConsumerArgs, SystemTransactionProvider}; // Removed unused ReconfigState, DefaultSystemTransactionProvider
 use prometheus::Registry;
 use tokio::time::sleep;
-use crate::tx_submitter::TransactionSubmitter; // Added TransactionSubmitter trait
+use crate::node::tx_submitter::TransactionSubmitter; // Added TransactionSubmitter trait
 // Removed unused RocksDBStore import
 
 pub async fn transition_to_epoch_from_system_tx(
@@ -60,7 +60,7 @@ pub async fn transition_to_epoch_from_system_tx(
     info!("📊 Snapshot: Last committed block from Go: {}", synced_index);
 
     // Deterministic calc for verification only - should match Go's last block
-    let calculated_last_block = crate::checkpoint::calculate_global_exec_index(
+    let calculated_last_block = crate::consensus::checkpoint::calculate_global_exec_index(
         node.current_epoch, commit_index, node.last_global_exec_index
     );
 
@@ -116,7 +116,7 @@ pub async fn transition_to_epoch_from_system_tx(
 
     // Setup new processor
     let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
-    let epoch_cb = crate::commit_callbacks::create_epoch_transition_callback(node.epoch_transition_sender.clone());
+    let epoch_cb = crate::consensus::commit_callbacks::create_epoch_transition_callback(node.epoch_transition_sender.clone());
     
     let exec_client_proc = if node.executor_commit_enabled {
         Some(Arc::new(ExecutorClient::new_with_initial_index(
@@ -124,9 +124,9 @@ pub async fn transition_to_epoch_from_system_tx(
         )))
     } else { None };
 
-    let mut processor = crate::commit_processor::CommitProcessor::new(commit_receiver)
-        .with_commit_index_callback(crate::commit_callbacks::create_commit_index_callback(node.current_commit_index.clone()))
-        .with_global_exec_index_callback(crate::commit_callbacks::create_global_exec_index_callback(node.shared_last_global_exec_index.clone()))
+    let mut processor = crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
+        .with_commit_index_callback(crate::consensus::commit_callbacks::create_commit_index_callback(node.current_commit_index.clone()))
+        .with_global_exec_index_callback(crate::consensus::commit_callbacks::create_global_exec_index_callback(node.shared_last_global_exec_index.clone()))
         .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
         .with_epoch_info(new_epoch, synced_index)
         .with_is_transitioning(node.is_transitioning.clone())
@@ -161,7 +161,7 @@ pub async fn transition_to_epoch_from_system_tx(
         if let Some(proxy) = &node.transaction_client_proxy {
             proxy.set_client(auth.transaction_client()).await;
         } else {
-             node.transaction_client_proxy = Some(Arc::new(crate::tx_submitter::TransactionClientProxy::new(auth.transaction_client())));
+             node.transaction_client_proxy = Some(Arc::new(crate::node::tx_submitter::TransactionClientProxy::new(auth.transaction_client())));
         }
     } else {
         node.transaction_client_proxy = None;
@@ -285,7 +285,7 @@ async fn recover_epoch_pending_transactions(
 
     // Filter out transactions that were already committed in the previous epoch
     for tx_data in epoch_pending.iter() {
-        let tx_hash = crate::tx_hash::calculate_transaction_hash(tx_data);
+        let tx_hash = crate::types::tx_hash::calculate_transaction_hash(tx_data);
         let hash_hex = hex::encode(&tx_hash);
 
         // Special debug logging for the problematic transaction
@@ -329,7 +329,7 @@ async fn recover_epoch_pending_transactions(
 
     for tx_data in transactions_to_recover {
         if let Some(proxy) = &node.transaction_client_proxy {
-            let tx_hash = crate::tx_hash::calculate_transaction_hash(&tx_data);
+            let tx_hash = crate::types::tx_hash::calculate_transaction_hash(&tx_data);
             let hash_hex = hex::encode(&tx_hash);
 
             match proxy.submit(vec![tx_data.clone()]).await {
