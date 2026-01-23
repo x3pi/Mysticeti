@@ -39,16 +39,7 @@ generate_address() {
 }
 
 # Function to generate a random BLS key for authority key
-generate_bls_authority_key() {
-    local node_id="$1"
-    # Generate deterministic BLS keys based on node_id for testing
-    case $node_id in
-        0) echo "o2/6dk0VXG9p8u1y1wwlFCUrskqxhpRCtRffBN6hPgyGSDYg11cf9k9G28zF8+rhEvyrF1zx1lwbdkCNohtsGSZkmDrfqdpoHiRIJl2C2qOFTHX0FV/UOaB6NweAGdzl" ;;
-        1) echo "sC5pYcq+J6QD4Oeb/SgxEWgmmw69VH2t1MjDe0Gwc8cCCzmp7le4GtqD3W9ow+pIDGLcVYqDlo9PeifTMNaHv41TeWLjsO8kEHNg/R3sXkEAVEKbGQJ0dn5r5xXwvftg" ;;
-        2) echo "qguXR7WYJyn+pXssbkMVgv24XmDjqrTb/0Mr10WNH0Iot+k0fhK91MY2ddvBA7RgEMNKLy3au7ymM/Ycixl6Nk8waQrGIR8LR3pHeHjB5U0QslzjZD/fImd6ZqBrNTGR" ;;
-        3) echo "rrLpSlaNHvS7B4Fka3ym6n8oSR+Qnz4jE7DQjdVlAonIfO+Gu8G6bId8mkCWvfYGA+K2NsSs2wcxG6rdqVYAIQlVN1usAEY12G3VN2SZ9APnVhU3NPqyJG1IyrGbfjRI" ;;
-    esac
-}
+
 
 # Get current timestamp in milliseconds for epoch_timestamp_ms
 CURRENT_TIMESTAMP_MS=$(python3 -c "import time; print(int(time.time() * 1000))" 2>/dev/null || echo "$(date +%s)000")
@@ -72,8 +63,27 @@ for i in 0 1 2 3; do
     PROTOCOL_KEY_FILE="$RUST_CONFIG_DIR/node_${i}_protocol_key.json"
     NETWORK_KEY_FILE="$RUST_CONFIG_DIR/node_${i}_network_key.json"
 
-    # Generate BLS authority key (deterministic based on node_id)
-    AUTHORITY_KEY=$(generate_bls_authority_key $i)
+    # Read Authority Key from committee.json (using Python for reliability)
+    COMMITTEE_FILE="$RUST_CONFIG_DIR/committee.json"
+    if [ ! -f "$COMMITTEE_FILE" ]; then
+        echo "ERROR: committee.json not found in $RUST_CONFIG_DIR" >&2
+        exit 1
+    fi
+
+    # Extract authority key for node i
+    AUTHORITY_KEY=$(python3 -c "import json, sys; 
+try:
+    with open('$COMMITTEE_FILE') as f:
+        data = json.load(f)
+        # Find authority with specific hostname or index? 
+        # Usually authorities array index matches node_id, but let's be safe if possible.
+        # Assuming index matches because that's how it's generated.
+        if $i < len(data['authorities']):
+            print(data['authorities'][$i]['authority_key'])
+        else:
+            sys.exit(1)
+except Exception as e:
+    sys.exit(1)" 2>/dev/null)
 
     PROTOCOL_KEY=$(extract_key "$PROTOCOL_KEY_FILE")
     NETWORK_KEY=$(extract_key "$NETWORK_KEY_FILE")

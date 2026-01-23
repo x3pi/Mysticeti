@@ -184,6 +184,11 @@ def sync_committee_to_genesis(committee_path: str, genesis_path: str):
         committee['total_stake'] = final_genesis.get('total_stake', 4)
         committee['quorum_threshold'] = final_genesis.get('quorum_threshold', 3)
         committee['validity_threshold'] = final_genesis.get('validity_threshold', 2)
+        
+        # CRITICAL: Sync epoch_timestamp_ms to committee to ensure Genesis Hash matches
+        if 'config' in final_genesis and 'epoch_timestamp_ms' in final_genesis['config']:
+            committee['epoch_timestamp_ms'] = final_genesis['config']['epoch_timestamp_ms']
+            print(f"   📅 Synced epoch_timestamp_ms to committee: {committee['epoch_timestamp_ms']}")
 
         # Update stake cho từng authority
         for idx, authority in enumerate(committee.get('authorities', [])):
@@ -200,7 +205,7 @@ def sync_committee_to_genesis(committee_path: str, genesis_path: str):
         with open(committee_path, 'w') as f:
             json.dump(committee, f, indent=2)
 
-        print(f"✅ Updated committee.json with correct stake and thresholds")
+        print(f"✅ Updated committee.json with correct stake, thresholds, and timestamp")
         print(f"   📊 Committee total_stake: {committee.get('total_stake')}")
         print(f"   📊 Committee quorum_threshold: {committee.get('quorum_threshold')}")
         print(f"   📊 Committee validity_threshold: {committee.get('validity_threshold')}")
