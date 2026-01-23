@@ -921,11 +921,14 @@ impl ExecutorClient {
         // Create CommittedEpochData message using generated protobuf code
         // CRITICAL FORK-SAFETY: Include global_exec_index and commit_index for deterministic ordering
         // EPOCH TRACKING: Include epoch number for block header population in Go Master
+        // CRITICAL FORK-SAFETY: Include commit_timestamp_ms for deterministic block hashes
+        // Go Master MUST use this timestamp for BlockHeader instead of time.Now()
         let epoch_data = CommittedEpochData {
             blocks,
             global_exec_index,
             commit_index: subdag.commit_ref.index as u32,
             epoch,
+            commit_timestamp_ms: subdag.timestamp_ms, // Consensus timestamp from Linearizer::calculate_commit_timestamp()
         };
         
         // Encode to protobuf bytes using prost::Message::encode

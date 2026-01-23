@@ -28,5 +28,10 @@ message CommittedEpochData {
     uint32 commit_index = 3;
     // EPOCH TRACKING: epoch number for this commit, used to populate BlockHeader.Epoch
     uint64 epoch = 4;
+    // CRITICAL FORK-SAFETY: Consensus timestamp (median stake-weighted) for deterministic block hashes
+    // This timestamp is calculated by Rust Linearizer::calculate_commit_timestamp()
+    // Go Master MUST use this timestamp for BlockHeader instead of time.Now()
+    // Unit: milliseconds since Unix epoch
+    uint64 commit_timestamp_ms = 5;
 }
 
