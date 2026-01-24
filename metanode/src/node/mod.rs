@@ -363,42 +363,35 @@ impl ConsensusNode {
                            local_go_block, peer_last_block);
                     // Force use of Peer Index to abandon local fork
                     peer_last_block
-                } else if local_go_block < peer_last_block.saturating_sub(1000) {
+                } else if local_go_block < peer_last_block.saturating_sub(5) {
+                    // LOCAL IS BEHIND PEERS
+                    // CRITICAL FIX: Use local_go_block as the baseline to ensure recovery backfills missing blocks.
+                    // If we jump to peer_last_block, we skip local recovery and Go Master will buffer forever.
                     info!(
-                        "ℹ️ [STARTUP] Local is behind Peer. Using Local {} to ensure continuity.",
-                        local_go_block
+                        "ℹ️ [STARTUP] Local Go Master ({}) is behind Peer ({}) by {} blocks. Using Local {} to trigger recovery/backfill.",
+                        local_go_block, peer_last_block, peer_last_block - local_go_block, local_go_block
                     );
                     local_go_block
                 } else {
-                    // Close enough, trust Peer as it's the network tip we synced epoch from
-                    if peer_last_block > local_go_block {
-                        info!(
-                            "✅ [STARTUP] Using Peer Index {} (ahead of local {})",
-                            peer_last_block, local_go_block
-                        );
-                        peer_last_block
-                    } else {
-                        // CRITICAL FIX: If Persisted > LocalGo, use Persisted to maintain continuity
-                        if persisted_index > local_go_block {
-                            warn!("⚠️ [STARTUP] Persisted Index {} > Local Go {}, using Persisted to prevent ID collision. (Go is behind)", persisted_index, local_go_block);
-                            persisted_index
-                        } else {
-                            local_go_block
-                        }
-                    }
+                    // Close enough or local is slightly ahead/behind within tolerance
+                    // Trust Local Go as authoritative source for execution state
+                    info!(
+                        "✅ [STARTUP] Local and Peer are in sync (Local={}, Peer={}). Using Local Go as authoritative.",
+                        local_go_block, peer_last_block
+                    );
+                    local_go_block
                 }
             } else {
                 // No peer reference
                 if persisted_index > local_go_block {
-                    warn!("⚠️ [STARTUP] Persisted Index {} > Local Go {}, using Persisted to prevent ID collision.", persisted_index, local_go_block);
-                    persisted_index
-                } else {
-                    info!(
-                        "📊 [STARTUP] No peer reference, using Local Go Last Block: {}",
-                        local_go_block
-                    );
-                    local_go_block
+                    warn!("⚠️ [STARTUP] Persisted Index {} > Local Go {}. Go is behind (possible rollback/crash). Using Local Go {} to force resync/replay.", 
+                        persisted_index, local_go_block, local_go_block);
                 }
+                info!(
+                    "📊 [STARTUP] No peer reference, using Local Go Last Block: {}",
+                    local_go_block
+                );
+                local_go_block
             }
         } else {
             0
@@ -442,6 +435,7 @@ impl ConsensusNode {
             recovery::perform_block_recovery_check(
                 &executor_client,
                 last_global_exec_index,
+                epoch_base_exec_index,
                 current_epoch,
                 &config.storage_path,
                 config.node_id as u32,
