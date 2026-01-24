@@ -312,18 +312,38 @@ impl ConsensusNode {
         // EXECUTION INDEX SYNC
         // GO-AUTHORITATIVE STRATEGY with local persistence fallback
         // Priority: Go's last_block_number (authoritative) with local persistence as safety net
+
+        // 1. Get Local Go Tip
+        let local_go_block = if config.executor_read_enabled {
+            executor_client.get_last_block_number().await.unwrap_or(0)
+        } else {
+            0
+        };
+
+        // 2. Get Persisted Tip + Commit Index (for base calculation)
+        let (persisted_index, persisted_commit) = if config.executor_read_enabled {
+            executor_client::load_persisted_last_index(&storage_path).unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+
+        // 3. Get Peer Tip (if available)
+        let peer_last_block = if config.executor_read_enabled
+            && best_socket != config.executor_receive_socket_path
+            && peer_last_block > 0
+        {
+            peer_last_block
+        } else {
+            0
+        };
+
+        // DECISION LOGIC: Determine "Effective Tip" (last_global_exec_index)
+        // This is used for ExecutorClient's next_expected (Replay Protection)
         let last_global_exec_index = if config.executor_read_enabled {
-            let local_go_block = executor_client.get_last_block_number().await.unwrap_or(0);
-
-            // Also check for persisted index from previous run
-            let persisted_index =
-                executor_client::load_persisted_last_index(&storage_path).unwrap_or(0);
-
-            // Check if we have a valid peer reference from startup scan
-            if best_socket != config.executor_receive_socket_path && peer_last_block > 0 {
+            if peer_last_block > 0 {
                 info!(
-                    "📊 [STARTUP] Sync Check: LocalGo={}, Peer={}, Persisted={} (from {})",
-                    local_go_block, peer_last_block, persisted_index, best_socket
+                    "📊 [STARTUP] Sync Check: LocalGo={}, Peer={}, Persisted=({}, commit={}) (from {})",
+                    local_go_block, peer_last_block, persisted_index, persisted_commit, best_socket
                 );
 
                 // PRODUCTION SAFETY: Cross-validate all sources
@@ -344,13 +364,6 @@ impl ConsensusNode {
                     // Force use of Peer Index to abandon local fork
                     peer_last_block
                 } else if local_go_block < peer_last_block.saturating_sub(1000) {
-                    // Way behind? Use peer index as target?
-                    // No, if we are behind, we should use local index and let catchup handle it?
-                    // But catchup is for consensus.
-                    // If we tell consensus we are at 1272 (peer), but we are at 0, consensus starts at 1273.
-                    // This creates gap 0..1272.
-                    // BUT Go execution sync should fill it?
-                    // Let's rely on Local if behind, but Peer if Forked.
                     info!(
                         "ℹ️ [STARTUP] Local is behind Peer. Using Local {} to ensure continuity.",
                         local_go_block
@@ -366,9 +379,6 @@ impl ConsensusNode {
                         peer_last_block
                     } else {
                         // CRITICAL FIX: If Persisted > LocalGo, use Persisted to maintain continuity
-                        // If we use LocalGo (which is behind), we will generate new blocks with old IDs!
-                        // Example: Sent 100, Go executed 95. Restart. If we pick 95, next is 96.
-                        // But 96..100 were already sent. 96 would be a duplicate ID for different content.
                         if persisted_index > local_go_block {
                             warn!("⚠️ [STARTUP] Persisted Index {} > Local Go {}, using Persisted to prevent ID collision. (Go is behind)", persisted_index, local_go_block);
                             persisted_index
@@ -403,6 +413,29 @@ impl ConsensusNode {
                 last_global_exec_index
             );
         }
+
+        // CALCULATE EPOCH BASE INDEX (Fix for Double-Counting Bug)
+        // Global = Base + CommitIndex
+        // Base = Global - CommitIndex
+        // We use the Persisted Pair for this because it's a guaranteed valid (Global, Commit) sample
+        let epoch_base_exec_index = if persisted_commit > 0
+            && persisted_index >= persisted_commit as u64
+        {
+            let base = persisted_index - persisted_commit as u64;
+            info!(
+                "✅ [STARTUP] Calculated Epoch Base Index: {} (Persisted: Global={}, Commit={})",
+                base, persisted_index, persisted_commit
+            );
+            base
+        } else {
+            // Fallback: If no persisted commit index (legacy), we assume last_global_exec_index is the Base?
+            // OR we assume commit index is 0?
+            // If we are restarting, and we don't have commit index, we risk the bug.
+            // But if we have 0, then Base = Tip. This is the old behavior.
+            warn!("⚠️ [STARTUP] Could not calculate Epoch Base (Persisted: Global={}, Commit={}). Using Tip {} as Base (Legacy/Fallback).", 
+                persisted_index, persisted_commit, last_global_exec_index);
+            last_global_exec_index
+        };
 
         // Recovery check
         if config.executor_read_enabled && last_global_exec_index > 0 {
@@ -470,8 +503,19 @@ impl ConsensusNode {
                 epoch_tx_sender.clone(),
             );
 
+        // CRITICAL: Initialize shared index with BASE for correct generation
+        // But CommitProcessor updates it... is it Base or Tip?
+        // checkpoint::calculate_global_exec_index(..., last) -> last + 1.
+        // So we need to provide the Previous Global Index.
+        // If we are replaying 1..N.
+        // Block 1 needs Base.
+        // Block 2 needs Base + 1.
+        // So shared_last_global_exec_index must start at BASE.
+        // BUT CommitProcessor updates it after each commit.
+        // If we replay Commit 3813, it will update to Base + 3813.
+        // Which matches Tip. Correct.
         let shared_last_global_exec_index =
-            Arc::new(tokio::sync::Mutex::new(last_global_exec_index));
+            Arc::new(tokio::sync::Mutex::new(epoch_base_exec_index));
 
         // Note: We do NOT read initial_commit_index from DB (per user request).
         // CommitProcessor has "Auto-Jump" logic to detect stream start index.
@@ -502,11 +546,13 @@ impl ConsensusNode {
             }
         })
         .with_shared_last_global_exec_index(shared_last_global_exec_index.clone())
-        .with_epoch_info(current_epoch, last_global_exec_index)
+        .with_epoch_info(current_epoch, epoch_base_exec_index) // Start from BASE
         .with_is_transitioning(is_transitioning.clone())
         .with_pending_transactions_queue(pending_transactions_queue.clone())
         .with_epoch_transition_callback(epoch_transition_callback);
 
+        // INITIAL_NEXT_EXPECTED: This is for Replay Protection
+        // It should be TIP + 1 (what Go expects next)
         let initial_next_expected = if config.executor_read_enabled {
             last_global_exec_index + 1
         } else {
