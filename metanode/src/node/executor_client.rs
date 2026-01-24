@@ -113,7 +113,29 @@ impl ExecutorClient {
         }
         
         // Query Go Master for last block number (only once at startup)
-        if let Ok(last_block_number) = self.get_last_block_number().await {
+        let last_block_number_opt = match self.get_last_block_number().await {
+            Ok(n) => Some(n),
+            Err(e) => {
+                warn!("⚠️  [INIT] Failed to get last block number from Go Master: {}. Attempting to read persisted value.", e);
+                // Fallback to persisted last block number if available
+                if let Some(ref storage_path) = self.storage_path {
+                    match read_last_block_number(storage_path).await {
+                        Ok(n) => {
+                            info!("📊 [INIT] Loaded persisted last block number {}", n);
+                            Some(n)
+                        }
+                        Err(e) => {
+                            warn!("⚠️  [INIT] No persisted last block number available: {}.", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(last_block_number) = last_block_number_opt {
             let go_next_expected = last_block_number + 1;
             let current_next_expected = {
                 let next_expected_guard = self.next_expected_index.lock().await;
@@ -152,7 +174,7 @@ impl ExecutorClient {
                     last_block_number, current_next_expected);
             }
         } else {
-            warn!("⚠️  [INIT] Failed to get last block number from Go Master. Keeping current next_expected_index. Rust will continue sending blocks, Go will buffer and process sequentially.");
+            warn!("⚠️  [INIT] Could not determine last block number. Keeping current next_expected_index. Rust will continue sending blocks, Go will buffer and process sequentially.");
         }
     }
 
@@ -1594,6 +1616,14 @@ impl ExecutorClient {
                 Some(proto::response::Payload::LastBlockNumberResponse(res)) => {
                     let last_block_number = res.last_block_number;
                     info!("✅ [EXECUTOR-REQ] Received LastBlockNumberResponse: last_block_number={}", last_block_number);
+                    
+                    // Persist for crash recovery
+                    if let Some(ref storage_path) = self.storage_path {
+                        if let Err(e) = persist_last_block_number(storage_path, last_block_number).await {
+                            warn!("⚠️ [PERSIST] Failed to persist last block number {}: {}", last_block_number, e);
+                        }
+                    }
+                    
                     return Ok(last_block_number);
                 }
                 Some(proto::response::Payload::Error(error_msg)) => {
@@ -1661,6 +1691,33 @@ pub async fn persist_last_sent_index(storage_path: &Path, index: u64) -> Result<
     Ok(())
 }
 
+// Persist the last block number retrieved from Go for crash recovery
+pub async fn persist_last_block_number(storage_path: &Path, block_number: u64) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let persist_dir = storage_path.join("executor_state");
+    std::fs::create_dir_all(&persist_dir)?;
+    let temp_path = persist_dir.join("last_block_number.tmp");
+    let final_path = persist_dir.join("last_block_number.bin");
+    let mut file = tokio::fs::File::create(&temp_path).await?;
+    file.write_all(&block_number.to_le_bytes()).await?;
+    file.flush().await?;
+    file.sync_all().await?;
+    drop(file);
+    std::fs::rename(&temp_path, &final_path)?;
+    trace!("💾 [PERSIST] Saved last_block_number={} to {:?}", block_number, final_path);
+    Ok(())
+}
+
+// Read persisted last block number, if any
+pub async fn read_last_block_number(storage_path: &Path) -> Result<u64> {
+    use tokio::io::AsyncReadExt;
+    let persist_dir = storage_path.join("executor_state");
+    let final_path = persist_dir.join("last_block_number.bin");
+    let mut file = tokio::fs::File::open(&final_path).await?;
+    let mut buf = [0u8; 8];
+    file.read_exact(&mut buf).await?;
+    Ok(u64::from_le_bytes(buf))
+}
 /// Load persisted last sent index from file
 /// Returns None if file doesn't exist or is corrupted
 pub fn load_persisted_last_index(storage_path: &Path) -> Option<u64> {
@@ -1689,3 +1746,5 @@ pub fn load_persisted_last_index(storage_path: &Path) -> Option<u64> {
         }
     }
 }
+
+

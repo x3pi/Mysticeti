@@ -141,13 +141,19 @@ impl ConsensusNode {
             false,
             config.executor_send_socket_path.clone(),
             config.executor_receive_socket_path.clone(),
-            None, // Read-only client, no persistence needed
+            Some(config.storage_path.clone()), // Enable persistence for readout client
         ));
 
-        let latest_block_number = executor_client
-            .get_last_block_number()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch latest block from Go: {}", e))?;
+        let latest_block_number = match executor_client.get_last_block_number().await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("⚠️ [STARTUP] Failed to fetch latest block from Go: {}. Attempting to read persisted value.", e);
+                // Fallback to persisted last block number
+                executor_client::read_last_block_number(&config.storage_path)
+                    .await
+                    .unwrap_or(0)
+            }
+        };
 
         // PEER EPOCH DISCOVERY: Query multiple Go Masters to get correct epoch
         // This handles cases where the local Go Master has stale data after restart
@@ -359,15 +365,30 @@ impl ConsensusNode {
                         );
                         peer_last_block
                     } else {
-                        local_go_block
+                        // CRITICAL FIX: If Persisted > LocalGo, use Persisted to maintain continuity
+                        // If we use LocalGo (which is behind), we will generate new blocks with old IDs!
+                        // Example: Sent 100, Go executed 95. Restart. If we pick 95, next is 96.
+                        // But 96..100 were already sent. 96 would be a duplicate ID for different content.
+                        if persisted_index > local_go_block {
+                            warn!("⚠️ [STARTUP] Persisted Index {} > Local Go {}, using Persisted to prevent ID collision. (Go is behind)", persisted_index, local_go_block);
+                            persisted_index
+                        } else {
+                            local_go_block
+                        }
                     }
                 }
             } else {
-                info!(
-                    "📊 [STARTUP] No peer reference, using Local Go Last Block: {}",
+                // No peer reference
+                if persisted_index > local_go_block {
+                    warn!("⚠️ [STARTUP] Persisted Index {} > Local Go {}, using Persisted to prevent ID collision.", persisted_index, local_go_block);
+                    persisted_index
+                } else {
+                    info!(
+                        "📊 [STARTUP] No peer reference, using Local Go Last Block: {}",
+                        local_go_block
+                    );
                     local_go_block
-                );
-                local_go_block
+                }
             }
         } else {
             0
