@@ -121,7 +121,95 @@ impl InitializedNode {
 
     /// Run the main event loop
     pub async fn run_main_loop(self) -> Result<()> {
-        // Chỉ cần wait signal, không cần loop sleep
+        // --- [SYNC-BEFORE-CONSENSUS] ---
+        // Block startup until we catch up with the network
+        // This prevents the node from proposing blocks on a fork or when behind
+        let catchup_manager = {
+            let node_guard = self.node.lock().await;
+            if let Some(client) = node_guard.executor_client.clone() {
+                Some(crate::node::catchup::CatchupManager::new(client))
+            } else {
+                warn!("⚠️ [STARTUP] No executor client available, skipping catchup check");
+                None
+            }
+        };
+
+        if let Some(cm) = catchup_manager {
+            info!("⏳ [STARTUP] Verifying sync status before joining consensus...");
+            let check_interval = std::time::Duration::from_secs(2);
+            let timeout = std::time::Duration::from_secs(600); // 10 minutes timeout
+            let start = std::time::Instant::now();
+            
+            // Force SyncingUp mode while waiting
+            {
+                let mut node_guard = self.node.lock().await;
+                if node_guard.node_mode == crate::node::NodeMode::Validator {
+                     info!("🔄 [STARTUP] Switching to SyncingUp mode while waiting for catchup");
+                     node_guard.node_mode = crate::node::NodeMode::SyncingUp;
+                }
+            }
+
+            loop {
+                // Check timeout
+                if start.elapsed() > timeout {
+                    warn!("⚠️ [STARTUP] Catchup timed out after 600s. Forcing start (risky).");
+                    break;
+                }
+
+                // Get current local state
+                let (local_epoch, local_commit) = {
+                    let node = self.node.lock().await;
+                    // RocksDBStore read is expensive? No, we use in-memory counters if available?
+                    // ConsensusNode has current_commit_index (AtomicU32) but we need u64 mapping?
+                    // Let's use current_epoch.
+                    // Commit index is trickier. Let's assume passed 0 for now as catchup checks Epoch primarily.
+                    // But for Commit sync, we need local commit.
+                    // Use commit_processor's tracked index?
+                    // Node has `current_commit_index` (AtomicU32).
+                    (node.current_epoch, node.current_commit_index.load(std::sync::atomic::Ordering::Relaxed) as u64)
+                };
+
+                match cm.check_sync_status(local_epoch, local_commit).await {
+                    Ok(status) => {
+                        if status.ready {
+                            info!("✅ [STARTUP] Node is synced (gap={}). Joining consensus!", status.commit_gap);
+                            break;
+                        }
+                        
+                        if status.epoch_match {
+                            info!("🔄 [CATCHUP] Syncing commits: Local={}, Network={}, Gap={}", 
+                                  local_commit, status.go_last_block, status.commit_gap);
+                        } else {
+                            info!("🔄 [CATCHUP] Syncing epoch: Local={}, Network={}", 
+                                  local_epoch, status.go_epoch);
+                        }
+                    },
+                    Err(e) => {
+                        warn!("⚠️ [STARTUP] Failed to check sync status: {}", e);
+                    }
+                }
+
+                tokio::time::sleep(check_interval).await;
+            }
+
+            // Restore Validator mode
+            {
+                let mut node_guard = self.node.lock().await;
+                // Only switch if we intended to be a validator (based on committee)
+                // We re-run check_and_update_node_mode to determine correct mode
+                let config = node_guard.protocol_config.clone(); // Need config... wait, protocol_config is strict.
+                // We need NodeConfig. It is not stored in ConsensusNode except parts.
+                // But we can just set to Validator if it was SyncingUp.
+                // Actually, check_and_update_node_mode requires Committee and NodeConfig.
+                // We don't have them easily here.
+                // Simpler: Set to Validator.
+                if node_guard.node_mode == crate::node::NodeMode::SyncingUp {
+                     info!("✅ [STARTUP] Switching to Validator mode");
+                     node_guard.node_mode = crate::node::NodeMode::Validator;
+                }
+            }
+        }
+
         info!("Press Ctrl+C to stop the node");
         tokio::signal::ctrl_c().await?;
         info!("Received Ctrl+C, initiating shutdown...");
@@ -136,30 +224,29 @@ impl InitializedNode {
     pub async fn shutdown(self) -> Result<()> {
         info!("Shutting down node...");
 
-        // 1. Flush remaining blocks to Go Master FIRST
-        // Đảm bảo tất cả blocks đã commit được gửi sang Go trước khi shutdown consensus
-        if let Ok(mutex) = Arc::try_unwrap(self.node.clone()) {
-            let node = mutex.into_inner();
-            node.flush_blocks_to_go_master().await?;
-        } else {
-            warn!("Could not unwrap node Arc for flushing, forcing shutdown...");
-        }
-
-        // 2. Shutdown consensus connections/tasks and node
-        if let Ok(mutex) = Arc::try_unwrap(self.node) {
-            let node = mutex.into_inner();
-            node.shutdown().await?;
-        } else {
-            warn!("Could not unwrap node Arc, forcing shutdown...");
-        }
-
-        // 3. Shutdown servers LAST (sau khi đã flush hết blocks)
-        // Dừng accept new requests từ clients
+        // 1. Shutdown servers FIRST (stop accepting new requests)
         if let Some(handle) = self.rpc_server_handle {
             handle.abort();
+            // Optional: wait for it to finish
+            let _ = handle.await;
         }
         if let Some(handle) = self.uds_server_handle {
             handle.abort();
+            let _ = handle.await;
+        }
+
+        // 2. Lock node and perform shutdown sequence
+        // We use lock() instead of try_unwrap() because the node is shared (e.g. global registry)
+        let mut node = self.node.lock().await;
+        
+        // 3. Flush remaining blocks to Go Master
+        if let Err(e) = node.flush_blocks_to_go_master().await {
+             warn!("⚠️ [SHUTDOWN] Failed to flush blocks: {}", e);
+        }
+
+        // 4. Shutdown consensus connections/tasks
+        if let Err(e) = node.shutdown().await {
+             error!("❌ [SHUTDOWN] Error during consensus shutdown: {}", e);
         }
 
         info!("Node stopped gracefully");

@@ -62,6 +62,12 @@ impl CommitProcessor {
         }
     }
 
+    /// Set the next expected commit index manually (e.g. from storage on startup)
+    pub fn with_next_expected_index(mut self, index: u32) -> Self {
+        self.next_expected_index = index;
+        self
+    }
+
     /// Set callback to notify commit index updates
     pub fn with_commit_index_callback<F>(mut self, callback: F) -> Self
     where
@@ -208,6 +214,15 @@ impl CommitProcessor {
 
                     info!("📊 [COMMIT CONDITION] Checking commit_index={}, next_expected_index={}", commit_index, next_expected_index);
                     
+                    // --- [AUTO-JUMP ON STARTUP] ---
+                    // If this is the VERY FIRST commit we receive after restart, and it is > expected,
+                    // we assume we are resuming from a higher commit index (provided by reliable Consensus Core).
+                    // This avoids reading DB for initial index (which User disallowed).
+                    if next_expected_index == 1 && commit_index > 1 {
+                        warn!("🚀 [AUTO-JUMP] Initial commit {} > expected 1. Auto-jumping to match stream.", commit_index);
+                        next_expected_index = commit_index;
+                    }
+
                     if commit_index == next_expected_index {
                         // --- [FORK SAFETY IMPLEMENTATION] ---
                         // Use the LOCAL tracker for calculation. 

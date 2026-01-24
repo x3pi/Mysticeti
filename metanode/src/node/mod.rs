@@ -26,6 +26,7 @@ use consensus_core::storage::rocksdb_store::RocksDBStore;
 use consensus_core::storage::Store; // Added Store trait
 
 // Declare submodules
+pub mod catchup;
 pub mod committee;
 pub mod executor_client;
 pub mod queue;
@@ -42,6 +43,8 @@ pub enum NodeMode {
     SyncOnly,
     /// Node participates in consensus and voting
     Validator,
+    /// Node is catching up with the network (syncing epoch/commits)
+    SyncingUp,
 }
 
 // Global registry for transition handler to access node
@@ -137,16 +140,100 @@ impl ConsensusNode {
         let latest_block_number = executor_client.get_last_block_number().await
             .map_err(|e| anyhow::anyhow!("Failed to fetch latest block from Go: {}", e))?;
 
-        let current_epoch = executor_client.get_current_epoch().await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch current epoch from Go: {}", e))?;
+        // PEER EPOCH DISCOVERY: Query multiple Go Masters to get correct epoch
+        // This handles cases where the local Go Master has stale data after restart
+        let (go_epoch, peer_last_block, best_socket) = if !config.peer_go_master_sockets.is_empty() {
+            match catchup::query_peer_epochs(
+                &config.peer_go_master_sockets,
+                &config.executor_receive_socket_path,
+            ).await {
+                Ok(result) => {
+                    info!("✅ [PEER EPOCH] Using epoch {} from peer discovery", result.0);
+                    result
+                }
+                Err(e) => {
+                    warn!("⚠️ [PEER EPOCH] Failed to query peers, falling back to local Go Master: {}", e);
+                    let epoch = executor_client.get_current_epoch().await
+                        .map_err(|e| anyhow::anyhow!("Failed to fetch epoch: {}", e))?;
+                    (epoch, latest_block_number, config.executor_receive_socket_path.clone())
+                }
+            }
+        } else {
+            // No peer sockets configured, use local Go Master
+            let epoch = executor_client.get_current_epoch().await
+                .map_err(|e| anyhow::anyhow!("Failed to fetch current epoch from Go: {}", e))?;
+            (epoch, latest_block_number, config.executor_receive_socket_path.clone())
+        };
 
-        info!("📊 [STARTUP] State: Block {}, Epoch {}", latest_block_number, current_epoch);
+        info!("📊 [STARTUP] Go State: Block {}, Epoch {} (peer_block={})", latest_block_number, go_epoch, peer_last_block);
 
-        let (validators, _go_epoch_timestamp_ms) = executor_client.get_validators_at_block(latest_block_number).await
+        // CATCHUP: Check if we need to sync epoch from local storage
+        let storage_path = config.storage_path.clone();
+        let local_epoch = detect_local_epoch(&storage_path);
+        
+        let current_epoch = if local_epoch < go_epoch {
+            // Epoch mismatch detected - need to sync
+            warn!(
+                "🔄 [CATCHUP] Epoch mismatch detected: local={}, go={}. Syncing to epoch {}.",
+                local_epoch, go_epoch, go_epoch
+            );
+            
+            // Clear old epoch data that is stale
+            for epoch in local_epoch..go_epoch {
+                let epoch_path = storage_path.join("epochs").join(format!("epoch_{}", epoch));
+                if epoch_path.exists() {
+                    info!("🗑️ [CATCHUP] Clearing stale epoch {} data", epoch);
+                    if let Err(e) = std::fs::remove_dir_all(&epoch_path) {
+                        warn!("⚠️ [CATCHUP] Failed to clear epoch {} data: {}", epoch, e);
+                    }
+                }
+            }
+            
+            go_epoch
+        } else if local_epoch > go_epoch {
+            // Local epoch is higher than network - likely we are on a stale "future" chain (e.g. network reset)
+            warn!("🚨 [CATCHUP] Local epoch {} is AHEAD of network epoch {}! Detect stale chain.", local_epoch, go_epoch);
+            warn!("🗑️ [CATCHUP] Clearing ALL local epochs to resync with network.");
+            
+            if let Ok(entries) = std::fs::read_dir(&storage_path.join("epochs")) {
+                for entry in entries.flatten() {
+                    if let Ok(path) = entry.path().canonicalize() {
+                        info!("🗑️ [CATCHUP] Removing {:?}", path);
+                        let _ = std::fs::remove_dir_all(path);
+                    }
+                }
+            }
+            go_epoch
+        } else {
+            go_epoch
+        };
+
+        info!("📊 [STARTUP] Using epoch {} (synced with Go)", current_epoch);
+
+        // ... existing committee loading code (unchanged) ...
+        // CRITICAL: Fetch validators from the Go Master that has the correct epoch
+        // If we synced epoch from a peer, we must get validators+timestamp from that same peer
+        // to ensure genesis block hash matches the network
+        let peer_executor_client = if best_socket != config.executor_receive_socket_path {
+            info!("🔄 [PEER SYNC] Using peer Go Master {} for validators (has correct epoch {})", 
+                  best_socket, go_epoch);
+            Arc::new(ExecutorClient::new(
+                true, false,
+                String::new(), // Send socket not needed for read
+                best_socket.clone(),
+            ))
+        } else {
+            executor_client.clone()
+        };
+
+        let (validators, _go_epoch_timestamp_ms) = peer_executor_client.get_validators_at_block(peer_last_block).await
             .map_err(|e| anyhow::anyhow!("Failed to fetch committee from Go: {}", e))?;
 
-        // Use epoch timestamp directly from Go state for all epochs
+        // Use epoch timestamp from the peer that has correct epoch
         let epoch_timestamp_ms = _go_epoch_timestamp_ms;
+        info!("📊 [STARTUP] Epoch timestamp: {}ms (from {})", 
+              epoch_timestamp_ms, 
+              if best_socket != config.executor_receive_socket_path { "peer" } else { "local" });
 
         if validators.is_empty() {
             anyhow::bail!("Go state returned empty validators list");
@@ -164,38 +251,47 @@ impl ConsensusNode {
         let committee = committee::build_committee_from_validator_list(validators_to_use, current_epoch)?;
         info!("✅ Loaded committee with {} authorities", committee.size());
 
-        let storage_path = config.storage_path.clone();
-        
-        let last_global_exec_index = if config.executor_read_enabled {
-            match executor_client.get_last_block_number().await {
-                Ok(go_last_block) => {
-                    let db_path = config.storage_path
-                        .join("epochs")
-                        .join(format!("epoch_{}", current_epoch))
-                        .join("consensus_db");
 
-                    if db_path.exists() {
-                        let temp_store = RocksDBStore::new(db_path.to_str().unwrap());
-                        match temp_store.read_last_commit_info() {
-                            Ok(Some((last_commit_ref, _))) => {
-                                let storage_index = last_commit_ref.index as u64;
-                                if storage_index < go_last_block && (go_last_block - storage_index) > 5 {
-                                    warn!("🚨 [STARTUP] INDEX CONFLICT: Go {}, Storage {} - using storage", go_last_block, storage_index);
-                                    storage_index
-                                } else {
-                                    go_last_block
-                                }
-                            },
-                            _ => go_last_block
-                        }
-                    } else {
-                        go_last_block
-                    }
-                },
-                Err(e) => {
-                    error!("🚨 [STARTUP] Failed to sync with Go: {}. Resetting to 0.", e);
-                    0
+        // EXECUTION INDEX SYNC
+        // EXECUTION INDEX SYNC
+        // STRATEGY: Peer > Local
+        // If we found a valid peer state, we trust it more than our potential stale/forked local state.
+        // This prevents us from building on top of a fork (e.g., Local=1291, Peer=1272 -> Use 1272)
+        let last_global_exec_index = if config.executor_read_enabled {
+            let local_go_block = executor_client.get_last_block_number().await.unwrap_or(0);
+            
+            // Check if we have a valid peer reference from startup scan
+            if best_socket != config.executor_receive_socket_path && peer_last_block > 0 {
+                info!("📊 [STARTUP] Sync Check: Local={}, Peer={} (from {})", 
+                      local_go_block, peer_last_block, best_socket);
+                
+                if local_go_block > peer_last_block + 5 {
+                     warn!("🚨 [STARTUP] STALE CHAIN DETECTED: Local ({}) is ahead of Peer ({})! Forcing resync from Peer.", 
+                           local_go_block, peer_last_block);
+                     // Force use of Peer Index to abandon local fork
+                     peer_last_block
+                } else if local_go_block < peer_last_block.saturating_sub(1000) {
+                     // Way behind? Use peer index as target? 
+                     // No, if we are behind, we should use local index and let catchup handle it?
+                     // But catchup is for consensus. 
+                     // If we tell consensus we are at 1272 (peer), but we are at 0, consensus starts at 1273.
+                     // This creates gap 0..1272.
+                     // BUT Go execution sync should fill it?
+                     // Let's rely on Local if behind, but Peer if Forked.
+                     info!("ℹ️ [STARTUP] Local is behind Peer. Using Local {} to ensure continuity.", local_go_block);
+                     local_go_block
+                } else {
+                     // Close enough, trust Peer as it's the network tip we synced epoch from
+                     if peer_last_block > local_go_block {
+                         info!("✅ [STARTUP] Using Peer Index {} (ahead of local {})", peer_last_block, local_go_block);
+                         peer_last_block
+                     } else {
+                         local_go_block
+                     }
                 }
+            } else {
+                info!("📊 [STARTUP] No peer reference, using Local Go Last Block: {}", local_go_block);
+                local_go_block
             }
         } else {
             0
@@ -257,6 +353,9 @@ impl ConsensusNode {
         
         let shared_last_global_exec_index = Arc::new(tokio::sync::Mutex::new(last_global_exec_index));
 
+        // Note: We do NOT read initial_commit_index from DB (per user request).
+        // CommitProcessor has "Auto-Jump" logic to detect stream start index.
+        
         let mut commit_processor = crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
             .with_commit_index_callback(crate::consensus::commit_callbacks::create_commit_index_callback(current_commit_index.clone()))
             .with_global_exec_index_callback(crate::consensus::commit_callbacks::create_global_exec_index_callback(shared_last_global_exec_index.clone()))
@@ -480,10 +579,10 @@ impl ConsensusNode {
         queue::submit_queued_transactions(self).await
     }
 
-    pub async fn shutdown(mut self) -> Result<()> {
+    pub async fn shutdown(&mut self) -> Result<()> {
         info!("Shutting down consensus node...");
         let _ = self.stop_sync_task().await;
-        if let Some(authority) = self.authority {
+        if let Some(authority) = self.authority.take() {
             authority.stop().await;
         }
         info!("Consensus node stopped");
@@ -564,4 +663,28 @@ impl ConsensusNode {
     pub async fn should_accept_tx(&self) -> bool {
         self.reconfig_state.read().await.should_accept_tx()
     }
+}
+
+/// Detect the highest epoch stored locally
+/// Returns 0 if no epoch data found
+fn detect_local_epoch(storage_path: &std::path::Path) -> u64 {
+    let epochs_dir = storage_path.join("epochs");
+    if !epochs_dir.exists() {
+        return 0;
+    }
+
+    let mut max_epoch = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&epochs_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(epoch_str) = name.strip_prefix("epoch_") {
+                    if let Ok(epoch) = epoch_str.parse::<u64>() {
+                        max_epoch = max_epoch.max(epoch);
+                    }
+                }
+            }
+        }
+    }
+
+    max_epoch
 }

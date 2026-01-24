@@ -150,6 +150,11 @@ pub struct NodeConfig {
     /// Seconds to wait for final transaction drain during gradual shutdown (default: 1)
     #[serde(default = "default_gradual_shutdown_final_drain_secs")]
     pub gradual_shutdown_final_drain_secs: Option<u64>,
+    /// Peer Go Master socket paths for epoch discovery (fallback if own Go Master is stale)
+    /// When node restarts and its own Go Master has stale epoch, it can query these peer masters
+    /// to get the correct network epoch. Format: ["/tmp/rust-go-standard-master.sock"]
+    #[serde(default)]
+    pub peer_go_master_sockets: Vec<String>,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -289,6 +294,7 @@ impl NodeConfig {
                 gradual_shutdown_consensus_cert_drain_secs: Some(1),
                 gradual_shutdown_final_drain_secs: Some(1),
                 adaptive_delay_ms: default_adaptive_delay_ms(),
+                peer_go_master_sockets: vec!["/tmp/rust-go-standard-master.sock".to_string()], // Fallback to main Go Master
             };
 
             // Save keys - use private_key_bytes and public key bytes

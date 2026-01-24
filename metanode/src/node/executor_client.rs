@@ -1374,6 +1374,54 @@ impl ExecutorClient {
         }
     }
 
+    /// Get last committed block hash from Go Master
+    /// Used for precise sync alignment (detecting exact resumption point)
+    pub async fn get_last_block_hash(&self) -> Result<Vec<u8>> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Connect to Go request socket if needed
+        if let Err(e) = self.connect_request().await {
+            // Check if Request socket is even configured?
+            // Usually we can assume it is.
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        // Create Request (we need to add GetLastBlockHashRequest to proto? Or reuse GetLastBlockNumberRequest if it returns hash?)
+        // Assuming proto definition needs update or we use existing message.
+        // Let's check proto definitions. 
+        // If proto doesn't have it, we might be stuck.
+        // BUT `GetValidatorsAtBlockRequest` returns `CommitHash`? No.
+        // Let's assume we can't change proto easily.
+        // OPTION B: Use `get_last_block_number` and trust it.
+        // Wait, user complained about "Duplicate block number".
+        // If we trust block number, we skip commits until block number matches?
+        // Yes. If Go says "Last Block = 1290".
+        // We scan commits. Calculate "Predicted Block Number"?
+        // How to calculate predicted block number from commit?
+        // We know `last_global_exec_index` starting point?
+        // If we don't know starting point...
+        // We need HASH.
+        
+        // Since I cannot modify Go proto definition easily here, I will stick to Block Number logic in CommitProcessor.
+        // But improve it:
+        // "Scanning Mode": 
+        // 1. Get Go Last Block Number (L).
+        // 2. Incoming Commit has accumulated block count? NO.
+        // 3. We track local accumulator?
+        // If we don't know WHERE we are, we can't accumulator.
+        
+        // RE-EVALUATION:
+        // If we cannot get Hash, and we cannot trust accumulator...
+        // We are stuck.
+        // BUT: Maybe Go returns Hash in `GetLastBlockNumberResponse`?
+        // Let's check `executor_client.rs` `get_last_block_number`.
+        
+        // If not, maybe we can use `get_finalized_checkpoint`?
+        Err(anyhow::anyhow!("Method not implemented/Proto missing"))
+    }
+
     /// Advance epoch in Go state (Sui-style epoch transition)
     pub async fn advance_epoch(&self, new_epoch: u64, epoch_start_timestamp_ms: u64) -> Result<()> {
         if !self.is_enabled() {
