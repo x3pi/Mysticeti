@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
-use consensus_config::{
-    Authority, AuthorityKeyPair, Committee, NetworkKeyPair,
-    ProtocolKeyPair,
-};
+use consensus_config::{Authority, AuthorityKeyPair, Committee, NetworkKeyPair, ProtocolKeyPair};
 use fastcrypto::traits::ToFromBytes;
 use mysten_network::Multiaddr;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 // Import NodeMode from parent module
 use crate::node::NodeMode;
@@ -162,10 +162,7 @@ fn default_max_clock_drift_seconds() -> u64 {
 }
 
 fn default_ntp_servers() -> Vec<String> {
-    vec![
-        "pool.ntp.org".to_string(),
-        "time.google.com".to_string(),
-    ]
+    vec!["pool.ntp.org".to_string(), "time.google.com".to_string()]
 }
 
 fn default_ntp_sync_interval_seconds() -> u64 {
@@ -256,7 +253,9 @@ impl NodeConfig {
 
         // Generate individual node configs
         // NOTE: Không tạo file committee_node_*.json nữa. Tất cả nodes sẽ fetch committee từ Go state.
-        for (idx, (protocol_keypair, network_keypair, _authority_keypair)) in keypairs.iter().enumerate() {
+        for (idx, (protocol_keypair, network_keypair, _authority_keypair)) in
+            keypairs.iter().enumerate()
+        {
             let config = NodeConfig {
                 node_id: idx,
                 network_address: format!("127.0.0.1:{}", 9000 + idx),
@@ -269,8 +268,8 @@ impl NodeConfig {
                 speed_multiplier: 0.2, // Default: 5x slower (0.2 = 1/5 speed)
                 leader_timeout_ms: None,
                 min_round_delay_ms: None,
-                time_based_epoch_change: true, // Enabled by default
-                epoch_duration_seconds: Some(300), // Default: 5 minutes (5 * 60 seconds)
+                time_based_epoch_change: true,     // Enabled by default
+                epoch_duration_seconds: Some(600), // Default: 10 minutes (10 * 60 seconds)
                 max_clock_drift_seconds: 5,
                 enable_ntp_sync: false, // Disabled by default (enable for production)
                 ntp_servers: default_ntp_servers(),
@@ -305,7 +304,7 @@ impl NodeConfig {
                 let mut combined = Vec::new();
                 combined.extend_from_slice(&private_bytes);
                 combined.extend_from_slice(public_bytes);
-                use base64::{Engine as _, engine::general_purpose};
+                use base64::{engine::general_purpose, Engine as _};
                 let key_str = general_purpose::STANDARD.encode(&combined);
                 fs::write(key_path, key_str)?;
             }
@@ -316,7 +315,7 @@ impl NodeConfig {
                 let mut combined = Vec::new();
                 combined.extend_from_slice(&private_bytes);
                 combined.extend_from_slice(&public_bytes);
-                use base64::{Engine as _, engine::general_purpose};
+                use base64::{engine::general_purpose, Engine as _};
                 let key_str = general_purpose::STANDARD.encode(&combined);
                 fs::write(key_path, key_str)?;
             }
@@ -332,7 +331,10 @@ impl NodeConfig {
 
     fn generate_committee(
         size: usize,
-    ) -> Result<(Committee, Vec<(ProtocolKeyPair, NetworkKeyPair, AuthorityKeyPair)>)> {
+    ) -> Result<(
+        Committee,
+        Vec<(ProtocolKeyPair, NetworkKeyPair, AuthorityKeyPair)>,
+    )> {
         let mut authorities = Vec::new();
         let mut keypairs = Vec::new();
 
@@ -341,7 +343,8 @@ impl NodeConfig {
             let network_keypair = NetworkKeyPair::generate(&mut rand::thread_rng());
             let authority_keypair = AuthorityKeyPair::generate(&mut rand::thread_rng());
 
-            let address: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", 9000 + i).parse()
+            let address: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", 9000 + i)
+                .parse()
                 .context("Failed to parse address")?;
 
             let authority = Authority {
@@ -365,14 +368,12 @@ impl NodeConfig {
     // This ensures all nodes have identical committee data and eliminates file-based inconsistencies
     // No more save/load committee from files - everything goes through Go state synchronization
 
-    
-    
-
     pub fn load_protocol_keypair(&self) -> Result<ProtocolKeyPair> {
         if let Some(path) = &self.protocol_key_path {
             let content = fs::read_to_string(path)?;
-            use base64::{Engine as _, engine::general_purpose};
-            let bytes = general_purpose::STANDARD.decode(content.trim())
+            use base64::{engine::general_purpose, Engine as _};
+            let bytes = general_purpose::STANDARD
+                .decode(content.trim())
                 .context("Failed to decode base64 key")?;
             if bytes.len() != 64 {
                 anyhow::bail!("Invalid key length: expected 64 bytes, got {}", bytes.len());
@@ -393,8 +394,9 @@ impl NodeConfig {
     pub fn load_network_keypair(&self) -> Result<NetworkKeyPair> {
         if let Some(path) = &self.network_key_path {
             let content = fs::read_to_string(path)?;
-            use base64::{Engine as _, engine::general_purpose};
-            let bytes = general_purpose::STANDARD.decode(content.trim())
+            use base64::{engine::general_purpose, Engine as _};
+            let bytes = general_purpose::STANDARD
+                .decode(content.trim())
                 .context("Failed to decode base64 key")?;
             if bytes.len() != 64 {
                 anyhow::bail!("Invalid key length: expected 64 bytes, got {}", bytes.len());
@@ -412,4 +414,3 @@ impl NodeConfig {
         }
     }
 }
-

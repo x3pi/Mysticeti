@@ -2,17 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use std::sync::Arc;
-use std::net::SocketAddr;
-use tokio::sync::Mutex;
-use tracing::{info, error, warn};
 use mysten_metrics::start_prometheus_server;
 use prometheus::Registry;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 
 use crate::config::NodeConfig;
-use crate::node::ConsensusNode;
 use crate::network::rpc::RpcServer;
 use crate::network::tx_socket_server::TxSocketServer;
+use crate::node::ConsensusNode;
 
 /// Startup configuration and initialization
 pub struct StartupConfig {
@@ -22,7 +22,11 @@ pub struct StartupConfig {
 }
 
 impl StartupConfig {
-    pub fn new(node_config: NodeConfig, registry: Registry, registry_service: Option<Arc<mysten_metrics::RegistryService>>) -> Self {
+    pub fn new(
+        node_config: NodeConfig,
+        registry: Registry,
+        registry_service: Option<Arc<mysten_metrics::RegistryService>>,
+    ) -> Self {
         Self {
             node_config,
             registry,
@@ -36,18 +40,26 @@ pub struct InitializedNode {
     pub node: Arc<Mutex<ConsensusNode>>,
     pub rpc_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub uds_server_handle: Option<tokio::task::JoinHandle<()>>,
+    pub node_config: NodeConfig,
 }
 
 impl InitializedNode {
     /// Initialize and start all node components
     pub async fn initialize(config: StartupConfig) -> Result<Self> {
-        let StartupConfig { node_config, registry, registry_service } = config;
+        let StartupConfig {
+            node_config,
+            registry,
+            registry_service,
+        } = config;
 
         // Start metrics server if enabled
         let _metrics_addr = if node_config.enable_metrics {
             let metrics_addr = SocketAddr::from(([127, 0, 0, 1], node_config.metrics_port));
             let _registry_service = start_prometheus_server(metrics_addr);
-            info!("Metrics server started at http://127.0.0.1:{}/metrics", node_config.metrics_port);
+            info!(
+                "Metrics server started at http://127.0.0.1:{}/metrics",
+                node_config.metrics_port
+            );
             Some(metrics_addr)
         } else {
             info!("Metrics server is disabled (enable_metrics = false)");
@@ -63,10 +75,7 @@ impl InitializedNode {
 
         // Create the ConsensusNode wrapped in a Mutex for safe concurrent access
         let node = Arc::new(Mutex::new(
-            ConsensusNode::new_with_registry_and_service(
-                node_config.clone(),
-                registry,
-            ).await?
+            ConsensusNode::new_with_registry_and_service(node_config.clone(), registry).await?,
         ));
 
         // Register node in global registry for transition handler access
@@ -82,7 +91,8 @@ impl InitializedNode {
             // Start RPC server for client submissions (HTTP) - only for validator nodes
             let rpc_port = node_config.metrics_port + 1000;
             let node_for_rpc = node.clone();
-            let rpc_server = RpcServer::with_node(tx_client.clone(), rpc_port, node_for_rpc.clone());
+            let rpc_server =
+                RpcServer::with_node(tx_client.clone(), rpc_port, node_for_rpc.clone());
             rpc_server_handle = Some(tokio::spawn(async move {
                 if let Err(e) = rpc_server.start().await {
                     error!("RPC server error: {}", e);
@@ -93,11 +103,8 @@ impl InitializedNode {
             let socket_path = format!("/tmp/metanode-tx-{}.sock", node_config.node_id);
             let tx_client_uds = tx_client.clone();
             let node_for_uds = node.clone();
-            let uds_server = TxSocketServer::with_node(
-                socket_path.clone(),
-                tx_client_uds,
-                node_for_uds,
-            );
+            let uds_server =
+                TxSocketServer::with_node(socket_path.clone(), tx_client_uds, node_for_uds);
             uds_server_handle = Some(tokio::spawn(async move {
                 if let Err(e) = uds_server.start().await {
                     error!("UDS server error: {}", e);
@@ -116,6 +123,7 @@ impl InitializedNode {
             node,
             rpc_server_handle,
             uds_server_handle,
+            node_config: node_config.clone(),
         })
     }
 
@@ -127,7 +135,11 @@ impl InitializedNode {
         let catchup_manager = {
             let node_guard = self.node.lock().await;
             if let Some(client) = node_guard.executor_client.clone() {
-                Some(crate::node::catchup::CatchupManager::new(client))
+                Some(crate::node::catchup::CatchupManager::new(
+                    client,
+                    self.node_config.peer_go_master_sockets.clone(),
+                    self.node_config.executor_receive_socket_path.clone(),
+                ))
             } else {
                 warn!("⚠️ [STARTUP] No executor client available, skipping catchup check");
                 None
@@ -139,13 +151,13 @@ impl InitializedNode {
             let check_interval = std::time::Duration::from_secs(2);
             let timeout = std::time::Duration::from_secs(600); // 10 minutes timeout
             let start = std::time::Instant::now();
-            
+
             // Force SyncingUp mode while waiting
             {
                 let mut node_guard = self.node.lock().await;
                 if node_guard.node_mode == crate::node::NodeMode::Validator {
-                     info!("🔄 [STARTUP] Switching to SyncingUp mode while waiting for catchup");
-                     node_guard.node_mode = crate::node::NodeMode::SyncingUp;
+                    info!("🔄 [STARTUP] Switching to SyncingUp mode while waiting for catchup");
+                    node_guard.node_mode = crate::node::NodeMode::SyncingUp;
                 }
             }
 
@@ -166,24 +178,36 @@ impl InitializedNode {
                     // But for Commit sync, we need local commit.
                     // Use commit_processor's tracked index?
                     // Node has `current_commit_index` (AtomicU32).
-                    (node.current_epoch, node.current_commit_index.load(std::sync::atomic::Ordering::Relaxed) as u64)
+                    (
+                        node.current_epoch,
+                        node.current_commit_index
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64,
+                    )
                 };
 
                 match cm.check_sync_status(local_epoch, local_commit).await {
                     Ok(status) => {
                         if status.ready {
-                            info!("✅ [STARTUP] Node is synced (gap={}). Joining consensus!", status.commit_gap);
+                            info!(
+                                "✅ [STARTUP] Node is synced (gap={}). Joining consensus!",
+                                status.commit_gap
+                            );
                             break;
                         }
-                        
+
                         if status.epoch_match {
-                            info!("🔄 [CATCHUP] Syncing commits: Local={}, Network={}, Gap={}", 
-                                  local_commit, status.go_last_block, status.commit_gap);
+                            info!(
+                                "🔄 [CATCHUP] Syncing blocks: LocalExec={}, Network={}, Gap={}",
+                                status.go_last_block, status.network_block_height, status.block_gap
+                            );
                         } else {
-                            info!("🔄 [CATCHUP] Syncing epoch: Local={}, Network={}", 
-                                  local_epoch, status.go_epoch);
+                            info!(
+                                "🔄 [CATCHUP] Syncing epoch: Local={}, Network={}",
+                                local_epoch, status.go_epoch
+                            );
                         }
-                    },
+                    }
                     Err(e) => {
                         warn!("⚠️ [STARTUP] Failed to check sync status: {}", e);
                     }
@@ -197,15 +221,15 @@ impl InitializedNode {
                 let mut node_guard = self.node.lock().await;
                 // Only switch if we intended to be a validator (based on committee)
                 // We re-run check_and_update_node_mode to determine correct mode
-                let config = node_guard.protocol_config.clone(); // Need config... wait, protocol_config is strict.
-                // We need NodeConfig. It is not stored in ConsensusNode except parts.
-                // But we can just set to Validator if it was SyncingUp.
-                // Actually, check_and_update_node_mode requires Committee and NodeConfig.
-                // We don't have them easily here.
-                // Simpler: Set to Validator.
+                let _config = node_guard.protocol_config.clone(); // Need config... wait, protocol_config is strict.
+                                                                  // We need NodeConfig. It is not stored in ConsensusNode except parts.
+                                                                  // But we can just set to Validator if it was SyncingUp.
+                                                                  // Actually, check_and_update_node_mode requires Committee and NodeConfig.
+                                                                  // We don't have them easily here.
+                                                                  // Simpler: Set to Validator.
                 if node_guard.node_mode == crate::node::NodeMode::SyncingUp {
-                     info!("✅ [STARTUP] Switching to Validator mode");
-                     node_guard.node_mode = crate::node::NodeMode::Validator;
+                    info!("✅ [STARTUP] Switching to Validator mode");
+                    node_guard.node_mode = crate::node::NodeMode::Validator;
                 }
             }
         }
@@ -238,15 +262,15 @@ impl InitializedNode {
         // 2. Lock node and perform shutdown sequence
         // We use lock() instead of try_unwrap() because the node is shared (e.g. global registry)
         let mut node = self.node.lock().await;
-        
+
         // 3. Flush remaining blocks to Go Master
         if let Err(e) = node.flush_blocks_to_go_master().await {
-             warn!("⚠️ [SHUTDOWN] Failed to flush blocks: {}", e);
+            warn!("⚠️ [SHUTDOWN] Failed to flush blocks: {}", e);
         }
 
         // 4. Shutdown consensus connections/tasks
         if let Err(e) = node.shutdown().await {
-             error!("❌ [SHUTDOWN] Error during consensus shutdown: {}", e);
+            error!("❌ [SHUTDOWN] Error during consensus shutdown: {}", e);
         }
 
         info!("Node stopped gracefully");

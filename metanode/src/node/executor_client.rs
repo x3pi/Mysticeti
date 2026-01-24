@@ -39,7 +39,15 @@ pub struct ExecutorClient {
     send_buffer: Arc<Mutex<BTreeMap<u64, (Vec<u8>, u64, u32)>>>,
     /// Next expected global_exec_index to send
     next_expected_index: Arc<tokio::sync::Mutex<u64>>,
+    /// Storage path for persisting state (crash recovery)
+    storage_path: Option<std::path::PathBuf>,
+    /// Last verified Go block number (for fork detection)
+    last_verified_go_index: Arc<tokio::sync::Mutex<u64>>,
 }
+
+/// Production safety constants
+const MAX_BUFFER_SIZE: usize = 10_000; // Maximum blocks to buffer before rejecting
+const GO_VERIFICATION_INTERVAL: u64 = 10; // Verify Go state every N blocks
 
 impl ExecutorClient {
     /// Create new executor client
@@ -48,8 +56,8 @@ impl ExecutorClient {
     /// send_socket_path: socket path for sending data to Go executor
     /// receive_socket_path: socket path for receiving data from Go executor
     /// initial_next_expected: initial value for next_expected_index (default: 1)
-    pub fn new(enabled: bool, can_commit: bool, send_socket_path: String, receive_socket_path: String) -> Self {
-        Self::new_with_initial_index(enabled, can_commit, send_socket_path, receive_socket_path, 1)
+    pub fn new(enabled: bool, can_commit: bool, send_socket_path: String, receive_socket_path: String, storage_path: Option<std::path::PathBuf>) -> Self {
+        Self::new_with_initial_index(enabled, can_commit, send_socket_path, receive_socket_path, 1, storage_path)
     }
 
     /// Create new executor client with initial next_expected_index
@@ -61,12 +69,13 @@ impl ExecutorClient {
         send_socket_path: String, 
         receive_socket_path: String,
         initial_next_expected: u64,
+        storage_path: Option<std::path::PathBuf>,
     ) -> Self {
         // CRITICAL FIX: Always create empty buffer to prevent duplicate global_exec_index
         // When creating new executor client (e.g., after restart or epoch transition),
         // buffer should be empty to avoid conflicts with old commits
         let send_buffer = Arc::new(Mutex::new(BTreeMap::new()));
-        info!("🔧 [EXECUTOR CLIENT] Creating new executor client with initial_next_expected={}, buffer is empty", initial_next_expected);
+        info!("🔧 [EXECUTOR CLIENT] Creating new executor client with initial_next_expected={}, buffer is empty, storage_path={:?}", initial_next_expected, storage_path);
         
         Self {
             socket_path: send_socket_path,
@@ -77,6 +86,8 @@ impl ExecutorClient {
             can_commit,
             send_buffer,
             next_expected_index: Arc::new(tokio::sync::Mutex::new(initial_next_expected)),
+            storage_path,
+            last_verified_go_index: Arc::new(tokio::sync::Mutex::new(0)),
         }
     }
 
@@ -254,6 +265,13 @@ impl ExecutorClient {
         // SEQUENTIAL BUFFERING: Add to buffer and try to send in order
         {
             let mut buffer = self.send_buffer.lock().await;
+            
+            // PRODUCTION SAFETY: Buffer size limit to prevent memory exhaustion
+            if buffer.len() >= MAX_BUFFER_SIZE {
+                error!("🚨 [BUFFER LIMIT] Buffer is full ({} blocks). Rejecting block global_exec_index={}. This indicates severe sync issues.",
+                    buffer.len(), global_exec_index);
+                return Err(anyhow::anyhow!("Buffer full: {} blocks (max {})", buffer.len(), MAX_BUFFER_SIZE));
+            }
             // #region agent log
             {
                 use std::io::Write;
@@ -443,12 +461,46 @@ impl ExecutorClient {
                     return Ok(());
                 }
                 
-                // Successfully sent, increment next_expected
+                // Successfully sent, increment next_expected and persist
                 {
                     let mut next_expected = self.next_expected_index.lock().await;
                     *next_expected += 1;
                     info!("✅ [SEQUENTIAL-BUFFER] Successfully sent block global_exec_index={}, next_expected={}", 
                         current_expected, *next_expected);
+                    
+                    // PERSIST: Save last successfully sent index for crash recovery
+                    if let Some(ref storage_path) = self.storage_path {
+                        if let Err(e) = persist_last_sent_index(storage_path, current_expected).await {
+                            warn!("⚠️ [PERSIST] Failed to persist last_sent_index={}: {}", current_expected, e);
+                        }
+                    }
+                    
+                    // GO VERIFICATION: Periodically verify Go actually received blocks
+                    // This detects forks where Go's state diverges from what Rust sent
+                    if current_expected % GO_VERIFICATION_INTERVAL == 0 {
+                        if let Ok(go_last_block) = self.get_last_block_number().await {
+                            let mut last_verified = self.last_verified_go_index.lock().await;
+                            
+                            // FORK DETECTION: Go's block should never decrease
+                            if go_last_block < *last_verified {
+                                error!("🚨 [FORK DETECTED] Go's block number DECREASED! last_verified={}, go_now={}. CRITICAL: Possible fork or Go state corruption!",
+                                    *last_verified, go_last_block);
+                            }
+                            
+                            // Update last verified
+                            *last_verified = go_last_block;
+                            
+                            // Check if Go is keeping up
+                            let lag = current_expected.saturating_sub(go_last_block);
+                            if lag > 100 {
+                                warn!("⚠️ [GO LAG] Go is {} blocks behind Rust. sent={}, go={}", 
+                                    lag, current_expected, go_last_block);
+                            } else {
+                                trace!("✓ [GO VERIFY] Go verified at block {}. Rust sent={}, lag={}", 
+                                    go_last_block, current_expected, lag);
+                            }
+                        }
+                    }
                 }
                 
                 // CRITICAL: Continue loop to try sending next block immediately
@@ -1374,53 +1426,6 @@ impl ExecutorClient {
         }
     }
 
-    /// Get last committed block hash from Go Master
-    /// Used for precise sync alignment (detecting exact resumption point)
-    pub async fn get_last_block_hash(&self) -> Result<Vec<u8>> {
-        if !self.is_enabled() {
-            return Err(anyhow::anyhow!("Executor client is not enabled"));
-        }
-
-        // Connect to Go request socket if needed
-        if let Err(e) = self.connect_request().await {
-            // Check if Request socket is even configured?
-            // Usually we can assume it is.
-            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
-        }
-
-        // Create Request (we need to add GetLastBlockHashRequest to proto? Or reuse GetLastBlockNumberRequest if it returns hash?)
-        // Assuming proto definition needs update or we use existing message.
-        // Let's check proto definitions. 
-        // If proto doesn't have it, we might be stuck.
-        // BUT `GetValidatorsAtBlockRequest` returns `CommitHash`? No.
-        // Let's assume we can't change proto easily.
-        // OPTION B: Use `get_last_block_number` and trust it.
-        // Wait, user complained about "Duplicate block number".
-        // If we trust block number, we skip commits until block number matches?
-        // Yes. If Go says "Last Block = 1290".
-        // We scan commits. Calculate "Predicted Block Number"?
-        // How to calculate predicted block number from commit?
-        // We know `last_global_exec_index` starting point?
-        // If we don't know starting point...
-        // We need HASH.
-        
-        // Since I cannot modify Go proto definition easily here, I will stick to Block Number logic in CommitProcessor.
-        // But improve it:
-        // "Scanning Mode": 
-        // 1. Get Go Last Block Number (L).
-        // 2. Incoming Commit has accumulated block count? NO.
-        // 3. We track local accumulator?
-        // If we don't know WHERE we are, we can't accumulator.
-        
-        // RE-EVALUATION:
-        // If we cannot get Hash, and we cannot trust accumulator...
-        // We are stuck.
-        // BUT: Maybe Go returns Hash in `GetLastBlockNumberResponse`?
-        // Let's check `executor_client.rs` `get_last_block_number`.
-        
-        // If not, maybe we can use `get_finalized_checkpoint`?
-        Err(anyhow::anyhow!("Method not implemented/Proto missing"))
-    }
 
     /// Advance epoch in Go state (Sui-style epoch transition)
     pub async fn advance_epoch(&self, new_epoch: u64, epoch_start_timestamp_ms: u64) -> Result<()> {
@@ -1631,3 +1636,56 @@ pub fn is_executor_enabled(config_dir: &Path) -> bool {
     config_file.exists()
 }
 
+/// Persist last successfully sent index to file for crash recovery
+/// Uses atomic write (temp file + rename) to prevent corruption
+pub async fn persist_last_sent_index(storage_path: &Path, index: u64) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    
+    let persist_dir = storage_path.join("executor_state");
+    std::fs::create_dir_all(&persist_dir)?;
+    
+    let temp_path = persist_dir.join("last_sent_index.tmp");
+    let final_path = persist_dir.join("last_sent_index.bin");
+    
+    // Write to temp file
+    let mut file = tokio::fs::File::create(&temp_path).await?;
+    file.write_all(&index.to_le_bytes()).await?;
+    file.flush().await?;
+    file.sync_all().await?;
+    drop(file);
+    
+    // Atomic rename
+    std::fs::rename(&temp_path, &final_path)?;
+    
+    trace!("💾 [PERSIST] Saved last_sent_index={} to {:?}", index, final_path);
+    Ok(())
+}
+
+/// Load persisted last sent index from file
+/// Returns None if file doesn't exist or is corrupted
+pub fn load_persisted_last_index(storage_path: &Path) -> Option<u64> {
+    let persist_path = storage_path.join("executor_state").join("last_sent_index.bin");
+    
+    if !persist_path.exists() {
+        return None;
+    }
+    
+    match std::fs::read(&persist_path) {
+        Ok(bytes) if bytes.len() == 8 => {
+            let index = u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+            info!("📂 [PERSIST] Loaded persisted last_sent_index={} from {:?}", index, persist_path);
+            Some(index)
+        }
+        Ok(bytes) => {
+            warn!("⚠️ [PERSIST] Corrupted last_sent_index file: {} bytes (expected 8)", bytes.len());
+            None
+        }
+        Err(e) => {
+            warn!("⚠️ [PERSIST] Failed to read last_sent_index: {}", e);
+            None
+        }
+    }
+}

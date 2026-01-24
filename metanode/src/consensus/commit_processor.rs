@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use consensus_core::{CommittedSubDag, BlockAPI};
+use consensus_core::{BlockAPI, CommittedSubDag};
+use hex;
 use mysten_metrics::monitored_mpsc::UnboundedReceiver;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration; // [Added] Import Duration
-use tokio::time::sleep;  // [Added] Import sleep for retry mechanism
-use tracing::{info, warn, error, trace};
-use hex;
+use tokio::time::sleep; // [Added] Import sleep for retry mechanism
+use tracing::{error, info, trace, warn};
 
 use crate::consensus::checkpoint::calculate_global_exec_index;
 use crate::node::executor_client::ExecutorClient;
@@ -62,12 +62,6 @@ impl CommitProcessor {
         }
     }
 
-    /// Set the next expected commit index manually (e.g. from storage on startup)
-    pub fn with_next_expected_index(mut self, index: u32) -> Self {
-        self.next_expected_index = index;
-        self
-    }
-
     /// Set callback to notify commit index updates
     pub fn with_commit_index_callback<F>(mut self, callback: F) -> Self
     where
@@ -97,7 +91,10 @@ impl CommitProcessor {
     }
 
     /// Set shared last global exec index for direct updates
-    pub fn with_shared_last_global_exec_index(mut self, shared_index: Arc<tokio::sync::Mutex<u64>>) -> Self {
+    pub fn with_shared_last_global_exec_index(
+        mut self,
+        shared_index: Arc<tokio::sync::Mutex<u64>>,
+    ) -> Self {
         self.shared_last_global_exec_index = Some(shared_index);
         self
     }
@@ -149,53 +146,66 @@ impl CommitProcessor {
         let executor_client = self.executor_client;
         let pending_transactions_queue = self.pending_transactions_queue;
         let epoch_transition_callback = self.epoch_transition_callback;
-        
+
         // --- [FORK SAFETY FIX] ---
         // Initialize local tracker. We read from shared state ONLY ONCE at startup.
         // This ensures sequential consistency within the loop, preventing race conditions
         // where we might read a stale index from the shared mutex.
-        let mut tracked_last_global_exec_index = if let Some(ref shared_index) = self.shared_last_global_exec_index {
-            let index_guard = shared_index.lock().await;
-            *index_guard
-        } else {
-            // Fallback: try callback if shared index not available
-            if let Some(ref callback) = self.get_last_global_exec_index {
-                callback()
+        let mut tracked_last_global_exec_index =
+            if let Some(ref shared_index) = self.shared_last_global_exec_index {
+                let index_guard = shared_index.lock().await;
+                *index_guard
             } else {
-                0 
-            }
-        };
+                // Fallback: try callback if shared index not available
+                if let Some(ref callback) = self.get_last_global_exec_index {
+                    callback()
+                } else {
+                    0
+                }
+            };
 
         // #region agent log
         {
             use std::io::Write;
-            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:124","message":"COMMIT PROCESSOR STARTED","data":{{"current_epoch":{},"last_global_exec_index":{},"next_expected_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                    ts.as_secs(), ts.as_nanos() % 1000000,
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log")
+            {
+                let _ = writeln!(
+                    f,
+                    r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:124","message":"COMMIT PROCESSOR STARTED","data":{{"current_epoch":{},"last_global_exec_index":{},"next_expected_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#,
+                    ts.as_secs(),
+                    ts.as_nanos() % 1000000,
                     ts.as_millis(),
-                    current_epoch, tracked_last_global_exec_index, next_expected_index);
+                    current_epoch,
+                    tracked_last_global_exec_index,
+                    next_expected_index
+                );
             }
         }
         // #endregion
-        
+
         info!("🚀 [COMMIT PROCESSOR] Started processing commits for epoch {} (last_global_exec_index={}, next_expected_index={})",
             current_epoch, tracked_last_global_exec_index, next_expected_index);
-        
+
         let mut last_heartbeat_commit = 0u32;
         let mut last_heartbeat_time = std::time::Instant::now();
-        const HEARTBEAT_INTERVAL: u32 = 1000; 
-        const HEARTBEAT_TIMEOUT_SECS: u64 = 300; 
-        
+        const HEARTBEAT_INTERVAL: u32 = 1000;
+        const HEARTBEAT_TIMEOUT_SECS: u64 = 300;
+
         info!("📡 [COMMIT PROCESSOR] Waiting for commits from consensus...");
-        
+
         loop {
             match receiver.recv().await {
                 Some(subdag) => {
                     let commit_index: u32 = subdag.commit_ref.index;
                     info!("📥 [COMMIT PROCESSOR] Received committed subdag: commit_index={}, leader={:?}, blocks={}",
                         commit_index, subdag.leader, subdag.blocks.len());
-                    
+
                     // Heartbeat logic
                     if commit_index >= last_heartbeat_commit + HEARTBEAT_INTERVAL {
                         let elapsed = last_heartbeat_time.elapsed().as_secs();
@@ -207,13 +217,18 @@ impl CommitProcessor {
 
                     // Check for stuck processor
                     let time_since_last_heartbeat = last_heartbeat_time.elapsed().as_secs();
-                    if time_since_last_heartbeat > HEARTBEAT_TIMEOUT_SECS && commit_index == last_heartbeat_commit {
+                    if time_since_last_heartbeat > HEARTBEAT_TIMEOUT_SECS
+                        && commit_index == last_heartbeat_commit
+                    {
                         warn!("⚠️  [COMMIT PROCESSOR] Possible stuck detected: No progress for {}s (last commit: {})", 
                             time_since_last_heartbeat, commit_index);
                     }
 
-                    info!("📊 [COMMIT CONDITION] Checking commit_index={}, next_expected_index={}", commit_index, next_expected_index);
-                    
+                    info!(
+                        "📊 [COMMIT CONDITION] Checking commit_index={}, next_expected_index={}",
+                        commit_index, next_expected_index
+                    );
+
                     // --- [AUTO-JUMP ON STARTUP] ---
                     // If this is the VERY FIRST commit we receive after restart, and it is > expected,
                     // we assume we are resuming from a higher commit index (provided by reliable Consensus Core).
@@ -225,7 +240,7 @@ impl CommitProcessor {
 
                     if commit_index == next_expected_index {
                         // --- [FORK SAFETY IMPLEMENTATION] ---
-                        // Use the LOCAL tracker for calculation. 
+                        // Use the LOCAL tracker for calculation.
                         // This guarantees deterministic increment: Index(N) = Index(N-1) + Blocks(N-1)
                         let current_last_global_exec_index = tracked_last_global_exec_index;
 
@@ -238,7 +253,11 @@ impl CommitProcessor {
                         info!("📊 [GLOBAL_EXEC_INDEX] Calculated: global_exec_index={}, epoch={}, commit_index={}, current_last_global_exec_index={}",
                             global_exec_index, current_epoch, commit_index, current_last_global_exec_index);
 
-                        let total_txs_in_commit = subdag.blocks.iter().map(|b| b.transactions().len()).sum::<usize>();
+                        let total_txs_in_commit = subdag
+                            .blocks
+                            .iter()
+                            .map(|b| b.transactions().len())
+                            .sum::<usize>();
 
                         // CRITICAL FIX: Process commit FIRST before triggering epoch transition
                         // This ensures Go receives the EndOfEpoch commit before Rust starts transition
@@ -248,8 +267,9 @@ impl CommitProcessor {
                             current_epoch,
                             executor_client.clone(),
                             pending_transactions_queue.clone(),
-                            self.shared_last_global_exec_index.clone()
-                        ).await?;
+                            self.shared_last_global_exec_index.clone(),
+                        )
+                        .await?;
 
                         // Update local tracker immediately after successful processing.
                         // The next iteration is GUARANTEED to see this updated value.
@@ -266,8 +286,15 @@ impl CommitProcessor {
                         next_expected_index += 1;
 
                         // Check for EndOfEpoch system transactions AFTER commit is sent to Go
-                        if let Some((_block_ref, system_tx)) = subdag.extract_end_of_epoch_transaction() {
-                            if let Some((new_epoch, new_epoch_timestamp_ms, _commit_index_from_tx)) = system_tx.as_end_of_epoch() {
+                        if let Some((_block_ref, system_tx)) =
+                            subdag.extract_end_of_epoch_transaction()
+                        {
+                            if let Some((
+                                new_epoch,
+                                new_epoch_timestamp_ms,
+                                _commit_index_from_tx,
+                            )) = system_tx.as_end_of_epoch()
+                            {
                                 info!(
                                     "🎯 [SYSTEM TX] EndOfEpoch transaction detected in commit {}: epoch {} -> {}, total_txs_in_commit={}",
                                     commit_index, current_epoch, new_epoch, total_txs_in_commit
@@ -279,7 +306,9 @@ impl CommitProcessor {
                                         commit_index, new_epoch, global_exec_index
                                     );
 
-                                    if let Err(e) = callback(new_epoch, new_epoch_timestamp_ms, commit_index) {
+                                    if let Err(e) =
+                                        callback(new_epoch, new_epoch_timestamp_ms, commit_index)
+                                    {
                                         warn!("❌ Failed to trigger epoch transition from system transaction: {}", e);
                                     }
                                 }
@@ -298,23 +327,24 @@ impl CommitProcessor {
                                 pending_commit_index,
                                 current_last_global_exec_index,
                             );
-                            
+
                             Self::process_commit(
-                                &pending, 
-                                global_exec_index, 
-                                current_epoch, 
-                                executor_client.clone(), 
-                                pending_transactions_queue.clone(), 
-                                self.shared_last_global_exec_index.clone()
-                            ).await?;
+                                &pending,
+                                global_exec_index,
+                                current_epoch,
+                                executor_client.clone(),
+                                pending_transactions_queue.clone(),
+                                self.shared_last_global_exec_index.clone(),
+                            )
+                            .await?;
 
                             // Update local tracker
                             tracked_last_global_exec_index = global_exec_index;
-                            
+
                             if let Some(ref callback) = commit_index_callback {
                                 callback(pending_commit_index);
                             }
-                            
+
                             next_expected_index += 1;
                         }
                     } else if commit_index > next_expected_index {
@@ -392,7 +422,8 @@ impl CommitProcessor {
             return false;
         }
         let data_str = String::from_utf8_lossy(tx_data);
-        data_str.contains("EndOfEpoch") || data_str.contains("epoch") && data_str.contains("transition")
+        data_str.contains("EndOfEpoch")
+            || data_str.contains("epoch") && data_str.contains("transition")
     }
 
     async fn process_commit(
@@ -407,20 +438,25 @@ impl CommitProcessor {
         let mut total_transactions = 0;
         let mut transaction_hashes = Vec::new();
         let mut block_details = Vec::new();
-        
+
         for (block_idx, block) in subdag.blocks.iter().enumerate() {
             let transactions = block.transactions();
             total_transactions += transactions.len();
-            
+
             for tx in transactions {
                 let tx_data = tx.data();
                 let tx_hash_hex = calculate_transaction_hash_hex(tx_data);
                 transaction_hashes.push(tx_hash_hex);
             }
-            
-            block_details.push(format!("block[{}]={:?} ({}tx)", block_idx, block.reference(), transactions.len()));
+
+            block_details.push(format!(
+                "block[{}]={:?} ({}tx)",
+                block_idx,
+                block.reference(),
+                transactions.len()
+            ));
         }
-        
+
         let has_system_tx = subdag.extract_end_of_epoch_transaction().is_some();
 
         if total_transactions > 0 || has_system_tx {
@@ -432,7 +468,10 @@ impl CommitProcessor {
             if let Some(ref client) = executor_client {
                 let mut retry_count = 0;
                 loop {
-                    match client.send_committed_subdag(subdag, epoch, global_exec_index).await {
+                    match client
+                        .send_committed_subdag(subdag, epoch, global_exec_index)
+                        .await
+                    {
                         Ok(_) => {
                             info!("✅ [TX FLOW] Successfully sent committed subdag: global_exec_index={}, commit_index={}",
                                 global_exec_index, commit_index);
@@ -446,14 +485,19 @@ impl CommitProcessor {
 
                             // Track committed transaction hashes to prevent duplicates during epoch transitions
                             // CRITICAL: Only track when commit is actually processed, not just submitted
-                            if let Some(node_arc) = crate::node::get_transition_handler_node().await {
+                            if let Some(node_arc) = crate::node::get_transition_handler_node().await
+                            {
                                 let node_guard = node_arc.lock().await;
-                                let mut hashes_guard = node_guard.committed_transaction_hashes.lock().await;
+                                let mut hashes_guard =
+                                    node_guard.committed_transaction_hashes.lock().await;
 
                                 let mut tracked_count = 0;
                                 for block in &subdag.blocks {
                                     for tx in block.transactions() {
-                                        let tx_hash = crate::types::tx_hash::calculate_transaction_hash(tx.data());
+                                        let tx_hash =
+                                            crate::types::tx_hash::calculate_transaction_hash(
+                                                tx.data(),
+                                            );
                                         let hash_hex = hex::encode(&tx_hash);
 
                                         // Special debug logging for the problematic transaction
@@ -483,7 +527,7 @@ impl CommitProcessor {
                             }
 
                             break;
-                        },
+                        }
                         Err(e) => {
                             // Case 1: Duplicate index - Critical Fork Safety check
                             if e.to_string().contains("Duplicate global_exec_index") {
@@ -491,13 +535,13 @@ impl CommitProcessor {
                                     global_exec_index, commit_index, e);
                                 break;
                             }
-                            
+
                             // Case 2: System Transaction (EndOfEpoch) failed - Retry needed
                             if has_system_tx {
                                 retry_count += 1;
                                 error!("🚨 [CRITICAL] Failed to send commit {} containing EndOfEpoch transaction (Attempt {}). Retrying in 1s... Error: {}", 
                                     commit_index, retry_count, e);
-                                
+
                                 sleep(Duration::from_secs(1)).await;
                                 continue;
                             }
@@ -505,7 +549,14 @@ impl CommitProcessor {
                             // Case 3: Regular transaction failure
                             warn!("⚠️  [TX FLOW] Failed to send committed subdag: {}", e);
                             if let Some(ref queue) = pending_transactions_queue {
-                                Self::queue_commit_transactions_for_next_epoch(subdag, queue, commit_index, global_exec_index, epoch).await;
+                                Self::queue_commit_transactions_for_next_epoch(
+                                    subdag,
+                                    queue,
+                                    commit_index,
+                                    global_exec_index,
+                                    epoch,
+                                )
+                                .await;
                             } else {
                                 warn!("⚠️  [TX FLOW] No pending_transactions_queue - transactions may be lost!");
                             }
@@ -518,8 +569,11 @@ impl CommitProcessor {
             }
         } else {
             // Empty commit handling (heartbeat/tick)
-             if let Some(ref client) = executor_client {
-                match client.send_committed_subdag(subdag, epoch, global_exec_index).await {
+            if let Some(ref client) = executor_client {
+                match client
+                    .send_committed_subdag(subdag, epoch, global_exec_index)
+                    .await
+                {
                     Ok(_) => {
                         info!("✅ [TX FLOW] Successfully sent empty commit: global_exec_index={}, commit_index={}",
                             global_exec_index, commit_index);
@@ -529,7 +583,7 @@ impl CommitProcessor {
                             *index_guard = global_exec_index;
                             info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} for empty commit", global_exec_index);
                         }
-                    },
+                    }
                     Err(e) => {
                         if e.to_string().contains("Duplicate global_exec_index") {
                             warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected for empty commit. Skipping.", global_exec_index);
@@ -540,7 +594,7 @@ impl CommitProcessor {
                 }
             }
         }
-        
+
         Ok(())
     }
 }
