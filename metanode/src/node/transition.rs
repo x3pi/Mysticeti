@@ -315,6 +315,29 @@ pub async fn transition_to_epoch_from_system_tx(
         .update_epoch(new_epoch, go_epoch_timestamp_ms)
         .await;
 
+    // SNAPSHOT TRIGGER: Create LVM snapshot after successful epoch transition
+    if config.enable_lvm_snapshot {
+        if let Some(bin_path) = &config.lvm_snapshot_bin_path {
+            let delay_seconds = config.lvm_snapshot_delay_seconds;
+            let snapshot_epoch = new_epoch.saturating_sub(1); // Snapshot the COMPLETED epoch
+            let bin_path_clone = bin_path.clone();
+
+            info!(
+                "📸 [LVM SNAPSHOT] Scheduling snapshot creation for epoch {} in {} seconds...",
+                snapshot_epoch, delay_seconds
+            );
+
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(delay_seconds)).await;
+                trigger_lvm_snapshot(&bin_path_clone, snapshot_epoch).await;
+            });
+        } else {
+            warn!(
+                "⚠️ [LVM SNAPSHOT] enable_lvm_snapshot=true but lvm_snapshot_bin_path is not set!"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -735,4 +758,59 @@ async fn save_transaction_hashes_to_file(
     file.flush().await?;
 
     Ok(())
+}
+
+/// Trigger LVM snapshot creation by calling the external lvm-snap-rsync binary
+/// This is called asynchronously after epoch transition to avoid blocking consensus
+async fn trigger_lvm_snapshot(bin_path: &std::path::Path, epoch_id: u64) {
+    use std::process::Command;
+
+    info!(
+        "📸 [LVM SNAPSHOT] Creating snapshot for epoch {} using {}",
+        epoch_id,
+        bin_path.display()
+    );
+
+    // Run the snapshot command with sudo (required for LVM operations)
+    // The binary expects --id <epoch_number> argument
+    let result = Command::new("sudo")
+        .arg(bin_path)
+        .arg("--id")
+        .arg(epoch_id.to_string())
+        .output();
+
+    match result {
+        Ok(output) => {
+            if output.status.success() {
+                info!(
+                    "✅ [LVM SNAPSHOT] Successfully created snapshot for epoch {}",
+                    epoch_id
+                );
+                if !output.stdout.is_empty() {
+                    info!(
+                        "📸 [LVM SNAPSHOT] Output: {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                }
+            } else {
+                error!(
+                    "❌ [LVM SNAPSHOT] Failed to create snapshot for epoch {}: exit code {:?}",
+                    epoch_id,
+                    output.status.code()
+                );
+                if !output.stderr.is_empty() {
+                    error!(
+                        "❌ [LVM SNAPSHOT] Stderr: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            error!(
+                "❌ [LVM SNAPSHOT] Failed to execute snapshot command for epoch {}: {}",
+                epoch_id, e
+            );
+        }
+    }
 }
