@@ -265,7 +265,7 @@ impl NodeConfig {
                 storage_path: output_dir.join(format!("storage/node_{}", idx)),
                 enable_metrics: true,
                 metrics_port: 9100 + idx as u16,
-                speed_multiplier: 0.2, // Default: 5x slower (0.2 = 1/5 speed)
+                speed_multiplier: 1.0, // Default: normal speed
                 leader_timeout_ms: None,
                 min_round_delay_ms: None,
                 time_based_epoch_change: true,     // Enabled by default
