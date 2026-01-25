@@ -87,16 +87,17 @@ def update_committee_from_genesis():
         with open(genesis_file, 'w') as f:
             json.dump(genesis, f, indent=2)
     else:
-        # Có timestamp - check nếu quá cũ (hơn 1 giờ) thì update
+        # Có timestamp - check nếu quá cũ (hơn 1 epoch = 600s) thì update
         elapsed_seconds = (current_timestamp_ms - existing_timestamp) / 1000
-        if elapsed_seconds > 3600:  # Hơn 1 giờ
-            print(f"⚠️  Existing epoch_timestamp_ms is {elapsed_seconds:.0f}s old, updating to current time")
+        epoch_duration = 600  # seconds
+        if elapsed_seconds > epoch_duration:
+            print(f"⚠️  Existing epoch_timestamp_ms is {elapsed_seconds:.0f}s old (> {epoch_duration}s epoch), resetting to current time")
             genesis['config']['epoch_timestamp_ms'] = current_timestamp_ms
             with open(genesis_file, 'w') as f:
                 json.dump(genesis, f, indent=2)
-            print(f"✅ Updated epoch_timestamp_ms: {existing_timestamp} -> {current_timestamp_ms}")
+            print(f"✅ Reset epoch_timestamp_ms: {existing_timestamp} -> {current_timestamp_ms}")
         else:
-            print(f"📅 Keeping existing epoch_timestamp_ms: {existing_timestamp} (elapsed: {elapsed_seconds:.0f}s)")
+            print(f"📅 Keeping existing epoch_timestamp_ms: {existing_timestamp} (elapsed: {elapsed_seconds:.0f}s < {epoch_duration}s)")
 
     print("✅ Updated committee.json và genesis.json với stake từ delegator_stakes")
     return True
