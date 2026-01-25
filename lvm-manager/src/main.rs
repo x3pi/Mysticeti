@@ -90,10 +90,38 @@ fn main() -> Result<()> {
     let snap_name = format!("{}_{:06}", config.snap_prefix, args.id);
     println!(">>> Kích hoạt tạo Snapshot với ID: {}", args.id);
 
-    // 2. Lấy danh sách snapshot hiện có
+    // 2. CRITICAL: Xóa symlink 'latest' TRƯỚC KHI xóa snapshot cũ
+    // Điều này đảm bảo symlink không bao giờ trỏ vào snapshot đã bị xóa (stale/broken)
+    let link_path = format!("{}/latest", config.base_path);
+    let tracking_file = format!("{}/latest.info", config.base_path);
+
+    if fs::symlink_metadata(&link_path).is_ok() {
+        println!("🔄 Bước đầu tiên: Xóa symlink 'latest' cũ trước khi rotation...");
+        if let Err(e) = Command::new("sudo")
+            .arg("rm")
+            .arg("-f")
+            .arg(&link_path)
+            .status()
+        {
+            println!(
+                "⚠️  Không thể xóa symlink bằng sudo: {}. Thử cách khác...",
+                e
+            );
+            let _ = fs::remove_file(&link_path);
+        }
+        // Xóa file tracking cũ
+        let _ = Command::new("sudo")
+            .arg("rm")
+            .arg("-f")
+            .arg(&tracking_file)
+            .status();
+        println!("✅ Đã xóa symlink và tracking file cũ");
+    }
+
+    // 3. Lấy danh sách snapshot hiện có
     let mut snapshots = get_existing_snapshots(&config.vg_name, &config.snap_prefix)?;
 
-    // 3. Xử lý xoay vòng (Rotation) - Giữ tối đa theo config.max_snapshots
+    // 4. Xử lý xoay vòng (Rotation) - Giữ tối đa theo config.max_snapshots
     if snapshots.contains(&snap_name) {
         println!("Snapshot {} đã tồn tại. Đang xóa để ghi đè...", snap_name);
         remove_full_snapshot(&config.vg_name, &snap_name, &config.base_path)?;
@@ -110,26 +138,23 @@ fn main() -> Result<()> {
         remove_full_snapshot(&config.vg_name, to_remove, &config.base_path)?;
     }
 
-    // 4. Tạo snapshot mới
+    // 5. Tạo snapshot mới
     println!("Đang tạo snapshot: {}...", snap_name);
     create_lvm_snapshot(&config.vg_name, &config.lv_name, &snap_name)?;
 
-    // 5. Mount snapshot để truy cập dữ liệu
+    // 6. Mount snapshot để truy cập dữ liệu
     let mount_point = format!("{}/{}", config.base_path, snap_name);
     fs::create_dir_all(&mount_point)?;
     mount_readonly(&config.vg_name, &snap_name, &mount_point)?;
 
-    // 6. Cập nhật symlink 'latest' trỏ vào THƯ MỤC CON thay vì toàn bộ ổ đĩa
-    // CRITICAL: Handle both absolute and relative paths for share_subdir
-    // If share_subdir starts with '/', it's an absolute path - use it directly
-    // Otherwise, append it to mount_point
+    // 7. Tạo symlink 'latest' MỚI trỏ vào THƯ MỤC CON
+    // (symlink cũ đã được xóa ở bước 2 trước khi rotation)
+    // Handle both absolute and relative paths for share_subdir
     let target_with_subdir = if config.share_subdir.starts_with('/') {
         format!("{}{}", mount_point, config.share_subdir)
     } else {
         format!("{}/{}", mount_point, config.share_subdir)
     };
-
-    let link_path = format!("{}/latest", config.base_path);
     println!(
         "Đang tạo symlink latest: {} -> {}",
         link_path, target_with_subdir
@@ -143,16 +168,7 @@ fn main() -> Result<()> {
         ));
     }
 
-    // Xóa symlink cũ (nếu có) NGAY TRƯỚC khi tạo symlink mới để minimize downtime
-    if fs::symlink_metadata(&link_path).is_ok() {
-        println!("🔄 Xóa symlink cũ trước khi tạo symlink mới...");
-        let _ = Command::new("sudo")
-            .arg("rm")
-            .arg("-rf")
-            .arg(&link_path)
-            .status();
-        // Ignore errors - symlink() will handle if removal fails
-    }
+    // Symlink đã được xóa ở bước 2, giờ tạo mới
 
     symlink(&target_with_subdir, &link_path).context("Lỗi tạo symlink latest")?;
     println!("✅ Tạo symlink latest thành công");
@@ -204,6 +220,24 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Lấy tên snapshot mà symlink 'latest' đang trỏ tới
+/// Trả về None nếu symlink không tồn tại hoặc không thể đọc
+fn get_current_symlink_target(base_path: &str) -> Option<String> {
+    let link_path = format!("{}/latest", base_path);
+    if let Ok(target) = fs::read_link(&link_path) {
+        // Extract snapshot name from target path
+        // e.g., /mnt/lvm_public/snap_id_000004/... -> snap_id_000004
+        if let Some(path_str) = target.to_str() {
+            for component in path_str.split('/') {
+                if component.starts_with("snap_id_") {
+                    return Some(component.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn get_existing_snapshots(vg: &str, prefix: &str) -> Result<Vec<String>> {
     let output = Command::new("lvs")
         .args(["--noheadings", "-o", "lv_name", vg])
@@ -219,6 +253,19 @@ fn get_existing_snapshots(vg: &str, prefix: &str) -> Result<Vec<String>> {
 
 fn remove_full_snapshot(vg: &str, snap_name: &str, base_path: &str) -> Result<()> {
     let mount_point = format!("{}/{}", base_path, snap_name);
+
+    // Kiểm tra xem symlink 'latest' có đang trỏ đến snapshot này không
+    let link_path = format!("{}/latest", base_path);
+    if let Some(current_target) = get_current_symlink_target(base_path) {
+        if current_target == snap_name {
+            println!("⚠️  Symlink 'latest' đang trỏ đến snapshot sắp xóa. Đang xóa symlink...");
+            let _ = fs::remove_file(&link_path);
+            let tracking_file = format!("{}/latest.info", base_path);
+            let _ = fs::remove_file(&tracking_file);
+            println!("✅ Đã xóa symlink và tracking file");
+        }
+    }
+
     let _ = Command::new("umount").arg("-l").arg(&mount_point).status();
     let _ = fs::remove_dir_all(&mount_point);
     let status = Command::new("lvremove")

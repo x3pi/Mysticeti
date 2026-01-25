@@ -2,7 +2,12 @@
 
 # Script để chạy Mixed System:
 # - Standard System: Nodes 0, 2, 3, 4 (Go Master/Sub standard, Rust Nodes standard)
+#   - Node 4 chạy như Full Node (sync-only nếu không trong committee)
 # - Special Node 1:  Node 1 Separate (Go Master/Sub separate, Rust Node separate ports)
+#
+# NodeMode được xác định tự động dựa trên committee membership:
+# - Nếu node nằm trong committee -> Validator
+# - Nếu node không trong committee -> SyncOnly (Full Node)
 #
 # Mục đích: Test khả năng tương tác giữa node chạy port riêng (Node 1) với hệ thống chuẩn.
 
@@ -95,7 +100,7 @@ pkill -9 -f "metanode run" 2>/dev/null || true
 # Standard ports
 # NO CHANGE NEEDED for Go Code here, as Go communicates via Sockets.
 # However, I should kill port 9001 explicitly in cleanup.
-kill_port 9000; kill_port 9001; kill_port 9002; kill_port 9003; # kill_port 9004
+kill_port 9000; kill_port 9001; kill_port 9002; kill_port 9003; kill_port 9004
 # Node 1 Separate ports
 kill_port 9011
 kill_port 10747; kill_port 10000; kill_port 6201; kill_port 9081
@@ -127,10 +132,10 @@ rm -f "$METANODE_ROOT/config/node_*.toml"
 rm -f "$METANODE_ROOT/config/node_*_protocol_key.json"
 rm -f "$METANODE_ROOT/config/node_*_network_key.json"
 
-# Generate keys for 4 nodes (0, 1, 2, 3) + 1 (node 4 not used in this script but standard generates 5 usually? Script says --nodes 4 which means 4 nodes: 0,1,2,3)
-# The original script said --nodes 4.
-print_info "Generating keys for 4 nodes..."
-"$BINARY" generate --nodes 4 --output config
+# Generate keys for 5 nodes (0, 1, 2, 3, 4)
+# Node 4 chạy như full node (mode được xác định bởi committee membership)
+print_info "Generating keys for 5 nodes..."
+"$BINARY" generate --nodes 5 --output config
 
 # DO NOT Restore old backup. Instead, PATCH node_1.toml directly.
 # This ensures it has the exact same structure/params as standard nodes.
@@ -149,9 +154,9 @@ sed -i 's|executor_send_socket_path = ".*"|executor_send_socket_path = "/tmp/exe
 # Fix RECEIVE socket (Rust connects to Go here) - MUST match Go Master 1
 sed -i 's|executor_receive_socket_path = ".*"|executor_receive_socket_path = "/tmp/rust-go-node1-master.sock"|g' config/node_1.toml
 
-# 4b. Update Socket Paths (Standard Nodes 0, 2, 3)
-# Updates 0, 2, 3 to connect to Standard Go Master
-for id in 0 2 3; do
+# 4b. Update Socket Paths (Standard Nodes 0, 2, 3, 4)
+# Updates 0, 2, 3, 4 to connect to Standard Go Master
+for id in 0 2 3 4; do
     sed -i 's|executor_receive_socket_path = ".*"|executor_receive_socket_path = "/tmp/rust-go-standard-master.sock"|g' "config/node_$id.toml"
 done
 
@@ -299,7 +304,8 @@ print_step "Bước 5: Start Rust Consensus Nodes..."
 cd "$METANODE_ROOT"
 
 # 5.1 Start Standard Nodes (0, 2, 3, 4)
-for id in 0 2 3; do
+# Node 4 là full node - mode (Validator/SyncOnly) được xác định tự động bởi committee
+for id in 0 2 3 4; do
     print_info "🚀 Starting Rust Node $id (Standard)..."
     tmux new-session -d -s "metanode-$id" -c "$METANODE_ROOT" \
         "export RUST_LOG=info,consensus_core=debug; $BINARY start --config config/node_$id.toml 2>&1 | tee \"$LOG_DIR/metanode-$id.log\""
@@ -324,8 +330,12 @@ print_info "🎉 MIXED SYSTEM STARTED SUCCESSFULLY!"
 print_info "=========================================="
 echo ""
 print_info "📊 Standard System (Nodes 0, 2, 3, 4):"
-print_info "  - Rust: tmux attach -t metanode-0 (etc)"
-print_info "  - Go:   tmux attach -t go-master / go-sub"
+print_info "  - Rust Node 0: tmux attach -t metanode-0"
+print_info "  - Rust Node 2: tmux attach -t metanode-2"
+print_info "  - Rust Node 3: tmux attach -t metanode-3"
+print_info "  - Rust Node 4: tmux attach -t metanode-4 (Full Node)"
+print_info "  - Go Master:   tmux attach -t go-master"
+print_info "  - Go Sub:      tmux attach -t go-sub"
 print_info ""
 print_info "📊 Node 1 Separate System (Node 1):"
 print_info "  - Rust: tmux attach -t metanode-1-sep"
