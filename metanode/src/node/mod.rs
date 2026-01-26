@@ -597,14 +597,26 @@ impl ConsensusNode {
         parameters.commit_sync_parallel_fetches = config.commit_sync_parallel_fetches;
         parameters.commit_sync_batches_ahead = config.commit_sync_batches_ahead;
 
-        if config.speed_multiplier != 1.0 {
+        // Apply custom timing parameters from config
+        // These control actual block creation timing
+        if let Some(min_round_delay_ms) = config.min_round_delay_ms {
+            info!("📊 Applying min_round_delay_ms = {}ms from config", min_round_delay_ms);
+            parameters.min_round_delay = Duration::from_millis(min_round_delay_ms);
+        }
+        if let Some(leader_timeout_ms) = config.leader_timeout_ms {
+            info!("📊 Applying leader_timeout_ms = {}ms from config", leader_timeout_ms);
+            parameters.leader_timeout = Duration::from_millis(leader_timeout_ms);
+        }
+        
+        // Also apply speed multiplier if set (legacy compatibility)
+        if config.speed_multiplier != 1.0 && config.leader_timeout_ms.is_none() {
             info!("Applying speed multiplier: {}x", config.speed_multiplier);
-            let leader_timeout = config
-                .leader_timeout_ms
-                .map(Duration::from_millis)
-                .unwrap_or_else(|| Duration::from_millis((200.0 / config.speed_multiplier) as u64));
+            let leader_timeout = Duration::from_millis((200.0 / config.speed_multiplier) as u64);
             parameters.leader_timeout = leader_timeout;
         }
+        
+        info!("📊 Final timing: min_round_delay={:?}, leader_timeout={:?}", 
+              parameters.min_round_delay, parameters.leader_timeout);
 
         let db_path = config
             .storage_path
