@@ -81,6 +81,7 @@ fi
 # ==============================================================================
 print_step "Bước 1: Cleanup dữ liệu toàn bộ hệ thống..."
 
+####
 # 1.1 Clean Standard Data (Logic from run_full_system.sh)
 print_info "🧹 Cleaning Standard Data..."
 mkdir -p "$LOG_DIR"

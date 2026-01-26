@@ -763,7 +763,9 @@ async fn save_transaction_hashes_to_file(
 /// Trigger LVM snapshot creation by calling the external lvm-snap-rsync binary
 /// This is called asynchronously after epoch transition to avoid blocking consensus
 async fn trigger_lvm_snapshot(bin_path: &std::path::Path, epoch_id: u64) {
-    use std::process::Command;
+    use tokio::process::Command;
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
 
     info!(
         "📸 [LVM SNAPSHOT] Creating snapshot for epoch {} using {}",
@@ -771,15 +773,39 @@ async fn trigger_lvm_snapshot(bin_path: &std::path::Path, epoch_id: u64) {
         bin_path.display()
     );
 
-    // Run the snapshot command with sudo (required for LVM operations)
+    // Run the snapshot command with sudo -S (read password from stdin)
     // The binary expects --id <epoch_number> argument
-    let result = Command::new("sudo")
+    let mut child = match Command::new("sudo")
+        .arg("-S") // Read password from stdin
         .arg(bin_path)
         .arg("--id")
         .arg(epoch_id.to_string())
-        .output();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            error!(
+                "❌ [LVM SNAPSHOT] Failed to spawn snapshot command for epoch {}: {}",
+                epoch_id, e
+            );
+            return;
+        }
+    };
 
-    match result {
+    // Write password to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        let password = "1234@abcd\n";
+        if let Err(e) = stdin.write_all(password.as_bytes()).await {
+            error!("❌ [LVM SNAPSHOT] Failed to write password: {}", e);
+        }
+        // stdin is dropped here, closing it
+    }
+
+    // Wait for command to complete
+    match child.wait_with_output().await {
         Ok(output) => {
             if output.status.success() {
                 info!(
@@ -799,16 +825,22 @@ async fn trigger_lvm_snapshot(bin_path: &std::path::Path, epoch_id: u64) {
                     output.status.code()
                 );
                 if !output.stderr.is_empty() {
-                    error!(
-                        "❌ [LVM SNAPSHOT] Stderr: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+                    // Filter out password prompt from stderr
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let filtered: String = stderr
+                        .lines()
+                        .filter(|line| !line.contains("[sudo]") && !line.contains("password"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !filtered.is_empty() {
+                        error!("❌ [LVM SNAPSHOT] Stderr: {}", filtered);
+                    }
                 }
             }
         }
         Err(e) => {
             error!(
-                "❌ [LVM SNAPSHOT] Failed to execute snapshot command for epoch {}: {}",
+                "❌ [LVM SNAPSHOT] Failed to wait for snapshot command for epoch {}: {}",
                 epoch_id, e
             );
         }
