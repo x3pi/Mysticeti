@@ -3,4 +3,4 @@ lv_name = "ubuntu-lv"
 snap_prefix = "snap_id"     # Tiền tố tên snapshot
 max_snapshots = 3            # Luôn giữ tối đa 3 bản cho test
 base_path = "/mnt/lvm_public" # Thư mục để mount và chia sẻ Rsync
-share_subdir = "/home/abc/chain-n/mtn-simple-2025/cmd/simple_chain/sample/simple/data-write/data"   # Thư mục con cần chia sẻ dưới mỗi snapshot
+share_subdir = "/home/abc/nhat/consensus-chain/mtn-simple-2025/cmd/simple_chain/sample/simple/data-write/data"   # Thư mục con cần chia sẻ dưới mỗi snapshot

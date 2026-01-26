@@ -8,8 +8,8 @@ import sys
 import time
 
 def update_committee_from_genesis():
-    committee_file = '/home/abc/chain-n/Mysticeti/metanode/config/committee.json'
-    genesis_file = '/home/abc/chain-n/mtn-simple-2025/cmd/simple_chain/genesis.json'
+    committee_file = '/home/abc/nhat/consensus-chain/Mysticeti/metanode/config/committee.json'
+    genesis_file = '/home/abc/nhat/consensus-chain/mtn-simple-2025/cmd/simple_chain/genesis.json'
 
     # Load files
     try:

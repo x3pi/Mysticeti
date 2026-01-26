@@ -32,6 +32,31 @@ print_warn() { echo -e "${YELLOW}⚠️  $1${NC}"; }
 print_error() { echo -e "${RED}❌ $1${NC}"; }
 print_step() { echo -e "${BLUE}📋 $1${NC}"; }
 
+# Function to apply custom node configurations
+apply_custom_node_configs() {
+    print_info "🔧 Applying custom node configurations..."
+    
+    # Node 0: Primary node with 10s block delay
+    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' config/node_0.toml
+    sed -i 's|enable_lvm_snapshot = false|enable_lvm_snapshot = true|g' config/node_0.toml
+    
+    # Node 1: Separate node with 10s block delay
+    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' config/node_1.toml
+    
+    # Node 2 & 3: Same 10s block delay for consistency
+    for id in 2 3; do
+        sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
+    done
+    
+    # Apply global settings to all nodes
+    for id in 0 1 2 3; do
+        sed -i 's|adaptive_delay_enabled = false|adaptive_delay_enabled = true|g' "config/node_$id.toml"
+        sed -i 's|commit_sync_batch_size = 200|commit_sync_batch_size = 50|g' "config/node_$id.toml"
+    done
+    
+    print_info "✅ Custom node configurations applied (10s block delay)"
+}
+
 if [ ! -d "$GO_PROJECT_ROOT" ]; then
     print_error "Cannot find Go project at $GO_PROJECT_ROOT"
     exit 1
@@ -42,7 +67,6 @@ fi
 # ==============================================================================
 print_step "Bước 1: Cleanup dữ liệu toàn bộ hệ thống..."
 
-####
 # 1.1 Clean Standard Data (Logic from run_full_system.sh)
 print_info "🧹 Cleaning Standard Data..."
 mkdir -p "$LOG_DIR"
@@ -133,8 +157,20 @@ rm -f "$METANODE_ROOT/config/node_*_network_key.json"
 print_info "Generating keys for 4 nodes..."
 "$BINARY" generate --nodes 4 --output config
 
+# OPTIONAL: Use template configs instead of patching (uncomment if you have templates)
+# if [ -d "$SCRIPT_DIR/config_templates" ]; then
+#     print_info "🔧 Using template configs instead of patches..."
+#     cp "$SCRIPT_DIR/config_templates/node_0_template.toml" config/node_0.toml
+#     cp "$SCRIPT_DIR/config_templates/node_1_template.toml" config/node_1.toml
+#     cp "$SCRIPT_DIR/config_templates/node_2_template.toml" config/node_2.toml
+#     cp "$SCRIPT_DIR/config_templates/node_3_template.toml" config/node_3.toml
+# fi
+
 # DO NOT Restore old backup. Instead, PATCH node_1.toml directly.
 # This ensures it has the exact same structure/params as standard nodes.
+
+# Apply custom configurations first
+apply_custom_node_configs
 
 # Patch node_1.toml for custom ports/sockets/paths
 # 1. Update Network Port (9001 -> 9011)
@@ -161,6 +197,23 @@ done
 sed -i 's|executor_commit_enabled = false|executor_commit_enabled = true|g' config/node_1.toml
 # Ensure read enabled too
 sed -i 's|executor_read_enabled = false|executor_read_enabled = true|g' config/node_1.toml
+
+# 6. CUSTOM: Apply adaptive delay settings to all nodes (10s delay)
+print_info "🔧 Applying 10s block delay settings..."
+for id in 0 1 2 3; do
+    # Set adaptive delay to 10000ms (10 seconds) for very slow consensus
+    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
+    sed -i 's|adaptive_delay_ms = 300|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
+    sed -i 's|adaptive_delay_ms = 500|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
+    sed -i 's|adaptive_delay_ms = 200|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
+    
+    # Enable adaptive delay if not already enabled
+    sed -i 's|adaptive_delay_enabled = false|adaptive_delay_enabled = true|g' "config/node_$id.toml"
+    
+    # Reduce commit batch size for slower processing
+    sed -i 's|commit_sync_batch_size = 200|commit_sync_batch_size = 50|g' "config/node_$id.toml"
+    sed -i 's|commit_sync_batch_size = 100|commit_sync_batch_size = 50|g' "config/node_$id.toml"
+done
 
 # 6. CRITICAL: Enable LVM Snapshot for Node 0 (Primary node creates epoch snapshots)
 print_info "🔧 Enabling LVM Snapshot for Node 0..."
