@@ -25,6 +25,7 @@ struct Config {
     max_snapshots: usize,
     base_path: String,
     share_subdir: String, // Thêm trường này để xác định thư mục con cần share
+    sudo_password: Option<String>, // Mật khẩu sudo (nếu có)
 }
 
 /// Tìm file config.toml theo thứ tự ưu tiên:
@@ -79,6 +80,53 @@ fn find_config(config_arg: &Option<String>) -> Result<String> {
     ))
 }
 
+/// Thực thi lệnh với quyền root (sudo).
+/// Nếu có password trong config, dùng `sudo -S`.
+/// Nếu không, dùng `sudo` thường (hy vọng đã có quyền hoặc NOPASSWD).
+fn run_privileged(cmd: &str, args: &[&str], config: &Config) -> Result<()> {
+    if let Some(ref pwd) = config.sudo_password {
+        // Echo password vào stdin của sudo -S
+        let mut child = Command::new("sudo")
+            .args(["-S", "-p", "", cmd]) // -p '' để không in prompt
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .context(format!("Không thể khởi chạy sudo {}", cmd))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(pwd.as_bytes())?;
+            stdin.write_all(b"\n")?;
+        }
+
+        let status = child.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "Lệnh '{}' thất bại với mã lỗi {:?}",
+                cmd,
+                status.code()
+            ))
+        }
+    } else {
+        // Chạy sudo thường
+        let status = Command::new("sudo")
+            .arg(cmd)
+            .args(args)
+            .status()
+            .context(format!("Không thể chạy lệnh sudo {}", cmd))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(anyhow!("Lệnh '{}' thất bại", cmd))
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -97,12 +145,7 @@ fn main() -> Result<()> {
 
     if fs::symlink_metadata(&link_path).is_ok() {
         println!("🔄 Bước đầu tiên: Xóa symlink 'latest' cũ trước khi rotation...");
-        if let Err(e) = Command::new("sudo")
-            .arg("rm")
-            .arg("-f")
-            .arg(&link_path)
-            .status()
-        {
+        if let Err(e) = run_privileged("rm", &["-f", &link_path], &config) {
             println!(
                 "⚠️  Không thể xóa symlink bằng sudo: {}. Thử cách khác...",
                 e
@@ -110,11 +153,7 @@ fn main() -> Result<()> {
             let _ = fs::remove_file(&link_path);
         }
         // Xóa file tracking cũ
-        let _ = Command::new("sudo")
-            .arg("rm")
-            .arg("-f")
-            .arg(&tracking_file)
-            .status();
+        let _ = run_privileged("rm", &["-f", &tracking_file], &config);
         println!("✅ Đã xóa symlink và tracking file cũ");
     }
 
@@ -124,7 +163,7 @@ fn main() -> Result<()> {
     // 4. Xử lý xoay vòng (Rotation) - Giữ tối đa theo config.max_snapshots
     if snapshots.contains(&snap_name) {
         println!("Snapshot {} đã tồn tại. Đang xóa để ghi đè...", snap_name);
-        remove_full_snapshot(&config.vg_name, &snap_name, &config.base_path)?;
+        remove_full_snapshot(&config.vg_name, &snap_name, &config.base_path, &config)?;
         snapshots.retain(|x| x != &snap_name);
     }
 
@@ -135,17 +174,59 @@ fn main() -> Result<()> {
             "Đã đủ {} bản. Đang xóa bản cũ nhất: {}",
             config.max_snapshots, to_remove
         );
-        remove_full_snapshot(&config.vg_name, to_remove, &config.base_path)?;
+        remove_full_snapshot(&config.vg_name, to_remove, &config.base_path, &config)?;
     }
 
     // 5. Tạo snapshot mới
     println!("Đang tạo snapshot: {}...", snap_name);
-    create_lvm_snapshot(&config.vg_name, &config.lv_name, &snap_name)?;
+    create_lvm_snapshot(&config.vg_name, &config.lv_name, &snap_name, &config)?;
 
     // 6. Mount snapshot để truy cập dữ liệu
     let mount_point = format!("{}/{}", config.base_path, snap_name);
     fs::create_dir_all(&mount_point)?;
-    mount_readonly(&config.vg_name, &snap_name, &mount_point)?;
+
+    // 6a. Thử mount với rollback nếu thất bại
+    if let Err(e) = mount_readonly(&config.vg_name, &snap_name, &mount_point, &config) {
+        println!("❌ Mount thất bại: {}. Đang rollback...", e);
+        // Xóa thư mục mount rỗng
+        let _ = fs::remove_dir(&mount_point);
+        // Xóa LVM snapshot vừa tạo
+        let _ = run_privileged(
+            "lvremove",
+            &["-f", &format!("{}/{}", config.vg_name, snap_name)],
+            &config,
+        );
+        println!("🔄 Đã rollback: xóa thư mục mount và LVM snapshot");
+        return Err(e);
+    }
+
+    // 6b. VERIFY mount thành công bằng cách kiểm tra thư mục không rỗng
+    let entries: Vec<_> = fs::read_dir(&mount_point)
+        .context("Không thể đọc mount point")?
+        .collect();
+    if entries.is_empty() {
+        println!(
+            "❌ Mount thất bại: thư mục {} rỗng sau mount. Đang rollback...",
+            mount_point
+        );
+        // Umount (có thể không cần nếu mount thất bại, nhưng để chắc chắn)
+        let _ = run_privileged("umount", &["-l", &mount_point], &config);
+        let _ = fs::remove_dir(&mount_point);
+        let _ = run_privileged(
+            "lvremove",
+            &["-f", &format!("{}/{}", config.vg_name, snap_name)],
+            &config,
+        );
+        println!("🔄 Đã rollback: xóa mount point và LVM snapshot");
+        return Err(anyhow!(
+            "Mount verification thất bại: thư mục {} rỗng sau mount",
+            mount_point
+        ));
+    }
+    println!(
+        "✅ Đã verify mount thành công ({} entries trong mount point)",
+        entries.len()
+    );
 
     // 7. Tạo symlink 'latest' MỚI trỏ vào THƯ MỤC CON
     // (symlink cũ đã được xóa ở bước 2 trước khi rotation)
@@ -251,7 +332,7 @@ fn get_existing_snapshots(vg: &str, prefix: &str) -> Result<Vec<String>> {
     Ok(snaps)
 }
 
-fn remove_full_snapshot(vg: &str, snap_name: &str, base_path: &str) -> Result<()> {
+fn remove_full_snapshot(vg: &str, snap_name: &str, base_path: &str, config: &Config) -> Result<()> {
     let mount_point = format!("{}/{}", base_path, snap_name);
 
     // Kiểm tra xem symlink 'latest' có đang trỏ đến snapshot này không
@@ -259,43 +340,43 @@ fn remove_full_snapshot(vg: &str, snap_name: &str, base_path: &str) -> Result<()
     if let Some(current_target) = get_current_symlink_target(base_path) {
         if current_target == snap_name {
             println!("⚠️  Symlink 'latest' đang trỏ đến snapshot sắp xóa. Đang xóa symlink...");
-            let _ = fs::remove_file(&link_path);
+            let _ = run_privileged("rm", &["-f", &link_path], config);
             let tracking_file = format!("{}/latest.info", base_path);
-            let _ = fs::remove_file(&tracking_file);
+            let _ = run_privileged("rm", &["-f", &tracking_file], config);
             println!("✅ Đã xóa symlink và tracking file");
         }
     }
 
-    let _ = Command::new("umount").arg("-l").arg(&mount_point).status();
-    let _ = fs::remove_dir_all(&mount_point);
-    let status = Command::new("lvremove")
-        .args(["-f", &format!("{}/{}", vg, snap_name)])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("Lỗi xóa LV snapshot"))
-    }
+    let _ = run_privileged("umount", &["-l", &mount_point], config);
+    let _ = fs::remove_dir_all(&mount_point); // Remove mount point dir, typically doesn't need sudo if owned by user, but strictly speaking generated by root? No, fs::create_dir_all was likely as user.
+                                              // Actually, if mount was done as root, the dir might need root to remove? Ideally mount point ownership is preserved.
+                                              // If 'umount' succeeds, the dir is just a dir.
+
+    // Use sudo to remove the directory just in case
+    let _ = run_privileged("rm", &["-rf", &mount_point], config);
+
+    run_privileged(
+        "lvremove",
+        &["-f", &format!("{}/{}", vg, snap_name)],
+        config,
+    )
+    .context("Lỗi xóa LV snapshot")
 }
 
-fn create_lvm_snapshot(vg: &str, lv: &str, snap_name: &str) -> Result<()> {
-    let status = Command::new("lvcreate")
-        .args(["-s", "-n", snap_name, "-L", "1G", &format!("{}/{}", vg, lv)])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("Lỗi lệnh lvcreate"))
-    }
+fn create_lvm_snapshot(vg: &str, lv: &str, snap_name: &str, config: &Config) -> Result<()> {
+    run_privileged(
+        "lvcreate",
+        &["-s", "-n", snap_name, "-L", "5G", &format!("{}/{}", vg, lv)],
+        config,
+    )
+    .context("Lỗi lệnh lvcreate")
 }
 
-fn mount_readonly(vg: &str, snap: &str, path: &str) -> Result<()> {
-    let status = Command::new("mount")
-        .args(["-o", "ro", &format!("/dev/{}/{}", vg, snap), path])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("Lỗi lệnh mount"))
-    }
+fn mount_readonly(vg: &str, snap: &str, path: &str, config: &Config) -> Result<()> {
+    run_privileged(
+        "mount",
+        &["-o", "ro", &format!("/dev/{}/{}", vg, snap), path],
+        config,
+    )
+    .context("Lỗi lệnh mount")
 }

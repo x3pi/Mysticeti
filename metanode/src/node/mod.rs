@@ -597,13 +597,20 @@ impl ConsensusNode {
         parameters.commit_sync_parallel_fetches = config.commit_sync_parallel_fetches;
         parameters.commit_sync_batches_ahead = config.commit_sync_batches_ahead;
 
-        if config.speed_multiplier != 1.0 {
+        // Apply min_round_delay if configured
+        if let Some(ms) = config.min_round_delay_ms {
+            parameters.min_round_delay = Duration::from_millis(ms);
+        }
+
+        parameters.adaptive_delay_enabled = config.adaptive_delay_enabled;
+
+        // Apply leader_timeout: explicit config takes precedence, otherwise calculate from speed_multiplier
+        if let Some(ms) = config.leader_timeout_ms {
+            parameters.leader_timeout = Duration::from_millis(ms);
+        } else if config.speed_multiplier != 1.0 {
             info!("Applying speed multiplier: {}x", config.speed_multiplier);
-            let leader_timeout = config
-                .leader_timeout_ms
-                .map(Duration::from_millis)
-                .unwrap_or_else(|| Duration::from_millis((200.0 / config.speed_multiplier) as u64));
-            parameters.leader_timeout = leader_timeout;
+            parameters.leader_timeout =
+                Duration::from_millis((200.0 / config.speed_multiplier) as u64);
         }
 
         let db_path = config

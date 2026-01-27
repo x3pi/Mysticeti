@@ -5,16 +5,15 @@ use std::{sync::Arc, time::Instant};
 
 use consensus_config::{AuthorityIndex, Committee, NetworkKeyPair, Parameters, ProtocolKeyPair};
 use itertools::Itertools;
+use meta_protocol_config::ProtocolConfig;
 use mysten_metrics::spawn_logged_monitored_task;
 use parking_lot::RwLock;
 use prometheus::Registry;
-use meta_protocol_config::ProtocolConfig;
 use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::{
     adaptive_delay::AdaptiveDelayState,
-    CommitConsumerArgs,
     authority_service::AuthorityService,
     block_manager::BlockManager,
     block_verifier::SignedBlockVerifier,
@@ -28,7 +27,7 @@ use crate::{
     leader_schedule::LeaderSchedule,
     leader_timeout::{LeaderTimeoutTask, LeaderTimeoutTaskHandle},
     metrics::initialise_metrics,
-    network::{NetworkManager, tonic_network::TonicManager},
+    network::{tonic_network::TonicManager, NetworkManager},
     proposed_block_handler::ProposedBlockHandler,
     round_prober::{RoundProber, RoundProberHandle},
     round_tracker::PeerRoundTracker,
@@ -38,6 +37,7 @@ use crate::{
     system_transaction_provider::SystemTransactionProvider,
     transaction::{TransactionClient, TransactionConsumer, TransactionVerifier},
     transaction_certifier::TransactionCertifier,
+    CommitConsumerArgs,
 };
 
 /// ConsensusAuthority is used by Sui to manage the lifetime of AuthorityNode.
@@ -180,10 +180,11 @@ where
         );
         info!("Consensus parameters: {:?}", parameters);
         info!("Consensus committee: {:?}", committee);
-        
+
         // Save min_round_delay before moving parameters into Context
         let min_round_delay_ms = parameters.min_round_delay.as_millis() as u64;
-        
+        let adaptive_delay_enabled = parameters.adaptive_delay_enabled;
+
         let context = Arc::new(Context::new(
             epoch_start_timestamp_ms,
             own_index,
@@ -267,13 +268,15 @@ where
 
         let round_tracker = Arc::new(RwLock::new(PeerRoundTracker::new(context.clone())));
 
-        // Create adaptive delay state (enabled by default with base delay from min_round_delay)
-        // TODO: Make this configurable from NodeConfig (currently using default: enabled, base_delay = min_round_delay)
+        // Create adaptive delay state
         let adaptive_delay_state = Arc::new(AdaptiveDelayState::new(
             min_round_delay_ms,
-            true, // enabled by default - can be configured via NodeConfig in the future
+            adaptive_delay_enabled,
         ));
-        info!("Adaptive delay enabled: base_delay={}ms", min_round_delay_ms);
+        info!(
+            "Adaptive delay enabled: base_delay={}ms",
+            min_round_delay_ms
+        );
 
         let core = Core::new(
             context.clone(),
@@ -396,10 +399,7 @@ where
             }
             // Cancellation can happen during an epoch transition where we intentionally abort in-flight tasks.
             // Keep it at DEBUG to avoid alarming operators.
-            tracing::debug!(
-                "Synchronizer stop returned error during shutdown: {:?}",
-                e
-            );
+            tracing::debug!("Synchronizer stop returned error during shutdown: {:?}", e);
         };
         self.commit_syncer_handle.stop().await;
         self.round_prober_handle.stop().await;
@@ -433,21 +433,21 @@ mod tests {
         time::Duration,
     };
 
-    use consensus_config::{Parameters, local_committee_and_keys};
-    use mysten_metrics::RegistryService;
+    use consensus_config::{local_committee_and_keys, Parameters};
+    use meta_protocol_config::ProtocolConfig;
     use mysten_metrics::monitored_mpsc::UnboundedReceiver;
+    use mysten_metrics::RegistryService;
     use prometheus::Registry;
     use rstest::rstest;
-    use meta_protocol_config::ProtocolConfig;
     use tempfile::TempDir;
     use tokio::time::{sleep, timeout};
     use typed_store::DBMetrics;
 
     use super::*;
     use crate::{
-        CommittedSubDag,
         block::{BlockAPI as _, CertifiedBlocksOutput, GENESIS_ROUND},
         transaction::NoopTransactionVerifier,
+        CommittedSubDag,
     };
 
     #[rstest]

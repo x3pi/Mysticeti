@@ -126,16 +126,20 @@ fi
 BINARY="$METANODE_ROOT/target/release/metanode"
 
 # 3.2 Update Committee & Genesis (Standard Logic)
-# Clean old configs
-rm -f "$METANODE_ROOT/config/committee.json"
-rm -f "$METANODE_ROOT/config/node_*.toml"
-rm -f "$METANODE_ROOT/config/node_*_protocol_key.json"
-rm -f "$METANODE_ROOT/config/node_*_network_key.json"
+if [ -z "$KEEP_KEYS" ]; then
+    # Clean old configs
+    rm -f "$METANODE_ROOT/config/committee.json"
+    rm -f "$METANODE_ROOT/config/node_*.toml"
+    rm -f "$METANODE_ROOT/config/node_*_protocol_key.json"
+    rm -f "$METANODE_ROOT/config/node_*_network_key.json"
 
-# Generate keys for 5 nodes (0, 1, 2, 3, 4)
-# Node 4 chạy như full node (mode được xác định bởi committee membership)
-print_info "Generating keys for 5 nodes..."
-"$BINARY" generate --nodes 5 --output config
+    # Generate keys for 5 nodes (0, 1, 2, 3, 4)
+    # Node 4 chạy như full node (mode được xác định bởi committee membership)
+    print_info "Generating keys for 5 nodes..."
+    "$BINARY" generate --nodes 5 --output config
+else
+    print_info "🔑 Skipping key generation (KEEP_KEYS set)..."
+fi
 
 # DO NOT Restore old backup. Instead, PATCH node_1.toml directly.
 # This ensures it has the exact same structure/params as standard nodes.
@@ -272,6 +276,11 @@ sleep 5
 
 # 4.2 Start Standard Go Sub
 print_info "🚀 Starting Standard Go Sub (go-sub)..."
+
+# Standard sockets are already configured in config-master.json and node_0.toml (via generation template or default)
+# We assume node_0.toml points to go-master sockets by default generation logic or previous manual edits.
+
+
 tmux new-session -d -s go-sub -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
     "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data-write/data/xapian_node' && go run . -config=config-sub-write.json 2>&1 | tee \"$LOG_DIR/go-sub.log\""
 sleep 5
@@ -322,8 +331,141 @@ print_info "⏳ Waiting for Rust nodes to start..."
 sleep 5
 
 # ==============================================================================
+# Step 5.5: Update add_validator_node4 config with new keys
+# ==============================================================================
+print_step "Bước 5.5: Update add_validator_node4 config..."
+
+ADD_VALIDATOR_TOOL_DIR="$GO_PROJECT_ROOT/cmd/tool/add_validator_node4"
+if [ -d "$ADD_VALIDATOR_TOOL_DIR" ]; then
+    print_info "🔧 Updating add_validator_node4 config from new committee.json..."
+    
+    # Read chain_id from genesis
+    CHAIN_ID=$(python3 -c "import json; print(json.load(open('$GENESIS_OUTPUT'))['config']['chainId'])" 2>/dev/null || echo "991")
+    
+    # Extract node-4 info from committee.json and update config
+    python3 << PYTHON_EOF
+import json
+import re
+import os
+
+committee_path = "$METANODE_ROOT/config/committee.json"
+tool_dir = "$ADD_VALIDATOR_TOOL_DIR"
+chain_id = $CHAIN_ID
+
+with open(committee_path, 'r') as f:
+    committee = json.load(f)
+
+# Find node-4 in authorities (by port 9004 or hostname)
+node4 = None
+for auth in committee['authorities']:
+    hostname = auth.get('hostname', '')
+    address = auth.get('address', '')
+    if 'node-4' in hostname or 'node_4' in hostname or address.endswith(':9004'):
+        node4 = auth
+        break
+
+if node4:
+    print(f"   Found node-4 in committee.json: {node4.get('hostname')}")
+    
+    # Update main.go with new keys
+    main_go_path = os.path.join(tool_dir, "main.go")
+    if os.path.exists(main_go_path):
+        with open(main_go_path, 'r') as f:
+            content = f.read()
+        
+        # Replace node4Info struct values
+        content = re.sub(r'Address:\s*"[^"]*"', f'Address:      "{node4.get("address", "/ip4/127.0.0.1/tcp/9004")}"', content)
+        content = re.sub(r'Hostname:\s*"[^"]*"', f'Hostname:     "{node4.get("hostname", "node-4")}"', content)
+        content = re.sub(r'AuthorityKey:\s*"[^"]*"', f'AuthorityKey: "{node4.get("authority_key", "")}"', content)
+        content = re.sub(r'ProtocolKey:\s*"[^"]*"', f'ProtocolKey:  "{node4.get("protocol_key", "")}"', content)
+        content = re.sub(r'NetworkKey:\s*"[^"]*"', f'NetworkKey:   "{node4.get("network_key", "")}"', content)
+        
+        with open(main_go_path, 'w') as f:
+            f.write(content)
+        print("   ✅ Updated main.go with node-4 keys")
+    
+    # Create config.json with a unique BLS key for node-4
+    # HARDCODED VALID KEY AND ADDRESS to avoid SIGSEGV and dependency issues
+    node4_bls_key = "6c8489f6f86fea58b26e34c8c37e13e5993651f09f5f96739d9febf65aded718"
+    node4_eth_address = "a87c6FD018Da82a52158B0328D61BAc29b556e86".lower()
+    
+    config = {
+        "private_key": node4_bls_key,
+        "version": "0.0.1.0",
+        "parent_address": "0x0000000000000000000000000000000000000000",
+        "parent_connection_address": "127.0.0.1:4200",
+        "parent_connection_type": "TCP_CONNECTION",
+        "chain_id": chain_id
+    }
+    
+    config_path = os.path.join(tool_dir, "config.json")
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"   ✅ Created config.json with HARDCODED valid key")
+    print(f"   Chain ID: {chain_id}")
+    
+    # CRITICAL: Add node-4 address to genesis.json alloc with balance
+    try:
+        # Add to genesis.json alloc
+        genesis_path = "$GENESIS_OUTPUT"
+        with open(genesis_path, 'r') as f:
+            genesis = json.load(f)
+        
+        # Add node-4 address with balance
+        node4_balance = "2000000000000000000000000000000"  # Same as other validators
+        node4_bls_pub = "0x86d5de6f7c9c13cc0d959a553cc0e4853ba5faae45a28da9bddc8ef8e104eb5d3dece8dfaa24f11b4243ec27537e3184"
+        
+        # HARDCODED OLD ADDR TO REMOVE
+        old_node4_addr = "c98223c939f0313d5b5dace9c3c3759af4de663a".lower()
+
+        # Check if alloc exists or is list
+        if 'alloc' not in genesis:
+             genesis['alloc'] = []
+             
+        # Filter out OLD incorrect address FIRST if it exists
+        genesis['alloc'] = [entry for entry in genesis['alloc'] if entry.get('address','').lower().replace('0x','') != old_node4_addr]
+             
+        # Check if new address present
+        found = False
+        for entry in genesis['alloc']:
+             if entry['address'].lower().replace('0x','') == node4_eth_address:
+                 entry['balance'] = node4_balance
+                 entry['publicKeyBls'] = node4_bls_pub
+                 found = True
+                 break
+        
+        if not found:
+             genesis['alloc'].append({
+                 "address": "0x" + node4_eth_address,
+                 "balance": node4_balance,
+                 "pending_balance": "0",
+                 "last_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                 "device_key": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                 "publicKeyBls": node4_bls_pub
+             })
+        
+        with open(genesis_path, 'w') as f:
+            json.dump(genesis, f, indent=2)
+        
+        print(f"   ✅ Removed old node-4 ({old_node4_addr}) if existed")
+        print(f"   ✅ Added/Updated node-4 address 0x{node4_eth_address} to genesis.json with balance")
+    except Exception as e:
+        print(f"   ⚠️  Could not add node-4 to genesis: {e}")
+else:
+    print("   ⚠️  node-4 not found in committee.json")
+PYTHON_EOF
+
+    # Rebuild the tool
+    print_info "🔨 Rebuilding add_validator_node4..."
+    cd "$ADD_VALIDATOR_TOOL_DIR"
+    go build -o add_validator_node4 . 2>&1 && print_info "   ✅ Tool rebuilt successfully" || print_warn "   Build failed, manual rebuild needed"
+    cd "$METANODE_ROOT"
+fi
+
+# ==============================================================================
 # Step 6: Summary
 # ==============================================================================
+
 echo ""
 print_info "=========================================="
 print_info "🎉 MIXED SYSTEM STARTED SUCCESSFULLY!"
@@ -342,3 +484,8 @@ print_info "  - Rust: tmux attach -t metanode-1-sep"
 print_info "  - Go:   tmux attach -t go-master-1 / go-sub-1"
 echo ""
 print_info "Log files in $LOG_DIR/*.log"
+echo ""
+print_info "📝 To register Node-4 as validator:"
+print_info "  cd $GO_PROJECT_ROOT/cmd/tool/add_validator_node4"
+print_info "  ./add_validator_node4 config.json"
+echo ""
