@@ -9,7 +9,7 @@ use meta_protocol_config::ProtocolConfig;
 use mysten_metrics::spawn_logged_monitored_task;
 use parking_lot::RwLock;
 use prometheus::Registry;
-use tokio::task::JoinHandle;
+use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::info;
 
 use crate::{
@@ -132,6 +132,11 @@ where
     core_thread_handle: CoreThreadHandle,
     subscriber: Subscriber<N::Client, AuthorityService<ChannelCoreThreadDispatcher>>,
     network_manager: N,
+    /// Keeper for broadcast sender to prevent channel from closing during async spawning.
+    /// This ensures the broadcast channel stays open until all components are fully initialized.
+    /// Without this, race conditions can cause ProposedBlockHandler to receive "channel closed" immediately.
+    #[allow(dead_code)]
+    broadcast_sender_keeper: broadcast::Sender<crate::block::ExtendedBlock>,
 }
 
 impl<N> AuthorityNode<N>
@@ -213,6 +218,21 @@ where
 
         let (core_signals, signals_receivers) = CoreSignals::new(context.clone());
 
+        // CRITICAL FIX: Get the broadcast sender keeper IMMEDIATELY after CoreSignals creation
+        // and BEFORE any tasks are spawned. This prevents the broadcast channel from closing
+        // if Core is dropped before CoreThread starts, which would cause ProposedBlockHandler
+        // to exit immediately with "Broadcast channel CLOSED" error.
+        // The keeper must be obtained here because:
+        // 1. ProposedBlockHandler is spawned at line ~247 with signals_receivers.block_broadcast_receiver()
+        // 2. The receiver subscribes to the broadcast channel
+        // 3. If all strong senders are dropped before the task runs, the channel closes
+        // 4. Holding the keeper here ensures at least one strong sender survives
+        let broadcast_sender_keeper = signals_receivers.broadcast_sender_keeper();
+        info!(
+            "📡 [AUTHORITY NODE] Broadcast sender keeper obtained, receiver_count={}, total_senders_should_be=3",
+            broadcast_sender_keeper.receiver_count()
+        );
+
         let mut network_manager = N::new(context.clone(), network_keypair);
         let network_client = network_manager.client();
 
@@ -238,6 +258,10 @@ where
             transaction_certifier.clone(),
         );
 
+        info!(
+            "📡 [AUTHORITY NODE] About to spawn ProposedBlockHandler, keeper receiver_count={}",
+            broadcast_sender_keeper.receiver_count()
+        );
         let proposed_block_handler =
             spawn_logged_monitored_task!(proposed_block_handler.run(), "proposed_block_handler");
 
@@ -367,7 +391,7 @@ where
         network_manager.install_service(network_service).await;
 
         info!(
-            "Consensus authority started, took {:?}",
+            "✅ [AUTHORITY NODE] Consensus authority started, took {:?}",
             start_time.elapsed()
         );
 
@@ -383,6 +407,7 @@ where
             core_thread_handle,
             subscriber,
             network_manager,
+            broadcast_sender_keeper,
         }
     }
 

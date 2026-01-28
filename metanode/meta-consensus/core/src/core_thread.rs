@@ -5,15 +5,15 @@ use std::{
     collections::BTreeSet,
     fmt::Debug,
     sync::{
-        Arc,
         atomic::{AtomicU32, Ordering},
+        Arc,
     },
 };
 
 use async_trait::async_trait;
 use consensus_types::block::{BlockRef, Round};
 use mysten_metrics::{
-    monitored_mpsc::{Receiver, Sender, WeakSender, channel},
+    monitored_mpsc::{channel, Receiver, Sender, WeakSender},
     monitored_scope, spawn_logged_monitored_task,
 };
 use parking_lot::RwLock;
@@ -22,7 +22,6 @@ use tokio::sync::{oneshot, watch};
 use tracing::warn;
 
 use crate::{
-    BlockAPI as _,
     block::VerifiedBlock,
     commit::CertifiedCommits,
     context::Context,
@@ -30,6 +29,7 @@ use crate::{
     core_thread::CoreError::Shutdown,
     dag_state::DagState,
     error::{ConsensusError, ConsensusResult},
+    BlockAPI as _,
 };
 
 const CORE_THREAD_COMMANDS_CHANNEL_SIZE: usize = 2000;
@@ -62,7 +62,7 @@ pub enum CoreError {
 #[async_trait]
 pub trait CoreThreadDispatcher: Sync + Send + 'static {
     async fn add_blocks(&self, blocks: Vec<VerifiedBlock>)
-    -> Result<BTreeSet<BlockRef>, CoreError>;
+        -> Result<BTreeSet<BlockRef>, CoreError>;
 
     async fn check_block_refs(
         &self,
@@ -111,12 +111,13 @@ struct CoreThread {
 
 impl CoreThread {
     pub async fn run(mut self) -> ConsensusResult<()> {
-        tracing::debug!("Started core thread");
+        tracing::info!("🚀 [CORE THREAD] Started core thread");
 
         loop {
             tokio::select! {
                 command = self.receiver.recv() => {
                     let Some(command) = command else {
+                        tracing::info!("⚠️ [CORE THREAD] Command receiver closed - Shutting down");
                         break;
                     };
                     self.context.metrics.node_metrics.core_lock_dequeued.inc();
@@ -426,7 +427,6 @@ mod test {
 
     use super::*;
     use crate::{
-        CommitConsumerArgs,
         block_manager::BlockManager,
         block_verifier::NoopBlockVerifier,
         commit_observer::CommitObserver,
@@ -438,6 +438,7 @@ mod test {
         storage::mem_store::MemStore,
         transaction::{TransactionClient, TransactionConsumer},
         transaction_certifier::TransactionCertifier,
+        CommitConsumerArgs,
     };
 
     #[tokio::test]

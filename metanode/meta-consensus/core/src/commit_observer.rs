@@ -3,14 +3,14 @@
 
 use std::{sync::Arc, time::Duration};
 
+use mysten_metrics::monitored_mpsc::UnboundedSender;
 use parking_lot::RwLock;
 use tokio::time::Instant;
 use tracing::info;
 
 use crate::{
-    CommitConsumerArgs, CommittedSubDag,
     block::{BlockAPI, VerifiedBlock},
-    commit::{CommitAPI, load_committed_subdag_from_store},
+    commit::{load_committed_subdag_from_store, CommitAPI},
     commit_finalizer::{CommitFinalizer, CommitFinalizerHandle},
     context::Context,
     dag_state::DagState,
@@ -19,6 +19,7 @@ use crate::{
     linearizer::Linearizer,
     storage::Store,
     transaction_certifier::TransactionCertifier,
+    CommitConsumerArgs, CommittedSubDag,
 };
 
 /// Role of CommitObserver
@@ -44,6 +45,12 @@ pub(crate) struct CommitObserver {
     commit_interpreter: Linearizer,
     /// Handle to an unbounded channel to send output commits.
     commit_finalizer_handle: CommitFinalizerHandle,
+    /// Keeper for commit_sender to prevent race condition.
+    /// This ensures the sender stays alive until CommitFinalizer task actually starts executing.
+    /// Without this, tokio::spawn may not have scheduled the task yet when commit_consumer is dropped,
+    /// causing all senders to be dropped and the receiver to see a closed channel.
+    #[allow(dead_code)]
+    commit_sender_keeper: UnboundedSender<CommittedSubDag>,
 }
 
 impl CommitObserver {
@@ -63,6 +70,11 @@ impl CommitObserver {
             commit_consumer.commit_sender.clone(),
         );
 
+        // Clone the sender to keep it alive in the observer.
+        // This prevents race condition where commit_consumer is dropped before
+        // CommitFinalizer task starts executing, causing all senders to be dropped.
+        let commit_sender_keeper = commit_consumer.commit_sender.clone();
+
         let mut observer = Self {
             context,
             dag_state,
@@ -71,6 +83,7 @@ impl CommitObserver {
             leader_schedule,
             commit_interpreter,
             commit_finalizer_handle,
+            commit_sender_keeper,
         };
         observer.recover_and_send_commits(&commit_consumer).await;
 
@@ -339,16 +352,16 @@ impl CommitObserver {
 mod tests {
     use consensus_config::AuthorityIndex;
     use consensus_types::block::BlockRef;
-    use mysten_metrics::monitored_mpsc::{UnboundedReceiver, unbounded_channel};
+    use mysten_metrics::monitored_mpsc::{unbounded_channel, UnboundedReceiver};
     use parking_lot::RwLock;
     use rstest::rstest;
     use tokio::time::timeout;
 
     use super::*;
     use crate::{
-        CommitIndex, block_verifier::NoopBlockVerifier, context::Context, dag_state::DagState,
+        block_verifier::NoopBlockVerifier, context::Context, dag_state::DagState,
         linearizer::median_timestamp_by_stake, storage::mem_store::MemStore,
-        test_dag_builder::DagBuilder,
+        test_dag_builder::DagBuilder, CommitIndex,
     };
 
     #[rstest]

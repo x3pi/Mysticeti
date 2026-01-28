@@ -32,6 +32,7 @@ use crate::node::tx_submitter::{TransactionClientProxy, TransactionSubmitter};
 // Declare submodules
 pub mod catchup;
 pub mod committee;
+pub mod epoch_monitor;
 pub mod executor_client;
 pub mod queue;
 pub mod recovery;
@@ -111,6 +112,7 @@ pub struct ConsensusNode {
     pub(crate) system_transaction_provider: Arc<DefaultSystemTransactionProvider>,
     pub(crate) epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u32)>,
     pub(crate) sync_task_handle: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) epoch_monitor_handle: Option<tokio::task::JoinHandle<()>>,
     pub(crate) executor_client: Option<Arc<ExecutorClient>>,
     /// Transactions submitted in current epoch that may need recovery during epoch transition
     pub(crate) epoch_pending_transactions: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
@@ -733,6 +735,7 @@ impl ConsensusNode {
             system_transaction_provider,
             epoch_transition_sender: epoch_tx_sender,
             sync_task_handle: None,
+            epoch_monitor_handle: None,
             executor_client: Some(executor_client_for_proc),
             epoch_pending_transactions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             committed_transaction_hashes,
@@ -748,6 +751,15 @@ impl ConsensusNode {
 
         if matches!(node.node_mode, NodeMode::SyncOnly) {
             let _ = node.start_sync_task(&config).await;
+            // Start epoch monitor for SyncOnly nodes to auto-transition when added to committee
+            if let Ok(Some(handle)) = epoch_monitor::start_epoch_monitor(
+                node.node_mode.clone(),
+                &node.executor_client,
+                node.current_epoch,
+                &config,
+            ) {
+                node.epoch_monitor_handle = Some(handle);
+            }
         }
 
         recovery::perform_fork_detection_check(&node).await?;
@@ -832,14 +844,46 @@ impl ConsensusNode {
             );
             match (&self.node_mode, &new_mode) {
                 (NodeMode::SyncOnly, NodeMode::Validator) => {
+                    // First update mode so tasks see correct state
+                    self.node_mode = new_mode.clone();
                     let _ = self.stop_sync_task().await;
+                    // CRITICAL FIX: Do NOT call stop_epoch_monitor() here!
+                    // If this transition is triggered BY epoch_monitor (which is the normal case),
+                    // calling stop_epoch_monitor().abort() would abort the current task mid-execution,
+                    // causing all spawned consensus tasks to be dropped immediately.
+                    // Instead, just take() the handle - epoch_monitor will exit naturally after
+                    // this transition completes successfully (see epoch_monitor.rs line ~141).
+                    let _ = self.epoch_monitor_handle.take();
                 }
                 (NodeMode::Validator, NodeMode::SyncOnly) => {
+                    // First update mode so tasks see correct state
+                    self.node_mode = new_mode.clone();
+                    // CRITICAL FIX: Stop consensus authority before starting sync task
+                    // Without this, old consensus components continue running alongside sync task,
+                    // causing resource leaks and potential conflicts.
+                    if let Some(auth) = self.authority.take() {
+                        info!(
+                            "🛑 [NODE MODE] Stopping consensus authority for demotion to SyncOnly"
+                        );
+                        auth.stop().await;
+                    }
                     let _ = self.start_sync_task(config).await;
+                    // Start epoch monitor so we can be promoted back if added to committee
+                    // CRITICAL: Pass new_mode (SyncOnly) NOT self.node_mode (was Validator)
+                    if let Ok(Some(handle)) = epoch_monitor::start_epoch_monitor(
+                        self.node_mode.clone(),
+                        &self.executor_client,
+                        self.current_epoch,
+                        config,
+                    ) {
+                        info!("🔍 [EPOCH MONITOR] Started epoch monitor for demotion to SyncOnly");
+                        self.epoch_monitor_handle = Some(handle);
+                    }
                 }
-                _ => {}
+                _ => {
+                    self.node_mode = new_mode.clone();
+                }
             }
-            self.node_mode = new_mode;
         }
         Ok(())
     }

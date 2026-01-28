@@ -9,33 +9,28 @@ use std::{
     vec,
 };
 
-use consensus_config::{AuthorityIndex, ProtocolKeyPair};
 #[cfg(test)]
-use consensus_config::{Stake, local_committee_and_keys};
+use consensus_config::{local_committee_and_keys, Stake};
+use consensus_config::{AuthorityIndex, ProtocolKeyPair};
 use consensus_types::block::{BlockRef, BlockTimestampMs, Round};
 use itertools::Itertools as _;
+use meta_macros::fail_point;
 #[cfg(test)]
 use mysten_metrics::monitored_mpsc::UnboundedReceiver;
 use mysten_metrics::monitored_scope;
 use parking_lot::RwLock;
-use meta_macros::fail_point;
 use tokio::{
     sync::{broadcast, watch},
     time::Instant,
 };
 use tracing::{debug, info, trace, warn};
 
-#[cfg(test)]
-use crate::{
-    CommitConsumerArgs, TransactionClient, block::CertifiedBlocksOutput,
-    block_verifier::NoopBlockVerifier, storage::mem_store::MemStore,
-};
 use crate::{
     adaptive_delay::AdaptiveDelayState,
     ancestor::{AncestorState, AncestorStateManager},
     block::{
-        Block, BlockAPI, BlockV1, BlockV2, ExtendedBlock, GENESIS_ROUND, SignedBlock, Slot,
-        VerifiedBlock,
+        Block, BlockAPI, BlockV1, BlockV2, ExtendedBlock, SignedBlock, Slot, VerifiedBlock,
+        GENESIS_ROUND,
     },
     block_manager::BlockManager,
     commit::{
@@ -52,8 +47,13 @@ use crate::{
     transaction::TransactionConsumer,
     transaction_certifier::TransactionCertifier,
     universal_committer::{
-        UniversalCommitter, universal_committer_builder::UniversalCommitterBuilder,
+        universal_committer_builder::UniversalCommitterBuilder, UniversalCommitter,
     },
+};
+#[cfg(test)]
+use crate::{
+    block::CertifiedBlocksOutput, block_verifier::NoopBlockVerifier, storage::mem_store::MemStore,
+    CommitConsumerArgs, TransactionClient,
 };
 
 // Maximum number of commit votes to include in a block.
@@ -522,21 +522,40 @@ impl Core {
             let mut effective_delay = self.context.parameters.min_round_delay;
             if let Some(adaptive_delay_state) = &self.adaptive_delay_state {
                 let local_commit_index = self.dag_state.read().last_commit_index();
-                let quorum_commit_index = self.context.metrics.node_metrics.commit_sync_quorum_index.get() as u32;
-                let adaptive_delay = adaptive_delay_state.calculate_adaptive_delay(
-                    local_commit_index,
-                    quorum_commit_index,
-                );
+                let quorum_commit_index = self
+                    .context
+                    .metrics
+                    .node_metrics
+                    .commit_sync_quorum_index
+                    .get() as u32;
+                let adaptive_delay = adaptive_delay_state
+                    .calculate_adaptive_delay(local_commit_index, quorum_commit_index);
                 effective_delay += adaptive_delay;
-                
+
                 // Update metrics
-                self.context.metrics.node_metrics.adaptive_delay_ms.set(adaptive_delay.as_millis() as i64);
+                self.context
+                    .metrics
+                    .node_metrics
+                    .adaptive_delay_ms
+                    .set(adaptive_delay.as_millis() as i64);
                 let lead = local_commit_index.saturating_sub(quorum_commit_index);
-                self.context.metrics.node_metrics.commit_sync_lead.set(lead as i64);
-                self.context.metrics.node_metrics.local_commit_rate.set(adaptive_delay_state.local_rate());
-                self.context.metrics.node_metrics.quorum_commit_rate.set(adaptive_delay_state.quorum_rate());
+                self.context
+                    .metrics
+                    .node_metrics
+                    .commit_sync_lead
+                    .set(lead as i64);
+                self.context
+                    .metrics
+                    .node_metrics
+                    .local_commit_rate
+                    .set(adaptive_delay_state.local_rate());
+                self.context
+                    .metrics
+                    .node_metrics
+                    .quorum_commit_rate
+                    .set(adaptive_delay_state.quorum_rate());
             }
-            
+
             if Duration::from_millis(
                 self.context
                     .clock
@@ -643,7 +662,7 @@ impl Core {
         // Consume the next transactions to be included. Do not drop the guards yet as this would acknowledge
         // the inclusion of transactions. Just let this be done in the end of the method.
         let (mut transactions, ack_transactions, _limit_reached) = self.transaction_consumer.next();
-        
+
         // Inject system transactions (e.g., EndOfEpoch) if provider is available
         // FORK-SAFETY: Only inject system transactions when this node is the leader
         // This ensures only one node creates the system transaction, preventing forks
@@ -653,19 +672,21 @@ impl Core {
             // Check if this node is the leader for this round
             let leader_for_round = self.first_leader(clock_round);
             let is_leader = leader_for_round == self.context.own_index;
-            
+
             if is_leader {
                 let current_epoch = self.context.committee.epoch();
                 // Get current commit index from dag_state
                 let current_commit_index = self.dag_state.read().last_commit_index();
-                
+
                 tracing::debug!(
                     "🔍 Leader checking for system transactions: epoch={}, commit_index={}",
                     current_epoch,
                     current_commit_index
                 );
-                
-                if let Some(system_txs) = provider.get_system_transactions(current_epoch, current_commit_index) {
+
+                if let Some(system_txs) =
+                    provider.get_system_transactions(current_epoch, current_commit_index)
+                {
                     // Convert system transactions to regular transactions
                     let system_transactions: Vec<crate::block::Transaction> = system_txs
                         .into_iter()
@@ -675,7 +696,7 @@ impl Core {
                                 .ok()
                         })
                         .collect();
-                    
+
                     if !system_transactions.is_empty() {
                         tracing::info!(
                             "📝 Injecting {} system transaction(s) into block (epoch={}, commit_index={})",
@@ -699,7 +720,7 @@ impl Core {
                 );
             }
         }
-        
+
         self.context
             .metrics
             .node_metrics
@@ -726,8 +747,9 @@ impl Core {
         };
 
         // Get epoch change data to include in block
-        let (epoch_change_proposal, epoch_change_votes) = crate::epoch_change_provider::get_epoch_change_data();
-        
+        let (epoch_change_proposal, epoch_change_votes) =
+            crate::epoch_change_provider::get_epoch_change_data();
+
         // Create the block and insert to storage.
         let mut block = if self.context.protocol_config.mysticeti_fastpath() {
             Block::V2(BlockV2::new(
@@ -753,13 +775,13 @@ impl Core {
                 vec![],
             ))
         };
-        
+
         // Include epoch change data in block
         // NOTE: All nodes must have updated code (no backward compatibility)
         // For production, use BlockV2 with versioning or separate epoch change messages
         block.set_epoch_change_proposal(epoch_change_proposal);
         block.set_epoch_change_votes(epoch_change_votes);
-        
+
         let signed_block =
             SignedBlock::new(block, &self.block_signer).expect("Block signing failed.");
         let serialized = signed_block
@@ -1046,8 +1068,13 @@ impl Core {
         // CRITICAL: Check if node is lagging and prioritize sync over consensus
         // When lag is significant, skip proposing new blocks to focus on syncing commits
         let local_commit_index = self.dag_state.read().last_commit_index();
-        let quorum_commit_index = self.context.metrics.node_metrics.commit_sync_quorum_index.get() as u32;
-        
+        let quorum_commit_index = self
+            .context
+            .metrics
+            .node_metrics
+            .commit_sync_quorum_index
+            .get() as u32;
+
         // Thresholds for skipping consensus when lagging:
         // - MODERATE_LAG: 100 commits or 10% behind quorum -> skip consensus, prioritize sync
         // - SEVERE_LAG: 200 commits or 15% behind quorum -> aggressively skip consensus
@@ -1055,32 +1082,35 @@ impl Core {
         const SEVERE_LAG_THRESHOLD: u32 = 200; // Aggressively skip consensus if lag > 200 commits
         const MODERATE_LAG_PERCENTAGE: f64 = 10.0; // Skip consensus if lag > 10% of quorum
         const SEVERE_LAG_PERCENTAGE: f64 = 15.0; // Aggressively skip if lag > 15% of quorum
-        
+
         // HYSTERESIS: To prevent oscillation, use lower threshold when recovering from sync mode
         // When lag was high and is now decreasing, require lag to drop below 80% of threshold
         // before resuming consensus. This ensures smooth transition back to consensus.
         const HYSTERESIS_FACTOR: f64 = 0.8; // Resume consensus when lag < 80% of threshold
-        
+
         let lag = quorum_commit_index.saturating_sub(local_commit_index);
         let lag_percentage = if quorum_commit_index > 0 {
             (lag as f64 / quorum_commit_index as f64) * 100.0
         } else {
             0.0
         };
-        
+
         // Check if we should skip consensus
         // Use hysteresis: if we were in sync mode, require lag to drop below 80% of threshold
-        let moderate_lag_threshold_with_hysteresis = (MODERATE_LAG_THRESHOLD as f64 * HYSTERESIS_FACTOR) as u32;
+        let moderate_lag_threshold_with_hysteresis =
+            (MODERATE_LAG_THRESHOLD as f64 * HYSTERESIS_FACTOR) as u32;
         let moderate_lag_percentage_with_hysteresis = MODERATE_LAG_PERCENTAGE * HYSTERESIS_FACTOR;
-        
+
         // Determine if we should skip consensus
         // If lag is above threshold OR above hysteresis threshold (for smooth recovery)
-        let should_skip_consensus = lag > MODERATE_LAG_THRESHOLD || lag_percentage > MODERATE_LAG_PERCENTAGE;
+        let should_skip_consensus =
+            lag > MODERATE_LAG_THRESHOLD || lag_percentage > MODERATE_LAG_PERCENTAGE;
         let is_severe_lag = lag > SEVERE_LAG_THRESHOLD || lag_percentage > SEVERE_LAG_PERCENTAGE;
-        
+
         // Check if we're recovering (lag was high but now decreasing)
-        let is_recovering = lag <= moderate_lag_threshold_with_hysteresis && lag_percentage <= moderate_lag_percentage_with_hysteresis;
-        
+        let is_recovering = lag <= moderate_lag_threshold_with_hysteresis
+            && lag_percentage <= moderate_lag_percentage_with_hysteresis;
+
         if should_skip_consensus {
             if is_severe_lag {
                 // Severe lag: Skip consensus aggressively
@@ -1103,7 +1133,7 @@ impl Core {
             }
             return false;
         }
-        
+
         // If we're recovering from sync mode (lag dropped below hysteresis threshold), log transition
         if is_recovering && lag > 0 {
             info!(
@@ -1478,6 +1508,13 @@ impl CoreSignals {
         );
         let (new_round_sender, new_round_receiver) = watch::channel(0);
 
+        // CRITICAL FIX: Clone the sender to create a keeper that will be owned by AuthorityNode.
+        // This prevents the broadcast channel from closing prematurely if Core is dropped
+        // before CoreThread can start processing. Without this keeper, race conditions
+        // during async spawning can cause ProposedBlockHandler to receive "channel closed"
+        // immediately after starting.
+        let broadcast_sender_keeper = tx_block_broadcast.clone();
+
         let me = Self {
             tx_block_broadcast,
             new_round_sender,
@@ -1487,6 +1524,7 @@ impl CoreSignals {
         let receivers = CoreSignalsReceivers {
             rx_block_broadcast,
             new_round_receiver,
+            broadcast_sender_keeper,
         };
 
         (me, receivers)
@@ -1527,6 +1565,10 @@ impl CoreSignals {
 pub(crate) struct CoreSignalsReceivers {
     rx_block_broadcast: broadcast::Receiver<ExtendedBlock>,
     new_round_receiver: watch::Receiver<Round>,
+    /// Keeper for broadcast sender to prevent channel from closing during async spawning race conditions.
+    /// This sender clone is held by AuthorityNode to ensure the broadcast channel stays open until
+    /// all components have been properly initialized and CoreThread has started.
+    broadcast_sender_keeper: broadcast::Sender<ExtendedBlock>,
 }
 
 impl CoreSignalsReceivers {
@@ -1536,6 +1578,14 @@ impl CoreSignalsReceivers {
 
     pub(crate) fn new_round_receiver(&self) -> watch::Receiver<Round> {
         self.new_round_receiver.clone()
+    }
+
+    /// Returns a clone of the broadcast sender keeper. This should be stored in AuthorityNode
+    /// to prevent the broadcast channel from closing prematurely during async initialization.
+    /// Without this keeper, race conditions between tokio::spawn scheduling and constructor
+    /// return can cause ProposedBlockHandler to receive "Broadcast channel CLOSED" immediately.
+    pub(crate) fn broadcast_sender_keeper(&self) -> broadcast::Sender<ExtendedBlock> {
+        self.broadcast_sender_keeper.clone()
     }
 }
 
@@ -1665,22 +1715,22 @@ mod test {
 
     use consensus_config::{AuthorityIndex, Parameters};
     use consensus_types::block::TransactionIndex;
-    use futures::{StreamExt, stream::FuturesUnordered};
-    use mysten_metrics::monitored_mpsc;
+    use futures::{stream::FuturesUnordered, StreamExt};
     use meta_protocol_config::ProtocolConfig;
+    use mysten_metrics::monitored_mpsc;
     use tokio::time::sleep;
 
     use super::*;
     use crate::{
-        CommitConsumerArgs, CommitIndex,
-        block::{TestBlock, genesis_blocks},
+        block::{genesis_blocks, TestBlock},
         block_verifier::NoopBlockVerifier,
         commit::CommitAPI,
         leader_scoring::ReputationScores,
-        storage::{Store, WriteBatch, mem_store::MemStore},
+        storage::{mem_store::MemStore, Store, WriteBatch},
         test_dag_builder::DagBuilder,
         test_dag_parser::parse_dag,
         transaction::{BlockStatus, TransactionClient},
+        CommitConsumerArgs, CommitIndex,
     };
 
     /// Recover Core and continue proposing from the last round which forms a quorum.

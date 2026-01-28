@@ -155,6 +155,9 @@ pub struct NodeConfig {
     /// to get the correct network epoch. Format: ["/tmp/rust-go-standard-master.sock"]
     #[serde(default)]
     pub peer_go_master_sockets: Vec<String>,
+    /// Poll interval in seconds for epoch monitor in SyncOnly mode (default: 5)
+    #[serde(default = "default_epoch_monitor_poll_interval_secs")]
+    pub epoch_monitor_poll_interval_secs: Option<u64>,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -215,6 +218,10 @@ fn default_gradual_shutdown_consensus_cert_drain_secs() -> Option<u64> {
 
 fn default_gradual_shutdown_final_drain_secs() -> Option<u64> {
     Some(1)
+}
+
+fn default_epoch_monitor_poll_interval_secs() -> Option<u64> {
+    Some(5) // Poll every 5 seconds by default
 }
 
 impl NodeConfig {
@@ -294,6 +301,7 @@ impl NodeConfig {
                 gradual_shutdown_final_drain_secs: Some(1),
                 adaptive_delay_ms: default_adaptive_delay_ms(),
                 peer_go_master_sockets: vec!["/tmp/rust-go-standard-master.sock".to_string()], // Fallback to main Go Master
+                epoch_monitor_poll_interval_secs: default_epoch_monitor_poll_interval_secs(),
             };
 
             // Save keys - use private_key_bytes and public key bytes

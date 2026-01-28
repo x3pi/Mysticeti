@@ -164,53 +164,56 @@ pub async fn transition_to_epoch_from_system_tx(
         node.own_index = consensus_config::AuthorityIndex::ZERO;
     }
 
-    // Setup new processor
-    let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
-    let epoch_cb = crate::consensus::commit_callbacks::create_epoch_transition_callback(
-        node.epoch_transition_sender.clone(),
-    );
-
-    let exec_client_proc = if node.executor_commit_enabled {
-        Some(Arc::new(ExecutorClient::new_with_initial_index(
-            true,
-            true,
-            config.executor_send_socket_path.clone(),
-            config.executor_receive_socket_path.clone(),
-            synced_index + 1,
-            Some(node.storage_path.clone()), // Enable persistence for commit client
-        )))
-    } else {
-        None
-    };
-
-    let mut processor = crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
-        .with_commit_index_callback(
-            crate::consensus::commit_callbacks::create_commit_index_callback(
-                node.current_commit_index.clone(),
-            ),
-        )
-        .with_global_exec_index_callback(
-            crate::consensus::commit_callbacks::create_global_exec_index_callback(
-                node.shared_last_global_exec_index.clone(),
-            ),
-        )
-        .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
-        .with_epoch_info(new_epoch, synced_index)
-        .with_is_transitioning(node.is_transitioning.clone())
-        .with_pending_transactions_queue(node.pending_transactions_queue.clone())
-        .with_epoch_transition_callback(epoch_cb);
-
-    if let Some(c) = exec_client_proc {
-        processor = processor.with_executor_client(c);
-    }
-
-    tokio::spawn(async move {
-        let _ = processor.run().await;
-    });
-    tokio::spawn(async move { while block_receiver.recv().await.is_some() {} });
-
-    // Start Authority
+    // Only setup consensus components if we're in Validator mode
+    // SyncOnly nodes don't need CommitProcessor or Authority
     if matches!(node.node_mode, NodeMode::Validator) {
+        // Setup new processor for Validator mode
+        let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
+        let epoch_cb = crate::consensus::commit_callbacks::create_epoch_transition_callback(
+            node.epoch_transition_sender.clone(),
+        );
+
+        let exec_client_proc = if node.executor_commit_enabled {
+            Some(Arc::new(ExecutorClient::new_with_initial_index(
+                true,
+                true,
+                config.executor_send_socket_path.clone(),
+                config.executor_receive_socket_path.clone(),
+                synced_index + 1,
+                Some(node.storage_path.clone()), // Enable persistence for commit client
+            )))
+        } else {
+            None
+        };
+
+        let mut processor =
+            crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
+                .with_commit_index_callback(
+                    crate::consensus::commit_callbacks::create_commit_index_callback(
+                        node.current_commit_index.clone(),
+                    ),
+                )
+                .with_global_exec_index_callback(
+                    crate::consensus::commit_callbacks::create_global_exec_index_callback(
+                        node.shared_last_global_exec_index.clone(),
+                    ),
+                )
+                .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
+                .with_epoch_info(new_epoch, synced_index)
+                .with_is_transitioning(node.is_transitioning.clone())
+                .with_pending_transactions_queue(node.pending_transactions_queue.clone())
+                .with_epoch_transition_callback(epoch_cb);
+
+        if let Some(c) = exec_client_proc {
+            processor = processor.with_executor_client(c);
+        }
+
+        tokio::spawn(async move {
+            let _ = processor.run().await;
+        });
+        tokio::spawn(async move { while block_receiver.recv().await.is_some() {} });
+
+        // Start Authority for Validator mode
         let mut params = node.parameters.clone();
         params.db_path = db_path;
         node.boot_counter += 1;
@@ -236,18 +239,23 @@ pub async fn transition_to_epoch_from_system_tx(
                 )
                 .await,
             );
-    }
 
-    // Update proxy
-    if let Some(auth) = &node.authority {
-        if let Some(proxy) = &node.transaction_client_proxy {
-            proxy.set_client(auth.transaction_client()).await;
-        } else {
-            node.transaction_client_proxy = Some(Arc::new(
-                crate::node::tx_submitter::TransactionClientProxy::new(auth.transaction_client()),
-            ));
+        // Update proxy for Validator mode
+        if let Some(auth) = &node.authority {
+            if let Some(proxy) = &node.transaction_client_proxy {
+                proxy.set_client(auth.transaction_client()).await;
+            } else {
+                node.transaction_client_proxy = Some(Arc::new(
+                    crate::node::tx_submitter::TransactionClientProxy::new(
+                        auth.transaction_client(),
+                    ),
+                ));
+            }
         }
     } else {
+        // SyncOnly mode: Clear authority and proxy
+        info!("🔄 [EPOCH TRANSITION] SyncOnly mode - skipping consensus setup");
+        node.authority = None;
         node.transaction_client_proxy = None;
     }
 
