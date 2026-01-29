@@ -61,15 +61,31 @@ pub async fn transition_to_epoch_from_system_tx(
 
     node.close_user_certs().await;
 
-    // Wait for processor
+    // [FIX 2026-01-29]: Calculate correct target_commit_index from synced_global_exec_index
+    // FORMULA: global_exec_index = last_global_exec_index + commit_index
+    // Therefore: target_commit_index = synced_global_exec_index - last_global_exec_index
+    // This ensures we compare commit_index with commit_index (same metric)
+    let target_commit_index = if synced_global_exec_index > node.last_global_exec_index {
+        (synced_global_exec_index - node.last_global_exec_index) as u32
+    } else {
+        // Fallback: if somehow global_exec_index is less, use it directly (shouldn't happen)
+        synced_global_exec_index as u32
+    };
+    info!(
+        "⏳ [TRANSITION] Waiting for commit_processor: target_commit_index={}, current_commit_index={}, synced_global_exec_index={}, last_global_exec_index={}",
+        target_commit_index,
+        node.current_commit_index.load(Ordering::SeqCst),
+        synced_global_exec_index,
+        node.last_global_exec_index
+    );
+
+    // Wait for processor to reach the target commit index (ensure sequential block processing)
     let timeout_secs = if config.epoch_transition_optimization == "fast" {
         5
     } else {
         10
     };
-    let _ =
-        wait_for_commit_processor_completion(node, synced_global_exec_index as u32, timeout_secs)
-            .await;
+    let _ = wait_for_commit_processor_completion(node, target_commit_index, timeout_secs).await;
 
     // Check executor read is enabled
     if !config.executor_read_enabled {
@@ -99,8 +115,86 @@ pub async fn transition_to_epoch_from_system_tx(
     let executor_client =
         committee_source.create_executor_client(&config.executor_send_socket_path);
 
-    // Get synced_index from the authoritative source
-    let synced_index = if committee_source.last_block > 0 {
+    // =============================================================================
+    // CRITICAL FIX: Stop old authority FIRST before fetching synced_index from Go
+    // This prevents race condition where:
+    // 1. We fetch synced_index=14400 from Go
+    // 2. Old epoch sends more blocks (global_exec_index=14405, 14406, ..., 14409)
+    // 3. New epoch starts with epoch_base_index=14400
+    // 4. New epoch's commit_index=9 → global_exec_index=14409 (COLLISION!)
+    //
+    // By stopping old authority FIRST, we ensure all blocks from old epoch
+    // have been sent to Go before we fetch epoch_base_index for new epoch.
+    // =============================================================================
+
+    info!("🛑 [TRANSITION] Stopping old authority BEFORE fetching synced_index...");
+
+    // Capture the expected last global_exec_index BEFORE stopping authority
+    // This is what we expect Go to have after all in-flight blocks are received
+    let expected_last_block = {
+        let shared_index = node.shared_last_global_exec_index.lock().await;
+        *shared_index
+    };
+    info!(
+        "📊 [TRANSITION] Expected last block after old epoch: {}",
+        expected_last_block
+    );
+
+    if let Some(auth) = node.authority.take() {
+        auth.stop().await;
+        info!("✅ [TRANSITION] Old authority stopped. All pending commits should have been sent.");
+    }
+
+    // =============================================================================
+    // STRICT SEQUENTIAL GUARANTEE: Poll Go FOREVER until it confirms receiving expected_last_block
+    // NO GAP, NO OVERLAP policy - we MUST NOT proceed until Go is in sync
+    // This prevents the duplicate global_exec_index race condition
+    // =============================================================================
+    let poll_interval = Duration::from_millis(100);
+    let mut go_last_block = 0u64;
+    let mut attempt = 0u64;
+
+    loop {
+        attempt += 1;
+        match executor_client.get_last_block_number().await {
+            Ok(last_block) => {
+                go_last_block = last_block;
+                if go_last_block >= expected_last_block {
+                    info!(
+                        "✅ [SYNC VERIFIED] Go confirmed receiving all blocks: go_last={} >= expected={} (took {} attempts)",
+                        go_last_block, expected_last_block, attempt
+                    );
+                    break;
+                } else {
+                    // Log every 100 attempts (10 seconds) to show we're waiting
+                    if attempt % 100 == 0 {
+                        warn!(
+                            "⏳ [SYNC WAIT] Waiting for Go to catch up: go_last={}, expected={} (waiting for {}s)",
+                            go_last_block, expected_last_block, attempt / 10
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                // Log errors but keep trying
+                if attempt % 100 == 0 {
+                    error!(
+                        "❌ [SYNC POLL] Cannot reach Go (attempt {}): {}. Will keep trying...",
+                        attempt, e
+                    );
+                }
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // At this point, go_last_block >= expected_last_block is GUARANTEED
+    // NOW fetch final synced_index from Go - this should include all blocks from old epoch
+    let synced_index = if let Ok(go_last) = executor_client.get_last_block_number().await {
+        info!("📊 [SYNC] Go last committed block (verified): {}", go_last);
+        go_last
+    } else if committee_source.last_block > 0 {
         info!(
             "📊 [SYNC] Using committee source last block: {} (from {})",
             committee_source.last_block,
@@ -111,9 +205,6 @@ pub async fn transition_to_epoch_from_system_tx(
             }
         );
         committee_source.last_block
-    } else if let Ok(go_last) = executor_client.get_last_block_number().await {
-        info!("📊 [SYNC] Go last committed block: {}", go_last);
-        go_last
     } else {
         warn!(
             "❌ [SYNC] Failed to get last block from Go, using node last_global_exec_index {}",
@@ -131,11 +222,6 @@ pub async fn transition_to_epoch_from_system_tx(
         "📊 Snapshot: Last committed block from Go: {}",
         synced_index
     );
-
-    // Stop old authority
-    if let Some(auth) = node.authority.take() {
-        auth.stop().await;
-    }
 
     // Update state
     node.current_epoch = new_epoch;

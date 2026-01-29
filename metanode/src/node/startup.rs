@@ -107,8 +107,17 @@ impl InitializedNode {
             let socket_path = format!("/tmp/metanode-tx-{}.sock", node_config.node_id);
             let tx_client_uds = tx_client.clone();
             let node_for_uds = node.clone();
-            let uds_server =
-                TxSocketServer::with_node(socket_path.clone(), tx_client_uds, node_for_uds);
+            // Get is_transitioning flag for lock-free epoch transition detection
+            let is_transitioning_for_uds = {
+                let node_guard = node.lock().await;
+                node_guard.is_transitioning.clone()
+            };
+            let uds_server = TxSocketServer::with_node(
+                socket_path.clone(),
+                tx_client_uds,
+                node_for_uds,
+                is_transitioning_for_uds,
+            );
             uds_server_handle = Some(tokio::spawn(async move {
                 if let Err(e) = uds_server.start().await {
                     error!("UDS server error: {}", e);

@@ -272,12 +272,17 @@ pub fn start_epoch_monitor(
                                 false
                             } else {
                                 // No peer available - might be first validator or network partition
-                                // Be conservative and wait for one more poll cycle
-                                warn!(
-                                "⚠️ [PEER EPOCH CHECK] No peer available for epoch verification. Local epoch={}. Will retry...",
-                                source.epoch
-                            );
-                                false
+                                // LOCAL-ONLY FALLBACK (Transition Autonomy): If no peers are configured
+                                // or reachable (is_peer=false), proceed using only local Go Master as
+                                // the source of truth. This is critical for:
+                                // - First validator in a new committee
+                                // - Isolated nodes like Node 4 in early join phases
+                                // - Single-node testnets
+                                info!(
+                                    "ℹ️ [PEER EPOCH CHECK] No peer available (is_peer=false). Using LOCAL-ONLY FALLBACK. Local epoch={}. Proceeding with transition!",
+                                    source.epoch
+                                );
+                                true // FIXED: Allow transition with local Go Master only
                             }
                         }
                         Err(e) => {
