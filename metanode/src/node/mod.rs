@@ -32,8 +32,10 @@ use crate::node::tx_submitter::{TransactionClientProxy, TransactionSubmitter};
 // Declare submodules
 pub mod catchup;
 pub mod committee;
+pub mod committee_source;
 pub mod epoch_monitor;
 pub mod executor_client;
+pub mod notification_listener;
 pub mod queue;
 pub mod recovery;
 pub mod startup;
@@ -110,7 +112,7 @@ pub struct ConsensusNode {
     pub(crate) is_transitioning: Arc<AtomicBool>,
     pub(crate) pending_transactions_queue: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
     pub(crate) system_transaction_provider: Arc<DefaultSystemTransactionProvider>,
-    pub(crate) epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u32)>,
+    pub(crate) epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u64)>, // CHANGED: u32 -> u64 for synced_global_exec_index
     pub(crate) sync_task_handle: Option<tokio::task::JoinHandle<()>>,
     pub(crate) epoch_monitor_handle: Option<tokio::task::JoinHandle<()>>,
     pub(crate) executor_client: Option<Arc<ExecutorClient>>,
@@ -274,25 +276,25 @@ impl ConsensusNode {
             executor_client.clone()
         };
 
-        let (validators, _go_epoch_timestamp_ms) = peer_executor_client
-            .get_validators_at_block(peer_last_block)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch committee from Go: {}", e))?;
+        // CRITICAL FIX: Use epoch boundary data instead of current validators
+        // This ensures new validators only become active AFTER epoch transition.
+        // get_validators_at_block() returns current state (includes newly registered validators)
+        // get_epoch_boundary_data() returns validators at epoch boundary (actual committee)
+        let (boundary_block, epoch_timestamp_ms, _boundary_epoch, validators) =
+            peer_executor_client
+                .get_epoch_boundary_data(current_epoch)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to fetch epoch boundary data from Go: {}", e)
+                })?;
 
-        // Use epoch timestamp from the peer that has correct epoch
-        let epoch_timestamp_ms = _go_epoch_timestamp_ms;
         info!(
-            "📊 [STARTUP] Epoch timestamp: {}ms (from {})",
-            epoch_timestamp_ms,
-            if best_socket != config.executor_receive_socket_path {
-                "peer"
-            } else {
-                "local"
-            }
+            "📊 [STARTUP] Using epoch boundary data: epoch={}, boundary_block={}, epoch_timestamp={}ms, validators={}",
+            current_epoch, boundary_block, epoch_timestamp_ms, validators.len()
         );
 
         if validators.is_empty() {
-            anyhow::bail!("Go state returned empty validators list");
+            anyhow::bail!("Go state returned empty validators list at epoch boundary");
         }
 
         // Filter validators for single node debug if needed
@@ -309,7 +311,10 @@ impl ConsensusNode {
         // Use helper from committee.rs
         let committee =
             committee::build_committee_from_validator_list(validators_to_use, current_epoch)?;
-        info!("✅ Loaded committee with {} authorities", committee.size());
+        info!(
+            "✅ Loaded committee with {} authorities (from epoch boundary)",
+            committee.size()
+        );
 
         // EXECUTION INDEX SYNC
         // GO-AUTHORITATIVE STRATEGY with local persistence fallback
@@ -448,9 +453,11 @@ impl ConsensusNode {
         let protocol_keypair = config.load_protocol_keypair()?;
         let network_keypair = config.load_network_keypair()?;
 
-        let own_hostname = format!("node-{}", config.node_id);
+        // FIX: Use protocol_key matching instead of hostname for robust identity
+        // This ensures node identity is derived from cryptographic key, not naming convention
+        let own_protocol_pubkey = protocol_keypair.public();
         let own_index_opt = committee.authorities().find_map(|(idx, auth)| {
-            if auth.hostname == own_hostname {
+            if auth.protocol_key == own_protocol_pubkey {
                 Some(idx)
             } else {
                 None
@@ -459,6 +466,18 @@ impl ConsensusNode {
 
         let is_in_committee = own_index_opt.is_some();
         let own_index = own_index_opt.unwrap_or(AuthorityIndex::ZERO);
+
+        if is_in_committee {
+            info!(
+                "✅ [IDENTITY] Found self in committee at index {} using protocol_key match",
+                own_index
+            );
+        } else {
+            info!(
+                "ℹ️ [IDENTITY] Not in committee (protocol_key not found in {} authorities)",
+                committee.size()
+            );
+        }
 
         std::fs::create_dir_all(&config.storage_path)?;
 
@@ -493,7 +512,7 @@ impl ConsensusNode {
         let committed_transaction_hashes = Arc::new(tokio::sync::Mutex::new(committed_hashes));
 
         let (epoch_tx_sender, epoch_tx_receiver) =
-            tokio::sync::mpsc::unbounded_channel::<(u64, u64, u32)>();
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, u64)>(); // CHANGED: u32 -> u64
         let epoch_transition_callback =
             crate::consensus::commit_callbacks::create_epoch_transition_callback(
                 epoch_tx_sender.clone(),
@@ -709,7 +728,11 @@ impl ConsensusNode {
 
         let mut node = Self {
             authority,
-            node_mode: config.initial_node_mode.clone(),
+            node_mode: if is_in_committee {
+                NodeMode::Validator
+            } else {
+                NodeMode::SyncOnly
+            },
             execution_lock: Arc::new(tokio::sync::RwLock::new(current_epoch)),
             reconfig_state: Arc::new(tokio::sync::RwLock::new(ReconfigState::default())),
             transaction_client_proxy,
@@ -826,10 +849,11 @@ impl ConsensusNode {
         committee: &Committee,
         config: &NodeConfig,
     ) -> Result<()> {
-        let node_hostname = format!("node-{}", config.node_id);
+        // FIX: Use protocol_key matching for consistent identity check
+        let own_protocol_pubkey = self.protocol_keypair.public();
         let should_be_validator = committee
             .authorities()
-            .any(|(_, authority)| authority.hostname == node_hostname);
+            .any(|(_, authority)| authority.protocol_key == own_protocol_pubkey);
 
         let new_mode = if should_be_validator {
             NodeMode::Validator
@@ -844,6 +868,44 @@ impl ConsensusNode {
             );
             match (&self.node_mode, &new_mode) {
                 (NodeMode::SyncOnly, NodeMode::Validator) => {
+                    // TRANSITION HANDOFF: Notify Go that consensus will start
+                    // Consensus will produce blocks starting from last_global_exec_index + 1
+                    let consensus_start_block = self.last_global_exec_index + 1;
+                    if let Some(ref executor_client) = self.executor_client {
+                        match executor_client
+                            .set_consensus_start_block(consensus_start_block)
+                            .await
+                        {
+                            Ok((success, last_sync_block, msg)) => {
+                                if success {
+                                    info!(
+                                        "✅ [TRANSITION HANDOFF] Go confirmed sync complete up to block {} (consensus starts at {})",
+                                        last_sync_block, consensus_start_block
+                                    );
+                                } else {
+                                    warn!(
+                                        "⚠️ [TRANSITION HANDOFF] Go sync not ready: {} (last_sync_block={}, need={})",
+                                        msg, last_sync_block, consensus_start_block - 1
+                                    );
+                                    // Optionally wait for sync to catch up
+                                    if let Ok((reached, current, _)) = executor_client
+                                        .wait_for_sync_to_block(consensus_start_block - 1, 30)
+                                        .await
+                                    {
+                                        if reached {
+                                            info!("✅ [TRANSITION HANDOFF] Go sync caught up to block {}", current);
+                                        } else {
+                                            warn!("⚠️ [TRANSITION HANDOFF] Timeout waiting for Go sync (current={})", current);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("⚠️ [TRANSITION HANDOFF] Failed to notify Go of consensus start: {}", e);
+                            }
+                        }
+                    }
+
                     // First update mode so tasks see correct state
                     self.node_mode = new_mode.clone();
                     let _ = self.stop_sync_task().await;
@@ -856,6 +918,33 @@ impl ConsensusNode {
                     let _ = self.epoch_monitor_handle.take();
                 }
                 (NodeMode::Validator, NodeMode::SyncOnly) => {
+                    // TRANSITION HANDOFF: Notify Go that consensus is ending
+                    // Sync should start from last_global_exec_index + 1
+                    let last_consensus_block = self.last_global_exec_index;
+                    if let Some(ref executor_client) = self.executor_client {
+                        match executor_client
+                            .set_sync_start_block(last_consensus_block)
+                            .await
+                        {
+                            Ok((success, sync_start_block, msg)) => {
+                                if success {
+                                    info!(
+                                        "✅ [TRANSITION HANDOFF] Go will start sync from block {} (consensus ended at {})",
+                                        sync_start_block, last_consensus_block
+                                    );
+                                } else {
+                                    warn!("⚠️ [TRANSITION HANDOFF] Go sync start notification failed: {}", msg);
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "⚠️ [TRANSITION HANDOFF] Failed to notify Go of sync start: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+
                     // First update mode so tasks see correct state
                     self.node_mode = new_mode.clone();
                     // CRITICAL FIX: Stop consensus authority before starting sync task
@@ -922,14 +1011,14 @@ impl ConsensusNode {
         &mut self,
         new_epoch: u64,
         new_epoch_timestamp_ms: u64,
-        commit_index: u32,
+        synced_global_exec_index: u64, // CHANGED: Use global_exec_index (u64) instead of commit_index (u32)
         config: &NodeConfig,
     ) -> Result<()> {
         transition::transition_to_epoch_from_system_tx(
             self,
             new_epoch,
             new_epoch_timestamp_ms,
-            commit_index,
+            synced_global_exec_index,
             config,
         )
         .await

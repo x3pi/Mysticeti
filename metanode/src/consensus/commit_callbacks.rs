@@ -1,8 +1,8 @@
 // Copyright (c) MetaNode Team
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
@@ -32,7 +32,10 @@ pub fn create_global_exec_index_callback(
         match update_result {
             Ok(_) => {
                 // Successfully spawned task to update shared index
-                info!("✅ [GLOBAL_EXEC_INDEX] Updated shared index to {}", global_exec_index);
+                info!(
+                    "✅ [GLOBAL_EXEC_INDEX] Updated shared index to {}",
+                    global_exec_index
+                );
             }
             Err(_) => {
                 // No runtime handle available, log warning
@@ -45,16 +48,27 @@ pub fn create_global_exec_index_callback(
 
 /// Creates an epoch transition callback that sends transition requests via channel
 pub fn create_epoch_transition_callback(
-    epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u32)>,
-) -> impl Fn(u64, u64, u32) -> Result<(), anyhow::Error> + Send + Sync + 'static {
-    move |new_epoch, new_epoch_timestamp_ms, commit_index| {
-        info!("🎯 [SYSTEM TX CALLBACK] EndOfEpoch detected: epoch={}, timestamp={}, commit_index={}",
-            new_epoch, new_epoch_timestamp_ms, commit_index);
+    epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u64)>, // CHANGED: u32 -> u64
+) -> impl Fn(u64, u64, u64) -> Result<(), anyhow::Error> + Send + Sync + 'static {
+    // CHANGED: u32 -> u64
+    move |new_epoch, new_epoch_timestamp_ms, synced_global_exec_index| {
+        info!("🎯 [SYSTEM TX CALLBACK] EndOfEpoch detected: epoch={}, timestamp={}, synced_global_exec_index={}",
+            new_epoch, new_epoch_timestamp_ms, synced_global_exec_index);
 
         // Send transition request via channel to transition handler task
-        if let Err(e) = epoch_transition_sender.send((new_epoch, new_epoch_timestamp_ms, commit_index)) {
-            warn!("❌ [SYSTEM TX CALLBACK] Failed to send epoch transition request: {}", e);
-            return Err(anyhow::anyhow!("Failed to send epoch transition request: {}", e));
+        if let Err(e) = epoch_transition_sender.send((
+            new_epoch,
+            new_epoch_timestamp_ms,
+            synced_global_exec_index,
+        )) {
+            warn!(
+                "❌ [SYSTEM TX CALLBACK] Failed to send epoch transition request: {}",
+                e
+            );
+            return Err(anyhow::anyhow!(
+                "Failed to send epoch transition request: {}",
+                e
+            ));
         }
         Ok(())
     }

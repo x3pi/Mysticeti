@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 
 use crate::{
     block::{BlockAPI, VerifiedBlock},
-    commit::{Commit, CommittedSubDag, TrustedCommit, sort_sub_dag_blocks},
+    commit::{sort_sub_dag_blocks, Commit, CommittedSubDag, TrustedCommit},
     context::Context,
     dag_state::DagState,
 };
@@ -62,11 +62,25 @@ pub struct Linearizer {
     /// In memory block store representing the dag state
     context: Arc<Context>,
     dag_state: Arc<RwLock<DagState>>,
+    /// Base index for global_exec_index calculation.
+    /// global_exec_index = epoch_base_index + commit_index
+    /// This is set once at epoch start and remains constant.
+    epoch_base_index: u64,
 }
 
 impl Linearizer {
     pub fn new(context: Arc<Context>, dag_state: Arc<RwLock<DagState>>) -> Self {
-        Self { context, dag_state }
+        Self {
+            context,
+            dag_state,
+            epoch_base_index: 0,
+        }
+    }
+
+    /// Set the epoch base index for global_exec_index calculation.
+    /// This should be called once at epoch start.
+    pub fn set_epoch_base_index(&mut self, epoch_base_index: u64) {
+        self.epoch_base_index = epoch_base_index;
     }
 
     /// Collect the sub-dag and the corresponding commit from a specific leader excluding any duplicates or
@@ -102,8 +116,12 @@ impl Linearizer {
         drop(dag_state);
 
         // Create the Commit.
+        // Calculate global_exec_index from epoch_base_index + commit_index
+        let commit_index = last_commit_index + 1;
+        let global_exec_index = self.epoch_base_index + commit_index as u64;
+
         let commit = Commit::new(
-            last_commit_index + 1,
+            commit_index,
             last_commit_digest,
             timestamp_ms,
             leader_block.reference(),
@@ -111,6 +129,7 @@ impl Linearizer {
                 .iter()
                 .map(|block| block.reference())
                 .collect::<Vec<_>>(),
+            global_exec_index,
         );
         let serialized = commit
             .serialize()
@@ -123,6 +142,7 @@ impl Linearizer {
             to_commit,
             timestamp_ms,
             commit.reference(),
+            global_exec_index,
         );
 
         (sub_dag, commit)
@@ -380,13 +400,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        CommitIndex, TestBlock,
         commit::{CommitAPI as _, CommitDigest, DEFAULT_WAVE_LENGTH},
         context::Context,
         leader_schedule::{LeaderSchedule, LeaderSwapTable},
         storage::mem_store::MemStore,
         test_dag_builder::DagBuilder,
         test_dag_parser::parse_dag,
+        CommitIndex, TestBlock,
     };
 
     #[rstest]
@@ -501,6 +521,7 @@ mod tests {
             0,
             first_leader.reference(),
             blocks.iter().map(|block| block.reference()).collect(),
+            last_commit_index as u64, // global_exec_index for test
         );
         dag_state.write().add_commit(first_commit_data);
 
@@ -539,6 +560,7 @@ mod tests {
             0,
             leader.reference(),
             blocks.clone(),
+            last_commit_index as u64, // global_exec_index for test
         );
 
         let commit = linearizer.handle_commit(vec![leader.clone()]);

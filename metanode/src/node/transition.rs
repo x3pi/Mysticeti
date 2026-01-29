@@ -22,9 +22,20 @@ pub async fn transition_to_epoch_from_system_tx(
     node: &mut ConsensusNode,
     new_epoch: u64,
     new_epoch_timestamp_ms: u64,
-    commit_index: u32,
+    synced_global_exec_index: u64, // CHANGED: Use global_exec_index (u64) instead of commit_index (u32)
     config: &NodeConfig,
 ) -> Result<()> {
+    // CRITICAL FIX: Prevent duplicate epoch transitions
+    // Multiple EndOfEpoch transactions can trigger multiple transitions to the same epoch
+    // This causes RocksDB lock conflicts when trying to open the same DB path twice
+    if node.current_epoch >= new_epoch {
+        info!(
+            "ℹ️ [TRANSITION SKIP] Already at epoch {} (requested: {}). Skipping duplicate transition.",
+            node.current_epoch, new_epoch
+        );
+        return Ok(());
+    }
+
     if node.is_transitioning.swap(true, Ordering::SeqCst) {
         warn!("⚠️ Transition already in progress, skipping.");
         node.is_transitioning.store(false, Ordering::SeqCst);
@@ -56,23 +67,51 @@ pub async fn transition_to_epoch_from_system_tx(
     } else {
         10
     };
-    let _ = wait_for_commit_processor_completion(node, commit_index, timeout_secs).await;
+    let _ =
+        wait_for_commit_processor_completion(node, synced_global_exec_index as u32, timeout_secs)
+            .await;
 
-    // CRITICAL FIX: Get last committed block from Go BEFORE calculating anything
-    // This ensures we use the actual committed state, not speculative calculations
-    let executor_client = if config.executor_read_enabled {
-        Arc::new(ExecutorClient::new(
-            true,
-            false,
-            config.executor_send_socket_path.clone(),
-            config.executor_receive_socket_path.clone(),
-            None,
-        ))
-    } else {
+    // Check executor read is enabled
+    if !config.executor_read_enabled {
         anyhow::bail!("Executor read disabled");
-    };
+    }
 
-    let synced_index = if let Ok(go_last) = executor_client.get_last_block_number().await {
+    // Deterministic calc for verification only - should match Go's last block
+    let calculated_last_block = crate::consensus::checkpoint::calculate_global_exec_index(
+        node.current_epoch,
+        synced_global_exec_index as u32, // Cast for checkpoint calculation
+        node.last_global_exec_index,
+    );
+
+    // UNIFIED COMMITTEE SOURCE: Use CommitteeSource for fork-safe committee fetching
+    // This ensures BOTH SyncOnly and Validator modes use the same logic
+    let committee_source = crate::node::committee_source::CommitteeSource::discover(config).await?;
+
+    // Validate epoch consistency
+    if !committee_source.validate_epoch(new_epoch) {
+        warn!(
+            "⚠️ [TRANSITION] Epoch mismatch detected. Expected={}, Source={}. Proceeding with source epoch.",
+            new_epoch, committee_source.epoch
+        );
+    }
+
+    // Use the unified source's executor client
+    let executor_client =
+        committee_source.create_executor_client(&config.executor_send_socket_path);
+
+    // Get synced_index from the authoritative source
+    let synced_index = if committee_source.last_block > 0 {
+        info!(
+            "📊 [SYNC] Using committee source last block: {} (from {})",
+            committee_source.last_block,
+            if committee_source.is_peer {
+                "peer"
+            } else {
+                "local"
+            }
+        );
+        committee_source.last_block
+    } else if let Ok(go_last) = executor_client.get_last_block_number().await {
         info!("📊 [SYNC] Go last committed block: {}", go_last);
         go_last
     } else {
@@ -83,22 +122,15 @@ pub async fn transition_to_epoch_from_system_tx(
         node.last_global_exec_index
     };
 
-    info!(
-        "📊 Snapshot: Last committed block from Go: {}",
-        synced_index
-    );
-
-    // Deterministic calc for verification only - should match Go's last block
-    let calculated_last_block = crate::consensus::checkpoint::calculate_global_exec_index(
-        node.current_epoch,
-        commit_index,
-        node.last_global_exec_index,
-    );
-
     if calculated_last_block != synced_index + 1 {
         warn!("⚠️ [SYNC] Calculated last block {} doesn't match Go's last block {} + 1. Using Go's value.",
             calculated_last_block, synced_index);
     }
+
+    info!(
+        "📊 Snapshot: Last committed block from Go: {}",
+        synced_index
+    );
 
     // Stop old authority
     if let Some(auth) = node.authority.take() {
@@ -115,8 +147,24 @@ pub async fn transition_to_epoch_from_system_tx(
     }
     node.last_global_exec_index = synced_index;
     node.update_execution_lock_epoch(new_epoch).await;
+
+    // CRITICAL: Use epoch_timestamp from CommitteeSource for consistency
+    // This ensures genesis block hash matches across all nodes
+    let verified_epoch_timestamp_ms = committee_source.get_epoch_timestamp();
+    if verified_epoch_timestamp_ms != new_epoch_timestamp_ms && verified_epoch_timestamp_ms > 0 {
+        warn!(
+            "⚠️ [TRANSITION] Epoch timestamp mismatch! Passed={}, Source={}. Using source timestamp for fork prevention.",
+            new_epoch_timestamp_ms, verified_epoch_timestamp_ms
+        );
+    }
+    let epoch_timestamp_to_use = if verified_epoch_timestamp_ms > 0 {
+        verified_epoch_timestamp_ms
+    } else {
+        new_epoch_timestamp_ms
+    };
+
     node.system_transaction_provider
-        .update_epoch(new_epoch, new_epoch_timestamp_ms)
+        .update_epoch(new_epoch, epoch_timestamp_to_use)
         .await;
 
     // Prepare DB
@@ -130,38 +178,34 @@ pub async fn transition_to_epoch_from_system_tx(
     }
     std::fs::create_dir_all(&db_path)?;
 
-    // Fetch committee - CRITICAL FIX: Use Go's last committed block to avoid race condition
-    // The synced_index might be ahead of what Go has committed, causing deadlock
-    let committee_block = match executor_client.get_last_block_number().await {
-        Ok(last_committed) => {
-            info!(
-                "✅ [COMMITTEE] Using Go's last committed block {} for committee fetch",
-                last_committed
-            );
-            last_committed
-        }
-        Err(e) => {
-            warn!("⚠️ [COMMITTEE] Failed to get last committed block from Go ({}), falling back to synced_index {}", e, synced_index);
-            synced_index
-        }
-    };
-
-    let committee = crate::node::committee::build_committee_from_go_validators_at_block_with_epoch(
-        &executor_client,
-        committee_block,
+    // Fetch committee from unified source FOR THE NEW EPOCH
+    // CRITICAL: Pass new_epoch to ensure we get the correct validator set
+    info!(
+        "📋 [COMMITTEE] Fetching committee for epoch {} from {} (epoch={}, block={})",
         new_epoch,
-    )
-    .await?;
+        committee_source.socket_path,
+        committee_source.epoch,
+        committee_source.last_block
+    );
+    let committee = committee_source
+        .fetch_committee(&config.executor_send_socket_path, new_epoch)
+        .await?;
     node.check_and_update_node_mode(&committee, config).await?;
 
-    let node_hostname = format!("node-{}", config.node_id);
+    // FIX: Use protocol_key matching for consistent identity
+    let own_protocol_pubkey = node.protocol_keypair.public();
     if let Some((idx, _)) = committee
         .authorities()
-        .find(|(_, a)| a.hostname == node_hostname)
+        .find(|(_, a)| a.protocol_key == own_protocol_pubkey)
     {
         node.own_index = idx;
+        info!(
+            "✅ [TRANSITION] Found self in new committee at index {}",
+            idx
+        );
     } else {
         node.own_index = consensus_config::AuthorityIndex::ZERO;
+        info!("ℹ️ [TRANSITION] Not in new committee (protocol_key not found)");
     }
 
     // Only setup consensus components if we're in Validator mode
@@ -222,7 +266,7 @@ pub async fn transition_to_epoch_from_system_tx(
             Some(
                 ConsensusAuthority::start(
                     NetworkType::Tonic,
-                    new_epoch_timestamp_ms,
+                    epoch_timestamp_to_use, // CRITICAL: Use verified timestamp from CommitteeSource
                     node.own_index,
                     committee,
                     params,
@@ -276,6 +320,25 @@ pub async fn transition_to_epoch_from_system_tx(
     let _ = executor_client
         .advance_epoch(new_epoch, new_epoch_timestamp_ms)
         .await;
+
+    // FORK-SAFETY: Verify Go and Rust epochs match after transition
+    // This catches any epoch desync early to prevent forks
+    match executor_client.get_current_epoch().await {
+        Ok(go_epoch) => {
+            if go_epoch != new_epoch {
+                warn!(
+                    "⚠️ [EPOCH VERIFY] Go-Rust epoch mismatch! Rust: {}, Go: {}. \
+                     This could indicate a fork risk. Consider investigating.",
+                    new_epoch, go_epoch
+                );
+            } else {
+                info!("✅ [EPOCH VERIFY] Go-Rust epoch consistent: {}", new_epoch);
+            }
+        }
+        Err(e) => {
+            warn!("⚠️ [EPOCH VERIFY] Failed to verify epoch with Go: {}", e);
+        }
+    }
 
     // FORK-SAFETY: Sync timestamp from Go to ensure consistency
     // CRITICAL: Retry with delay to allow Go to update its state

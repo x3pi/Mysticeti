@@ -10,11 +10,11 @@ use std::{
 use consensus_config::{AuthorityIndex, Stake};
 use consensus_types::block::Round;
 use parking_lot::RwLock;
-use rand::{SeedableRng, prelude::SliceRandom, rngs::StdRng};
+use rand::{prelude::SliceRandom, rngs::StdRng, SeedableRng};
 
 use crate::{
-    CommitIndex, commit::CommitRange, context::Context, dag_state::DagState,
-    leader_scoring::ReputationScores,
+    commit::CommitRange, context::Context, dag_state::DagState, leader_scoring::ReputationScores,
+    CommitIndex,
 };
 
 /// The `LeaderSchedule` is responsible for producing the leader schedule across
@@ -439,7 +439,7 @@ mod tests {
     use crate::{
         block::{TestBlock, VerifiedBlock},
         commit::{CommitDigest, CommitInfo, CommitRef, CommittedSubDag, TrustedCommit},
-        storage::{Store, WriteBatch, mem_store::MemStore},
+        storage::{mem_store::MemStore, Store, WriteBatch},
         test_dag_builder::DagBuilder,
     };
 
@@ -676,6 +676,7 @@ mod tests {
             vec![],
             context.clock.timestamp_utc_ms(),
             CommitRef::new(1, CommitDigest::MIN),
+            1, // global_exec_index for test
         )];
         dag_state.write().add_scoring_subdags(unscored_subdags);
 
@@ -764,6 +765,7 @@ mod tests {
                 .iter()
                 .map(|block| block.reference())
                 .collect::<Vec<_>>(),
+            commit_index as u64, // global_exec_index for test
         );
 
         let unscored_subdags = vec![CommittedSubDag::new(
@@ -771,6 +773,7 @@ mod tests {
             blocks,
             context.clock.timestamp_utc_ms(),
             last_commit.reference(),
+            commit_index as u64, // global_exec_index for test
         )];
 
         let mut dag_state_write = dag_state.write();
@@ -792,11 +795,9 @@ mod tests {
             AuthorityIndex::new_for_test(2)
         );
         assert_eq!(leader_swap_table.bad_nodes.len(), 1);
-        assert!(
-            leader_swap_table
-                .bad_nodes
-                .contains_key(&AuthorityIndex::new_for_test(0))
-        );
+        assert!(leader_swap_table
+            .bad_nodes
+            .contains_key(&AuthorityIndex::new_for_test(0)));
         assert_eq!(
             leader_schedule.elect_leader(4, 0),
             AuthorityIndex::new_for_test(2)
@@ -822,11 +823,9 @@ mod tests {
             AuthorityIndex::new_for_test(3)
         );
         assert_eq!(leader_swap_table.bad_nodes.len(), 1);
-        assert!(
-            leader_swap_table
-                .bad_nodes
-                .contains_key(&AuthorityIndex::new_for_test(0))
-        );
+        assert!(leader_swap_table
+            .bad_nodes
+            .contains_key(&AuthorityIndex::new_for_test(0)));
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::config::NodeConfig;
+use crate::network::peer_rpc::PeerRpcServer;
 use crate::network::rpc::RpcServer;
 use crate::network::tx_socket_server::TxSocketServer;
 use crate::node::ConsensusNode;
@@ -40,6 +41,8 @@ pub struct InitializedNode {
     pub node: Arc<Mutex<ConsensusNode>>,
     pub rpc_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub uds_server_handle: Option<tokio::task::JoinHandle<()>>,
+    #[allow(dead_code)]
+    pub peer_rpc_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub node_config: NodeConfig,
 }
 
@@ -86,6 +89,7 @@ impl InitializedNode {
 
         let mut rpc_server_handle = None;
         let mut uds_server_handle = None;
+        let mut peer_rpc_server_handle = None;
 
         if let Some(tx_client) = tx_client {
             // Start RPC server for client submissions (HTTP) - only for validator nodes
@@ -119,11 +123,41 @@ impl InitializedNode {
             info!("Sync-only node started successfully (no transaction submission servers)");
         }
 
+        // Start Peer RPC server for WAN-based peer discovery (all node types)
+        if let Some(peer_port) = node_config.peer_rpc_port {
+            if peer_port > 0 {
+                let executor_client_for_peer = {
+                    let node_guard = node.lock().await;
+                    node_guard.executor_client.clone()
+                };
+                if let Some(exc) = executor_client_for_peer {
+                    let peer_server = PeerRpcServer::new(
+                        node_config.node_id,
+                        peer_port,
+                        node_config.network_address.clone(),
+                        exc,
+                    );
+                    peer_rpc_server_handle = Some(tokio::spawn(async move {
+                        if let Err(e) = peer_server.start().await {
+                            error!("Peer RPC server error: {}", e);
+                        }
+                    }));
+                    info!(
+                        "📡 [PEER RPC] Server started on 0.0.0.0:{} for WAN sync",
+                        peer_port
+                    );
+                } else {
+                    warn!("⚠️ [PEER RPC] No executor client available, skipping peer RPC server");
+                }
+            }
+        }
+
         Ok(Self {
             node,
             rpc_server_handle,
             uds_server_handle,
-            node_config: node_config.clone(),
+            peer_rpc_server_handle,
+            node_config,
         })
     }
 
@@ -139,6 +173,7 @@ impl InitializedNode {
                     client,
                     self.node_config.peer_go_master_sockets.clone(),
                     self.node_config.executor_receive_socket_path.clone(),
+                    self.node_config.peer_rpc_addresses.clone(),
                 ))
             } else {
                 warn!("⚠️ [STARTUP] No executor client available, skipping catchup check");

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+use crate::network::peer_rpc::query_peer_epochs_network;
 use crate::node::executor_client::ExecutorClient;
 
 /// State of catchup process
@@ -60,10 +61,12 @@ pub struct SyncStatus {
 pub struct CatchupManager {
     /// Client to communicate with Go Master
     executor_client: Arc<ExecutorClient>,
-    /// List of peer Go Master sockets to query network state
+    /// List of peer Go Master sockets to query network state (LAN/local)
     peer_sockets: Vec<String>,
     /// Own Go Master socket (for fallback/identity)
     own_socket: String,
+    /// WAN peer RPC addresses (e.g., "192.168.1.100:19000")
+    peer_rpc_addresses: Vec<String>,
     /// Current catchup state
     state: RwLock<CatchupState>,
 }
@@ -77,11 +80,13 @@ impl CatchupManager {
         executor_client: Arc<ExecutorClient>,
         peer_sockets: Vec<String>,
         own_socket: String,
+        peer_rpc_addresses: Vec<String>,
     ) -> Self {
         Self {
             executor_client,
             peer_sockets,
             own_socket,
+            peer_rpc_addresses,
             state: RwLock::new(CatchupState::Initializing),
         }
     }
@@ -110,8 +115,39 @@ impl CatchupManager {
         };
 
         // 2. Get Network State from Peers
-        // If we have peers, query them to find the true "tip" of the chain
-        let (network_epoch, network_block, _best_peer) = if !self.peer_sockets.is_empty() {
+        // Priority: WAN peers (peer_rpc_addresses) > LAN peers (peer_sockets) > local
+        let (network_epoch, network_block, _best_peer) = if !self.peer_rpc_addresses.is_empty() {
+            // WAN-based discovery (cross-server sync)
+            info!(
+                "🌐 [CATCHUP] Using WAN peer discovery ({} peers configured)",
+                self.peer_rpc_addresses.len()
+            );
+            match query_peer_epochs_network(&self.peer_rpc_addresses).await {
+                Ok(res) => {
+                    info!(
+                        "✅ [CATCHUP] WAN peer query success: epoch={}, block={}, peer={}",
+                        res.0, res.1, res.2
+                    );
+                    res
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [CATCHUP] WAN peer query failed ({}), falling back to LAN peers",
+                        e
+                    );
+                    // Fallback to LAN peers
+                    if !self.peer_sockets.is_empty() {
+                        match query_peer_epochs(&self.peer_sockets, &self.own_socket).await {
+                            Ok(res) => res,
+                            Err(_) => (local_go_epoch, local_go_last_block, "local".to_string()),
+                        }
+                    } else {
+                        (local_go_epoch, local_go_last_block, "local".to_string())
+                    }
+                }
+            }
+        } else if !self.peer_sockets.is_empty() {
+            // LAN-based discovery (Unix socket)
             match query_peer_epochs(&self.peer_sockets, &self.own_socket).await {
                 Ok(res) => res,
                 Err(e) => {

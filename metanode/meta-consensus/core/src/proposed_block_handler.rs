@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use mysten_metrics::monitored_scope;
 use tokio::sync::broadcast;
-use tracing::{trace, warn};
+use tracing::warn;
 
 use crate::{block::ExtendedBlock, context::Context, transaction_certifier::TransactionCertifier};
 

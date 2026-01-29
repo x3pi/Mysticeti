@@ -6,7 +6,7 @@ use consensus_types::block::{BlockDigest, BlockRef};
 use rstest::rstest;
 use tempfile::TempDir;
 
-use super::{Store, WriteBatch, mem_store::MemStore, rocksdb_store::RocksDBStore};
+use super::{mem_store::MemStore, rocksdb_store::RocksDBStore, Store, WriteBatch};
 use crate::{
     block::{TestBlock, VerifiedBlock},
     commit::{CommitDigest, TrustedCommit},
@@ -209,6 +209,7 @@ async fn read_and_scan_commits(
             1,
             BlockRef::new(1, AuthorityIndex::new_for_test(0), BlockDigest::default()),
             vec![],
+            1, // global_exec_index for test
         ),
         TrustedCommit::new_for_test(
             2,
@@ -216,6 +217,7 @@ async fn read_and_scan_commits(
             2,
             BlockRef::new(2, AuthorityIndex::new_for_test(0), BlockDigest::default()),
             vec![],
+            2, // global_exec_index for test
         ),
         TrustedCommit::new_for_test(
             3,
@@ -223,6 +225,7 @@ async fn read_and_scan_commits(
             3,
             BlockRef::new(3, AuthorityIndex::new_for_test(0), BlockDigest::default()),
             vec![],
+            3, // global_exec_index for test
         ),
         TrustedCommit::new_for_test(
             4,
@@ -230,6 +233,7 @@ async fn read_and_scan_commits(
             4,
             BlockRef::new(4, AuthorityIndex::new_for_test(0), BlockDigest::default()),
             vec![],
+            4, // global_exec_index for test
         ),
     ];
     store

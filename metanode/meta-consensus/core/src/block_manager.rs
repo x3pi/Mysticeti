@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 use tracing::{debug, trace, warn};
 
 use crate::{
-    block::{BlockAPI, GENESIS_ROUND, VerifiedBlock},
+    block::{BlockAPI, VerifiedBlock, GENESIS_ROUND},
     context::Context,
     dag_state::DagState,
 };
@@ -607,11 +607,10 @@ mod tests {
     use consensus_config::AuthorityIndex;
     use consensus_types::block::{BlockDigest, BlockRef, Round};
     use parking_lot::RwLock;
-    use rand::{SeedableRng, prelude::StdRng, seq::SliceRandom};
+    use rand::{prelude::StdRng, seq::SliceRandom, SeedableRng};
     use rstest::rstest;
 
     use crate::{
-        CommitDigest,
         block::{BlockAPI, VerifiedBlock},
         block_manager::BlockManager,
         commit::TrustedCommit,
@@ -620,6 +619,7 @@ mod tests {
         storage::mem_store::MemStore,
         test_dag_builder::DagBuilder,
         test_dag_parser::parse_dag,
+        CommitDigest,
     };
 
     #[tokio::test]
@@ -772,6 +772,7 @@ mod tests {
             context.clock.timestamp_utc_ms(),
             BlockRef::new(10, AuthorityIndex::new_for_test(0), BlockDigest::MIN),
             vec![],
+            10, // global_exec_index for test
         );
         dag_state.write().set_last_commit(last_commit);
         assert_eq!(
@@ -861,6 +862,7 @@ mod tests {
             context.clock.timestamp_utc_ms(),
             BlockRef::new(10, AuthorityIndex::new_for_test(0), BlockDigest::MIN),
             vec![],
+            10, // global_exec_index for test
         );
         dag_state.write().set_last_commit(last_commit);
         assert_eq!(
@@ -997,6 +999,7 @@ mod tests {
                     BlockDigest::MIN,
                 ),
                 vec![],
+                (gc_depth * 2) as u64, // global_exec_index for test
             );
             dag_state.write().set_last_commit(last_commit);
 
@@ -1033,6 +1036,7 @@ mod tests {
             context.clock.timestamp_utc_ms(),
             BlockRef::new(6, AuthorityIndex::new_for_test(0), BlockDigest::MIN),
             vec![],
+            10, // global_exec_index for test
         );
         dag_state.write().set_last_commit(last_commit);
         assert_eq!(
@@ -1102,11 +1106,9 @@ mod tests {
         let missing_block_refs_from_find =
             block_manager.try_find_blocks(round_2_blocks.iter().map(|b| b.reference()).collect());
         assert_eq!(missing_block_refs_from_find.len(), 10);
-        assert!(
-            missing_block_refs_from_find
-                .iter()
-                .all(|block_ref| block_ref.round == 2)
-        );
+        assert!(missing_block_refs_from_find
+            .iter()
+            .all(|block_ref| block_ref.round == 2));
 
         // Try accept blocks which will cause blocks to be suspended and added to missing
         // in block manager.
@@ -1143,11 +1145,9 @@ mod tests {
         );
 
         assert_eq!(missing_block_refs_from_find.len(), 4);
-        assert!(
-            missing_block_refs_from_find
-                .iter()
-                .all(|block_ref| block_ref.round == 3)
-        );
+        assert!(missing_block_refs_from_find
+            .iter()
+            .all(|block_ref| block_ref.round == 3));
         assert_eq!(
             block_manager.missing_blocks(),
             missing_block_refs_from_accept

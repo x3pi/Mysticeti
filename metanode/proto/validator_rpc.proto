@@ -58,6 +58,63 @@ message AdvanceEpochResponse {
     uint64 epoch_start_timestamp_ms = 2;  // Confirmed epoch start timestamp
 }
 
+// NEW: Unified epoch boundary data request
+// Returns validators at epoch boundary (last block of previous epoch) for consistent committee
+message GetEpochBoundaryDataRequest {
+    uint64 epoch = 1;  // Target epoch to get boundary data for
+}
+
+// NEW: Unified epoch boundary data response
+// Contains all data needed for fork-safe epoch transition
+message EpochBoundaryData {
+    uint64 epoch = 1;                      // Target epoch
+    uint64 epoch_start_timestamp_ms = 2;   // Fixed timestamp for genesis hash consistency
+    uint64 boundary_block = 3;             // Last block of previous epoch (validator snapshot point)
+    repeated ValidatorInfo validators = 4; // Validators at boundary_block
+}
+
+// ============================================================================
+// CLEAN TRANSITION HANDOFF APIs
+// These APIs ensure no gaps or overlaps between sync and consensus modes
+// ============================================================================
+
+// SetConsensusStartBlock - Called before starting consensus
+// Tells Go: "Consensus will produce blocks starting from block_number"
+message SetConsensusStartBlockRequest {
+    uint64 block_number = 1;  // First block that consensus will produce
+}
+
+message SetConsensusStartBlockResponse {
+    bool success = 1;
+    uint64 last_sync_block = 2;  // Last block that was synced (should be block_number - 1)
+    string message = 3;
+}
+
+// SetSyncStartBlock - Called when consensus ends
+// Tells Go: "Consensus ended at last_consensus_block, sync should start from last_consensus_block + 1"
+message SetSyncStartBlockRequest {
+    uint64 last_consensus_block = 1;  // Last block produced by consensus
+}
+
+message SetSyncStartBlockResponse {
+    bool success = 1;
+    uint64 sync_start_block = 2;  // Block number where sync will start (last_consensus_block + 1)
+    string message = 3;
+}
+
+// WaitForSyncToBlock - Wait for Go sync to reach a specific block
+// Used during SyncOnly -> Validator transition to ensure sync is complete before consensus starts
+message WaitForSyncToBlockRequest {
+    uint64 target_block = 1;       // Target block number to wait for
+    uint64 timeout_seconds = 2;    // Maximum time to wait (0 = use default)
+}
+
+message WaitForSyncToBlockResponse {
+    bool reached = 1;              // True if target block was reached
+    uint64 current_block = 2;      // Current block number
+    string message = 3;
+}
+
 // Validator info từ Go state - các trường cần thiết cho committee.json + metadata + phí/phần thưởng
 message ValidatorInfo {
     // Các trường cần thiết cho committee.json (tên khớp với committee.json)
@@ -110,6 +167,10 @@ message Request {
         GetCurrentEpochRequest get_current_epoch_request = 6;  // Sui-style: Get current epoch
         GetEpochStartTimestampRequest get_epoch_start_timestamp_request = 7;  // Sui-style: Get epoch timestamp
         AdvanceEpochRequest advance_epoch_request = 8;  // Sui-style: Advance epoch
+        GetEpochBoundaryDataRequest get_epoch_boundary_data_request = 9;  // NEW: Unified epoch boundary data
+        SetConsensusStartBlockRequest set_consensus_start_block_request = 10;  // NEW: Transition handoff
+        SetSyncStartBlockRequest set_sync_start_block_request = 11;  // NEW: Transition handoff
+        WaitForSyncToBlockRequest wait_for_sync_to_block_request = 12;  // NEW: Transition handoff
     }
 }
 
@@ -125,6 +186,10 @@ message Response {
         GetCurrentEpochResponse get_current_epoch_response = 6;  // Sui-style: Current epoch response
         GetEpochStartTimestampResponse get_epoch_start_timestamp_response = 7;  // Sui-style: Epoch timestamp response
         AdvanceEpochResponse advance_epoch_response = 8;  // Sui-style: Advance epoch response
+        EpochBoundaryData epoch_boundary_data = 9;  // NEW: Unified epoch boundary data response
+        SetConsensusStartBlockResponse set_consensus_start_block_response = 10;  // NEW: Transition handoff
+        SetSyncStartBlockResponse set_sync_start_block_response = 11;  // NEW: Transition handoff
+        WaitForSyncToBlockResponse wait_for_sync_to_block_response = 12;  // NEW: Transition handoff
     }
 }
 

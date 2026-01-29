@@ -1213,6 +1213,14 @@ impl ExecutorClient {
                 Some(proto::response::Payload::AdvanceEpochResponse(_)) => {
                     warn!("🔍 [EXECUTOR-REQ] Payload is AdvanceEpochResponse (not expected for this request)");
                 }
+                Some(proto::response::Payload::EpochBoundaryData(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is EpochBoundaryData (not expected for this request)");
+                }
+                Some(proto::response::Payload::SetConsensusStartBlockResponse(_)) |
+                Some(proto::response::Payload::SetSyncStartBlockResponse(_)) |
+                Some(proto::response::Payload::WaitForSyncToBlockResponse(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is Transition Handoff response (not expected for this request)");
+                }
                 None => {
                     warn!("🔍 [EXECUTOR-REQ] Payload is None - response structure may be incorrect");
                     warn!("🔍 [EXECUTOR-REQ] Full response debug: {:?}", response);
@@ -1260,6 +1268,14 @@ impl ExecutorClient {
                 }
                 Some(proto::response::Payload::AdvanceEpochResponse(_)) => {
                     return Err(anyhow::anyhow!("Unexpected AdvanceEpochResponse response (expected ValidatorInfoList)"));
+                }
+                Some(proto::response::Payload::EpochBoundaryData(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected EpochBoundaryData response (expected ValidatorInfoList)"));
+                }
+                Some(proto::response::Payload::SetConsensusStartBlockResponse(_)) |
+                Some(proto::response::Payload::SetSyncStartBlockResponse(_)) |
+                Some(proto::response::Payload::WaitForSyncToBlockResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected Transition Handoff response (expected ValidatorInfoList)"));
                 }
                 None => {
                     return Err(anyhow::anyhow!("Unexpected response type from Go. Response payload: None. Response bytes (hex): {}", hex::encode(&response_buf)));
@@ -1559,6 +1575,110 @@ impl ExecutorClient {
         }
     }
 
+    /// Get unified epoch boundary data from Go Master (NEW: single authoritative source for epoch transitions)
+    /// Returns: epoch, epoch_start_timestamp_ms, boundary_block, and validators snapshot
+    /// This ensures consistency by getting all epoch transition data in a single atomic request
+    pub async fn get_epoch_boundary_data(&self, epoch: u64) -> Result<(u64, u64, u64, Vec<ValidatorInfo>)> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Connect to Go request socket if needed
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        // Create GetEpochBoundaryDataRequest
+        let request = Request {
+            payload: Some(proto::request::Payload::GetEpochBoundaryDataRequest(
+                proto::GetEpochBoundaryDataRequest { epoch }
+            )),
+        };
+
+        // Encode request to protobuf bytes
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        // Send request via UDS
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            // Write 4-byte length prefix (big-endian)
+            let len = request_buf.len() as u32;
+            let len_bytes = len.to_be_bytes();
+            stream.write_all(&len_bytes).await?;
+
+            // Write request data
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+
+            info!("📤 [EXECUTOR-REQ] Sent GetEpochBoundaryDataRequest to Go for epoch {} (size: {} bytes)",
+                epoch, request_buf.len());
+
+            // Read response (4-byte length prefix + response data)
+            use tokio::io::AsyncReadExt;
+            use tokio::time::{timeout, Duration};
+
+            // Set timeout for reading response (5 seconds)
+            let read_timeout = Duration::from_secs(5);
+
+            let mut len_buf = [0u8; 4];
+            timeout(read_timeout, stream.read_exact(&mut len_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response length: {}", e))??;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+
+            if response_len == 0 {
+                return Err(anyhow::anyhow!("Received zero-length response from Go"));
+            }
+            if response_len > 10_000_000 { // 10MB limit
+                return Err(anyhow::anyhow!("Response too large: {} bytes", response_len));
+            }
+
+            let mut response_buf = vec![0u8; response_len];
+            timeout(read_timeout, stream.read_exact(&mut response_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response data: {}", e))??;
+
+            info!("📥 [EXECUTOR-REQ] Received {} bytes from Go (GetEpochBoundaryData), decoding...", response_buf.len());
+
+            // Decode response
+            let response = Response::decode(&response_buf[..])
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to decode response from Go: {}. Response length: {} bytes",
+                        e,
+                        response_buf.len()
+                    )
+                })?;
+
+            match response.payload {
+                Some(proto::response::Payload::EpochBoundaryData(data)) => {
+                    info!("✅ [EPOCH BOUNDARY] Received unified epoch boundary data: epoch={}, timestamp_ms={}, boundary_block={}, validator_count={}",
+                        data.epoch, data.epoch_start_timestamp_ms, data.boundary_block, data.validators.len());
+
+                    // Log validators for debugging
+                    for (idx, validator) in data.validators.iter().enumerate() {
+                        let auth_key_preview = if validator.authority_key.len() > 50 {
+                            format!("{}...", &validator.authority_key[..50])
+                        } else {
+                            validator.authority_key.clone()
+                        };
+                        info!("📥 [RUST←GO] EpochBoundaryData Validator[{}]: address={}, stake={}, name={}, authority_key={}",
+                            idx, validator.address, validator.stake, validator.name, auth_key_preview);
+                    }
+
+                    return Ok((data.epoch, data.epoch_start_timestamp_ms, data.boundary_block, data.validators));
+                }
+                Some(proto::response::Payload::Error(error_msg)) => {
+                    return Err(anyhow::anyhow!("Go returned error: {}", error_msg));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unexpected response payload type for GetEpochBoundaryData"));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Request connection is not available"));
+        }
+    }
+
     /// Get last block number from Go Master
     /// Used to initialize next_expected_index when connecting
     pub async fn get_last_block_number(&self) -> Result<u64> {
@@ -1651,7 +1771,210 @@ impl ExecutorClient {
         }
     }
 
+    // ==========================================================================
+    // CLEAN TRANSITION HANDOFF APIs
+    // These APIs ensure no gaps or overlaps between sync and consensus modes
+    // ==========================================================================
 
+    /// Set consensus start block - called before transitioning to Validator mode
+    /// Tells Go that consensus will produce blocks starting from `block_number`
+    /// This is used during SyncOnly -> Validator transition
+    pub async fn set_consensus_start_block(&self, block_number: u64) -> Result<(bool, u64, String)> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        let request = Request {
+            payload: Some(proto::request::Payload::SetConsensusStartBlockRequest(
+                proto::SetConsensusStartBlockRequest { block_number },
+            )),
+        };
+
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            let len = request_buf.len() as u32;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+
+            info!("📤 [TRANSITION] Sent SetConsensusStartBlockRequest: block_number={}", block_number);
+
+            use tokio::io::AsyncReadExt;
+            use tokio::time::{timeout, Duration};
+            let read_timeout = Duration::from_secs(35); // Longer timeout for potential waiting
+
+            let mut len_buf = [0u8; 4];
+            timeout(read_timeout, stream.read_exact(&mut len_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response length: {}", e))??;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+
+            if response_len == 0 || response_len > 10_000_000 {
+                return Err(anyhow::anyhow!("Invalid response length: {}", response_len));
+            }
+
+            let mut response_buf = vec![0u8; response_len];
+            timeout(read_timeout, stream.read_exact(&mut response_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response data: {}", e))??;
+
+            let response = Response::decode(&response_buf[..])?;
+            match response.payload {
+                Some(proto::response::Payload::SetConsensusStartBlockResponse(res)) => {
+                    info!(
+                        "✅ [TRANSITION] SetConsensusStartBlock response: success={}, last_sync_block={}, message={}",
+                        res.success, res.last_sync_block, res.message
+                    );
+                    Ok((res.success, res.last_sync_block, res.message))
+                }
+                Some(proto::response::Payload::Error(error_msg)) => {
+                    Err(anyhow::anyhow!("Go returned error: {}", error_msg))
+                }
+                _ => Err(anyhow::anyhow!("Unexpected response type from Go")),
+            }
+        } else {
+            Err(anyhow::anyhow!("Request connection is not available"))
+        }
+    }
+
+    /// Set sync start block - called when transitioning from Validator to SyncOnly mode
+    /// Tells Go that consensus ended at `last_consensus_block`, sync should start from `last_consensus_block + 1`
+    pub async fn set_sync_start_block(&self, last_consensus_block: u64) -> Result<(bool, u64, String)> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        let request = Request {
+            payload: Some(proto::request::Payload::SetSyncStartBlockRequest(
+                proto::SetSyncStartBlockRequest { last_consensus_block },
+            )),
+        };
+
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            let len = request_buf.len() as u32;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+
+            info!("📤 [TRANSITION] Sent SetSyncStartBlockRequest: last_consensus_block={}", last_consensus_block);
+
+            use tokio::io::AsyncReadExt;
+            use tokio::time::{timeout, Duration};
+            let read_timeout = Duration::from_secs(5);
+
+            let mut len_buf = [0u8; 4];
+            timeout(read_timeout, stream.read_exact(&mut len_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response length: {}", e))??;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+
+            if response_len == 0 || response_len > 10_000_000 {
+                return Err(anyhow::anyhow!("Invalid response length: {}", response_len));
+            }
+
+            let mut response_buf = vec![0u8; response_len];
+            timeout(read_timeout, stream.read_exact(&mut response_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response data: {}", e))??;
+
+            let response = Response::decode(&response_buf[..])?;
+            match response.payload {
+                Some(proto::response::Payload::SetSyncStartBlockResponse(res)) => {
+                    info!(
+                        "✅ [TRANSITION] SetSyncStartBlock response: success={}, sync_start_block={}, message={}",
+                        res.success, res.sync_start_block, res.message
+                    );
+                    Ok((res.success, res.sync_start_block, res.message))
+                }
+                Some(proto::response::Payload::Error(error_msg)) => {
+                    Err(anyhow::anyhow!("Go returned error: {}", error_msg))
+                }
+                _ => Err(anyhow::anyhow!("Unexpected response type from Go")),
+            }
+        } else {
+            Err(anyhow::anyhow!("Request connection is not available"))
+        }
+    }
+
+    /// Wait for Go sync to reach a specific block
+    /// Used during SyncOnly -> Validator transition to ensure sync is complete before consensus starts
+    pub async fn wait_for_sync_to_block(&self, target_block: u64, timeout_seconds: u64) -> Result<(bool, u64, String)> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        if let Err(e) = self.connect_request().await {
+            return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
+        }
+
+        let request = Request {
+            payload: Some(proto::request::Payload::WaitForSyncToBlockRequest(
+                proto::WaitForSyncToBlockRequest { 
+                    target_block, 
+                    timeout_seconds, 
+                },
+            )),
+        };
+
+        let mut request_buf = Vec::new();
+        request.encode(&mut request_buf)?;
+
+        let mut conn_guard = self.request_connection.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
+            let len = request_buf.len() as u32;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(&request_buf).await?;
+            stream.flush().await?;
+
+            info!("📤 [TRANSITION] Sent WaitForSyncToBlockRequest: target_block={}, timeout={}s", target_block, timeout_seconds);
+
+            use tokio::io::AsyncReadExt;
+            use tokio::time::{timeout, Duration};
+            // Timeout needs to be longer than the Go-side timeout
+            let read_timeout = Duration::from_secs(timeout_seconds + 10);
+
+            let mut len_buf = [0u8; 4];
+            timeout(read_timeout, stream.read_exact(&mut len_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response length: {}", e))??;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+
+            if response_len == 0 || response_len > 10_000_000 {
+                return Err(anyhow::anyhow!("Invalid response length: {}", response_len));
+            }
+
+            let mut response_buf = vec![0u8; response_len];
+            timeout(read_timeout, stream.read_exact(&mut response_buf)).await
+                .map_err(|e| anyhow::anyhow!("Timeout reading response data: {}", e))??;
+
+            let response = Response::decode(&response_buf[..])?;
+            match response.payload {
+                Some(proto::response::Payload::WaitForSyncToBlockResponse(res)) => {
+                    info!(
+                        "✅ [TRANSITION] WaitForSyncToBlock response: reached={}, current_block={}, message={}",
+                        res.reached, res.current_block, res.message
+                    );
+                    Ok((res.reached, res.current_block, res.message))
+                }
+                Some(proto::response::Payload::Error(error_msg)) => {
+                    Err(anyhow::anyhow!("Go returned error: {}", error_msg))
+                }
+                _ => Err(anyhow::anyhow!("Unexpected response type from Go")),
+            }
+        } else {
+            Err(anyhow::anyhow!("Request connection is not available"))
+        }
+    }
 }
 
 /// Write uvarint to buffer (Go's binary.ReadUvarint format)

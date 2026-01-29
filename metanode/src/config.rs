@@ -136,9 +136,9 @@ pub struct NodeConfig {
     /// When enabled, transactions are rejected gradually before authority shutdown
     #[serde(default = "default_enable_gradual_shutdown")]
     pub enable_gradual_shutdown: bool,
-    /// Initial node operation mode (default: SyncOnly)
-    /// Node can be configured to start as SyncOnly or Validator
-    /// During runtime, node will automatically switch modes based on committee membership
+    /// DEPRECATED: This field is ignored. Node mode is determined dynamically by committee membership.
+    /// Kept for backward compatibility with existing config files.
+    /// If node is in committee → Validator mode, otherwise → SyncOnly mode.
     #[serde(default = "default_node_mode")]
     pub initial_node_mode: NodeMode,
     /// Seconds to wait for user certificates to drain during gradual shutdown (default: 2)
@@ -158,6 +158,15 @@ pub struct NodeConfig {
     /// Poll interval in seconds for epoch monitor in SyncOnly mode (default: 5)
     #[serde(default = "default_epoch_monitor_poll_interval_secs")]
     pub epoch_monitor_poll_interval_secs: Option<u64>,
+    /// Port for Peer RPC server (for WAN-based epoch/block queries, default: 19000 + node_id)
+    /// Set to 0 to disable Peer RPC server
+    #[serde(default)]
+    pub peer_rpc_port: Option<u16>,
+    /// Peer RPC addresses for WAN-based epoch discovery (IP:Port format)
+    /// When node is behind and local Go Master is stale, it can query these peers over network
+    /// Format: ["192.168.1.100:19000", "192.168.1.101:19000"]
+    #[serde(default)]
+    pub peer_rpc_addresses: Vec<String>,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -302,6 +311,8 @@ impl NodeConfig {
                 adaptive_delay_ms: default_adaptive_delay_ms(),
                 peer_go_master_sockets: vec!["/tmp/rust-go-standard-master.sock".to_string()], // Fallback to main Go Master
                 epoch_monitor_poll_interval_secs: default_epoch_monitor_poll_interval_secs(),
+                peer_rpc_port: Some(19000 + idx as u16), // Default: 19000 + node_id for WAN sync
+                peer_rpc_addresses: vec![],              // Empty by default, configure for WAN sync
             };
 
             // Save keys - use private_key_bytes and public key bytes

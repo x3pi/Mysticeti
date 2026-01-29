@@ -41,7 +41,7 @@ pub struct CommitProcessor {
     /// Optional callback to handle EndOfEpoch system transactions
     /// Called immediately when an EndOfEpoch system transaction is detected in a committed sub-dag
     /// Uses commit finalization approach (like Sui) - no buffer needed as commits are processed sequentially
-    epoch_transition_callback: Option<Arc<dyn Fn(u64, u64, u32) -> Result<()> + Send + Sync>>,
+    epoch_transition_callback: Option<Arc<dyn Fn(u64, u64, u64) -> Result<()> + Send + Sync>>, // CHANGED: u32 -> u64
 }
 
 impl CommitProcessor {
@@ -130,7 +130,7 @@ impl CommitProcessor {
     /// Set callback to handle EndOfEpoch system transactions
     pub fn with_epoch_transition_callback<F>(mut self, callback: F) -> Self
     where
-        F: Fn(u64, u64, u32) -> Result<()> + Send + Sync + 'static,
+        F: Fn(u64, u64, u64) -> Result<()> + Send + Sync + 'static, // CHANGED: u32 -> u64
     {
         self.epoch_transition_callback = Some(Arc::new(callback));
         self
@@ -147,22 +147,23 @@ impl CommitProcessor {
         let pending_transactions_queue = self.pending_transactions_queue;
         let epoch_transition_callback = self.epoch_transition_callback;
 
-        // --- [FORK SAFETY FIX] ---
-        // Initialize local tracker. We read from shared state ONLY ONCE at startup.
-        // This ensures sequential consistency within the loop, preventing race conditions
-        // where we might read a stale index from the shared mutex.
-        let mut tracked_last_global_exec_index =
-            if let Some(ref shared_index) = self.shared_last_global_exec_index {
-                let index_guard = shared_index.lock().await;
-                *index_guard
+        // --- [FORK SAFETY FIX v2] ---
+        // CRITICAL: epoch_base_index is set ONCE at epoch start and never changes during epoch.
+        // This is the last_global_exec_index at the END of previous epoch (or 0 for epoch 0).
+        // All nodes receive this same value from Go via GetEpochBoundaryData API.
+        // Formula: global_exec_index = epoch_base_index + commit_index
+        // Since commit_index is consensus-agreed (from Mysticeti), all nodes compute same result.
+        let epoch_base_index = if let Some(ref shared_index) = self.shared_last_global_exec_index {
+            let index_guard = shared_index.lock().await;
+            *index_guard
+        } else {
+            // Fallback: try callback if shared index not available
+            if let Some(ref callback) = self.get_last_global_exec_index {
+                callback()
             } else {
-                // Fallback: try callback if shared index not available
-                if let Some(ref callback) = self.get_last_global_exec_index {
-                    callback()
-                } else {
-                    0
-                }
-            };
+                0
+            }
+        };
 
         // #region agent log
         {
@@ -182,15 +183,15 @@ impl CommitProcessor {
                     ts.as_nanos() % 1000000,
                     ts.as_millis(),
                     current_epoch,
-                    tracked_last_global_exec_index,
+                    epoch_base_index,
                     next_expected_index
                 );
             }
         }
         // #endregion
 
-        info!("🚀 [COMMIT PROCESSOR] Started processing commits for epoch {} (last_global_exec_index={}, next_expected_index={})",
-            current_epoch, tracked_last_global_exec_index, next_expected_index);
+        info!("🚀 [COMMIT PROCESSOR] Started processing commits for epoch {} (epoch_base_index={}, next_expected_index={})",
+            current_epoch, epoch_base_index, next_expected_index);
 
         let mut last_heartbeat_commit = 0u32;
         let mut last_heartbeat_time = std::time::Instant::now();
@@ -239,19 +240,19 @@ impl CommitProcessor {
                     }
 
                     if commit_index == next_expected_index {
-                        // --- [FORK SAFETY IMPLEMENTATION] ---
-                        // Use the LOCAL tracker for calculation.
-                        // This guarantees deterministic increment: Index(N) = Index(N-1) + Blocks(N-1)
-                        let current_last_global_exec_index = tracked_last_global_exec_index;
-
+                        // --- [FORK SAFETY v2: CONSENSUS-BASED FORMULA] ---
+                        // global_exec_index = epoch_base_index + commit_index
+                        // - epoch_base_index: Fixed at epoch start, same for all nodes
+                        // - commit_index: From Mysticeti consensus, same for all nodes
+                        // Result: Deterministic across all nodes, even late joiners!
                         let global_exec_index = calculate_global_exec_index(
                             current_epoch,
                             commit_index,
-                            current_last_global_exec_index,
+                            epoch_base_index,
                         );
 
-                        info!("📊 [GLOBAL_EXEC_INDEX] Calculated: global_exec_index={}, epoch={}, commit_index={}, current_last_global_exec_index={}",
-                            global_exec_index, current_epoch, commit_index, current_last_global_exec_index);
+                        info!("📊 [GLOBAL_EXEC_INDEX] Calculated: global_exec_index={}, epoch={}, commit_index={}, epoch_base_index={}",
+                            global_exec_index, current_epoch, commit_index, epoch_base_index);
 
                         let total_txs_in_commit = subdag
                             .blocks
@@ -271,9 +272,9 @@ impl CommitProcessor {
                         )
                         .await?;
 
-                        // Update local tracker immediately after successful processing.
-                        // The next iteration is GUARANTEED to see this updated value.
-                        tracked_last_global_exec_index = global_exec_index;
+                        // NOTE: epoch_base_index is NOT updated after each commit.
+                        // It remains constant throughout the epoch.
+                        // The shared_last_global_exec_index is updated for monitoring/visibility only.
 
                         if let Some(ref callback) = self.global_exec_index_callback {
                             callback(global_exec_index);
@@ -306,8 +307,12 @@ impl CommitProcessor {
                                         commit_index, new_epoch, global_exec_index
                                     );
 
-                                    if let Err(e) =
-                                        callback(new_epoch, new_epoch_timestamp_ms, commit_index)
+                                    if let Err(e) = callback(
+                                        new_epoch,
+                                        new_epoch_timestamp_ms,
+                                        global_exec_index,
+                                    )
+                                    // FIXED: Use global_exec_index (u64) as sync point
                                     {
                                         warn!("❌ Failed to trigger epoch transition from system transaction: {}", e);
                                     }
@@ -319,13 +324,11 @@ impl CommitProcessor {
                         while let Some(pending) = pending_commits.remove(&next_expected_index) {
                             let pending_commit_index = next_expected_index;
 
-                            // Use LOCAL tracker for pending commits as well
-                            let current_last_global_exec_index = tracked_last_global_exec_index;
-
+                            // Use epoch_base_index for pending commits as well (same formula)
                             let global_exec_index = calculate_global_exec_index(
                                 current_epoch,
                                 pending_commit_index,
-                                current_last_global_exec_index,
+                                epoch_base_index,
                             );
 
                             Self::process_commit(
@@ -338,8 +341,7 @@ impl CommitProcessor {
                             )
                             .await?;
 
-                            // Update local tracker
-                            tracked_last_global_exec_index = global_exec_index;
+                            // epoch_base_index is NOT updated (it's constant per epoch)
 
                             if let Some(ref callback) = commit_index_callback {
                                 callback(pending_commit_index);
