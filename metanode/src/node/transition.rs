@@ -402,9 +402,10 @@ pub async fn transition_to_epoch_from_system_tx(
 
     node.reset_reconfig_state().await;
 
-    // Notify Go
+    // Notify Go with boundary_block (synced_index) for deterministic epoch transition
+    // synced_index is the global_exec_index of the last block of the ending epoch
     let _ = executor_client
-        .advance_epoch(new_epoch, new_epoch_timestamp_ms)
+        .advance_epoch(new_epoch, new_epoch_timestamp_ms, synced_index)
         .await;
 
     // FORK-SAFETY: Verify Go and Rust epochs match after transition

@@ -51,6 +51,7 @@ message GetEpochStartTimestampResponse {
 message AdvanceEpochRequest {
     uint64 new_epoch = 1;  // New epoch number to advance to
     uint64 epoch_start_timestamp_ms = 2;  // Epoch start timestamp in milliseconds
+    uint64 boundary_block = 3;  // global_exec_index of last block of ending epoch (epoch boundary)
 }
 
 message AdvanceEpochResponse {

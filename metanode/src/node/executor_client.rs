@@ -1479,7 +1479,8 @@ impl ExecutorClient {
 
 
     /// Advance epoch in Go state (Sui-style epoch transition)
-    pub async fn advance_epoch(&self, new_epoch: u64, epoch_start_timestamp_ms: u64) -> Result<()> {
+    /// boundary_block is the global_exec_index of the last block of the ending epoch
+    pub async fn advance_epoch(&self, new_epoch: u64, epoch_start_timestamp_ms: u64, boundary_block: u64) -> Result<()> {
         if !self.is_enabled() {
             return Err(anyhow::anyhow!("Executor client is not enabled"));
         }
@@ -1489,12 +1490,13 @@ impl ExecutorClient {
             return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
         }
 
-        // Create AdvanceEpochRequest
+        // Create AdvanceEpochRequest with boundary_block for deterministic epoch transition
         let request = Request {
             payload: Some(proto::request::Payload::AdvanceEpochRequest(
                 AdvanceEpochRequest {
                     new_epoch,
                     epoch_start_timestamp_ms,
+                    boundary_block,
                 }
             )),
         };
