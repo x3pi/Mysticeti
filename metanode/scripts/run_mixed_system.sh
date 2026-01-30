@@ -185,7 +185,7 @@ print_info "Generating keys for 4 nodes..."
 # This ensures it has the exact same structure/params as standard nodes.
 
 # Apply custom configurations first
-apply_custom_node_configs
+# apply_custom_node_configs
 
 # Patch node_1.toml for custom ports/sockets/paths
 # 1. Update Network Port (9001 -> 9011)

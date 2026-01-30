@@ -37,15 +37,15 @@ apply_custom_node_configs() {
     print_info "🔧 Applying custom node configurations..."
     
     # Node 0: Primary node with 10s block delay
-    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' config/node_0.toml
+    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 5000|g' config/node_0.toml
     sed -i 's|enable_lvm_snapshot = false|enable_lvm_snapshot = true|g' config/node_0.toml
     
     # Node 1: Separate node with 10s block delay
-    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' config/node_1.toml
+    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 5000|g' config/node_1.toml
     
     # Node 2 & 3: Same 10s block delay for consistency
     for id in 2 3; do
-        sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
+        sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 5000|g' "config/node_$id.toml"
     done
     
     # Apply global settings to all nodes
@@ -59,7 +59,7 @@ apply_custom_node_configs() {
     # leader_timeout_ms = max wait for leader before proposing (must be > min_round_delay)
     for id in 0 1 2 3; do
         if ! grep -q "min_round_delay_ms" "config/node_$id.toml"; then
-            echo "min_round_delay_ms = 10000" >> "config/node_$id.toml"
+            echo "min_round_delay_ms = 5000" >> "config/node_$id.toml"
         fi
         if ! grep -q "leader_timeout_ms" "config/node_$id.toml"; then
             echo "leader_timeout_ms = 15000" >> "config/node_$id.toml"
@@ -67,7 +67,7 @@ apply_custom_node_configs() {
     done
     
     print_info "✅ Custom node configurations applied (10s block delay)"
-    print_info "   - min_round_delay_ms = 10000 (10s min between rounds)"
+    print_info "   - min_round_delay_ms = 5000 (10s min between rounds)"
     print_info "   - leader_timeout_ms = 15000 (15s max wait for leader)"
 }
 
@@ -216,10 +216,10 @@ sed -i 's|executor_read_enabled = false|executor_read_enabled = true|g' config/n
 print_info "🔧 Applying 10s block delay settings..."
 for id in 0 1 2 3; do
     # Set adaptive delay to 10000ms (10 seconds) for very slow consensus
-    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
-    sed -i 's|adaptive_delay_ms = 300|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
-    sed -i 's|adaptive_delay_ms = 500|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
-    sed -i 's|adaptive_delay_ms = 200|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
+    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 5000|g' "config/node_$id.toml"
+    sed -i 's|adaptive_delay_ms = 300|adaptive_delay_ms = 5000|g' "config/node_$id.toml"
+    sed -i 's|adaptive_delay_ms = 500|adaptive_delay_ms = 5000|g' "config/node_$id.toml"
+    sed -i 's|adaptive_delay_ms = 200|adaptive_delay_ms = 5000|g' "config/node_$id.toml"
     
     # Enable adaptive delay if not already enabled
     sed -i 's|adaptive_delay_enabled = false|adaptive_delay_enabled = true|g' "config/node_$id.toml"
