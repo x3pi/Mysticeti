@@ -244,12 +244,11 @@ pub fn start_epoch_monitor(
                     if let Some(node_arc) = crate::node::get_transition_handler_node().await {
                         let mut node_guard = node_arc.lock().await;
 
-                        // Use Go's latest block as synced index (after sync barrier)
-                        let synced_global_exec_index =
-                            match client_arc.get_last_block_number().await {
-                                Ok(b) => b,
-                                Err(_) => boundary_block,
-                            };
+                        // CRITICAL FORK FIX: Use boundary_block from get_epoch_boundary_data()
+                        // NOT from get_last_block_number() which is node-specific!
+                        // boundary_block is the NETWORK CONSENSUS boundary from peer/local that
+                        // witnessed the epoch transition. Using local last_block would cause fork.
+                        let synced_global_exec_index = boundary_block;
 
                         if is_in_committee {
                             // Node is in committee -> transition to VALIDATOR mode
@@ -547,12 +546,11 @@ pub fn start_epoch_monitor(
                         return;
                     }
 
-                    // FORK-SAFETY: Use the ACTUAL synced global_exec_index from Go, NOT commit_index=0
-                    // This ensures we start from where Go has synced, not from epoch start
-                    let synced_global_exec_index = match client_arc.get_last_block_number().await {
-                        Ok(b) => b,
-                        Err(_) => boundary_block, // Fallback to boundary
-                    };
+                    // CRITICAL FORK FIX: Use boundary_block from get_epoch_boundary_data()
+                    // NOT from get_last_block_number() which is node-specific!
+                    // boundary_block is the NETWORK CONSENSUS boundary from all validators.
+                    // Using local block number would cause this node to load different committee.
+                    let synced_global_exec_index = boundary_block;
 
                     info!(
                         "📊 [EPOCH MONITOR] Using synced_global_exec_index={} for transition",
