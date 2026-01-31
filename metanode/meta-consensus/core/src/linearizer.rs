@@ -89,10 +89,8 @@ impl Linearizer {
     }
 
     /// Collect the sub-dag and the corresponding commit from a specific leader.
-    /// FORK PREVENTION: Commits are ONLY created when ALL referenced ancestors are present.
-    /// Note: We removed the overly strict check that required ALL committee blocks at leader_round.
-    /// This was causing permanent commit blockage when any node didn't propose at a round.
-    /// The linearize_sub_dag function already validates that all referenced ancestors exist.
+    /// FORK PREVENTION: This commits ONLY the leader block and its referenced ancestors.
+    /// This is deterministic because all nodes agree on what a leader references.
     fn try_collect_sub_dag_and_commit(
         &mut self,
         leader_block: VerifiedBlock,
@@ -108,10 +106,10 @@ impl Linearizer {
         let leader_round = leader_block.round();
         let committee_size = self.context.committee.size();
 
-        // Note: We removed the check_blocks_available call that required ALL committee blocks
-        // at leader_round. This was too strict - in consensus, not every validator proposes
-        // at every round. The leader block already references its ancestors, and those are
-        // what we commit. The linearize_sub_dag validates that all referenced blocks exist.
+        // NOTE: No need to check for block availability.
+        // We ONLY commit blocks that the leader references (its ancestors).
+        // Since all nodes receive the same leader block with the same references,
+        // they will all commit the same blocks deterministically.
         tracing::debug!(
             "✅ [COMMIT] Proceeding with commit for leader {} round {} (committee_size={})",
             leader_block.reference(),
@@ -243,39 +241,13 @@ impl Linearizer {
             leader_block_ref
         );
 
-        // ENHANCEMENT: Commit all blocks in the same round as the leader
-        // This ensures all transactions in the round are committed, not just those in the leader block.
-        // This prevents transaction loss when transactions are submitted to non-leader blocks.
-        //
-        // FORK-SAFETY GUARANTEE:
-        // 1. Threshold Clock ensures quorum (2f+1) before advancing rounds, so when a leader is committed,
-        //    the round already has quorum, meaning all blocks in the round have been broadcast.
-        // 2. Commit message contains BlockRef of ALL committed blocks (line 110-113), ensuring other nodes
-        //    know exactly which blocks are committed.
-        // 3. Commit syncer fetches ALL blocks referenced in commit messages (commit_syncer.rs:601),
-        //    ensuring all nodes have the same blocks before committing.
-        // 4. Linearization is deterministic - all nodes process the same blocks in the same order,
-        //    producing the same CommittedSubDag.
-        // Therefore, even if a node doesn't have a block locally, it will fetch it via commit syncer
-        // and produce the same commit as other nodes. No fork occurs.
-        if leader_round > gc_round {
-            let all_blocks_in_round = dag_state.get_uncommitted_blocks_at_round(leader_round);
-            for block in all_blocks_in_round {
-                let block_ref = block.reference();
-                // Only commit if not already committed (avoid duplicates)
-                if !dag_state.is_committed(&block_ref) {
-                    if dag_state.set_committed(&block_ref) {
-                        to_commit.push(block);
-                    }
-                }
-            }
-        }
+        // NOTE: We intentionally do NOT commit all blocks at the leader round.
+        // Different nodes may have different blocks at a round (due to network timing).
+        // To ensure determinism, we ONLY commit what the leader references (its ancestors).
+        // All nodes receive the same leader block, so they will commit the same blocks.
 
         while let Some(x) = buffer.pop() {
-            // Skip if already added from round-based collection
-            if !to_commit.iter().any(|b| b.reference() == x.reference()) {
-                to_commit.push(x.clone());
-            }
+            to_commit.push(x.clone());
 
             let ancestors: Vec<VerifiedBlock> = dag_state
                 .get_blocks(
