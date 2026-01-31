@@ -21,11 +21,12 @@ mod core;
 mod core_thread;
 mod dag_state;
 mod epoch_change;
-mod error;
 pub mod epoch_change_provider;
+mod error;
 mod leader_schedule;
 mod leader_scoring;
 mod leader_timeout;
+mod legacy_store;
 mod linearizer;
 mod metrics;
 mod network;
@@ -37,9 +38,9 @@ mod stake_aggregator;
 pub mod storage;
 mod subscriber;
 mod synchronizer;
-mod threshold_clock;
 mod system_transaction;
 mod system_transaction_provider;
+mod threshold_clock;
 mod transaction;
 mod transaction_certifier;
 mod universal_committer;
@@ -65,12 +66,17 @@ pub use reconfiguration::{ReconfigCertStatus, ReconfigState};
 
 /// Exported API for testing and tools.
 pub use block::{TestBlock, Transaction, VerifiedBlock};
-pub use commit::{CommitAPI, CommitDigest, CommitIndex, CommitRange, CommitRef, CommittedSubDag, load_committed_subdag_from_store};
-pub use system_transaction::{SystemTransaction, SystemTransactionKind};
-pub use system_transaction_provider::{SystemTransactionProvider, DefaultSystemTransactionProvider};
+pub use commit::{
+    load_committed_subdag_from_store, CommitAPI, CommitDigest, CommitIndex, CommitRange, CommitRef,
+    CommittedSubDag,
+};
 pub use commit_consumer::{CommitConsumerArgs, CommitConsumerMonitor};
 pub use context::Clock;
 pub use metrics::Metrics;
+pub use system_transaction::{SystemTransaction, SystemTransactionKind};
+pub use system_transaction_provider::{
+    DefaultSystemTransactionProvider, SystemTransactionProvider,
+};
 pub use transaction::{
     BlockStatus, ClientError, TransactionClient, TransactionVerifier, ValidationError,
 };
@@ -80,6 +86,7 @@ pub use block_verifier::{BlockVerifier, NoopBlockVerifier};
 pub use commit_finalizer::CommitFinalizer;
 pub use context::Context;
 pub use dag_state::DagState;
+pub use legacy_store::LegacyEpochStoreManager;
 pub use linearizer::Linearizer;
 pub use storage::mem_store::MemStore;
 pub use test_dag_builder::DagBuilder;

@@ -140,9 +140,21 @@ pub async fn transition_to_epoch_from_system_tx(
         expected_last_block
     );
 
+    // NOTE: We tried keeping old authority running for lagging node sync,
+    // but this causes consensus conflicts (transaction blocking).
+    // Now we extract the store and add it to LegacyEpochStoreManager for read-only sync.
     if let Some(auth) = node.authority.take() {
+        // Extract store before stopping (the store Arc will survive the stop)
+        let old_store = auth.take_store();
+        let old_epoch = new_epoch.saturating_sub(1);
+        node.legacy_store_manager.add_store(old_epoch, old_store);
+        info!(
+            "📦 [TRANSITION] Extracted store from epoch {} for legacy sync",
+            old_epoch
+        );
+        
         auth.stop().await;
-        info!("✅ [TRANSITION] Old authority stopped. All pending commits should have been sent.");
+        info!("✅ [TRANSITION] Old authority stopped. Store preserved in LegacyEpochStoreManager.");
     }
 
     // =============================================================================
@@ -237,9 +249,17 @@ pub async fn transition_to_epoch_from_system_tx(
     // CRITICAL: Use epoch_timestamp from CommitteeSource for consistency
     // This ensures genesis block hash matches across all nodes
     let verified_epoch_timestamp_ms = committee_source.get_epoch_timestamp();
+    
+    // DIAGNOSTIC: Log timestamp comparison to debug fork issues
+    info!(
+        "🔍 [TIMESTAMP DEBUG] For epoch {}: passed={}, source_verified={}, source_epoch={}, source_is_peer={}",
+        new_epoch, new_epoch_timestamp_ms, verified_epoch_timestamp_ms, 
+        committee_source.epoch, committee_source.is_peer
+    );
+    
     if verified_epoch_timestamp_ms != new_epoch_timestamp_ms && verified_epoch_timestamp_ms > 0 {
         warn!(
-            "⚠️ [TRANSITION] Epoch timestamp mismatch! Passed={}, Source={}. Using source timestamp for fork prevention.",
+            "⚠️ [TRANSITION] Epoch timestamp MISMATCH! Passed={}, Source={}. Using source timestamp for fork prevention.",
             new_epoch_timestamp_ms, verified_epoch_timestamp_ms
         );
     }
@@ -248,6 +268,12 @@ pub async fn transition_to_epoch_from_system_tx(
     } else {
         new_epoch_timestamp_ms
     };
+    
+    info!(
+        "✅ [EPOCH TIMESTAMP] Final timestamp for epoch {}: {} ms (source: {})",
+        new_epoch, epoch_timestamp_to_use, 
+        if verified_epoch_timestamp_ms > 0 { "CommitteeSource" } else { "SystemTx" }
+    );
 
     node.system_transaction_provider
         .update_epoch(new_epoch, epoch_timestamp_to_use)
@@ -353,6 +379,7 @@ pub async fn transition_to_epoch_from_system_tx(
                 ConsensusAuthority::start(
                     NetworkType::Tonic,
                     epoch_timestamp_to_use, // CRITICAL: Use verified timestamp from CommitteeSource
+                    synced_index, // epoch_base_index is the synced_index (last global_exec_index of prev epoch)
                     node.own_index,
                     committee,
                     params,

@@ -1216,8 +1216,12 @@ impl Core {
         to_commit
             .into_iter()
             .map(|commit| {
-                let leader = commit.blocks().last().expect("Certified commit should have at least one block");
-                assert_eq!(leader.reference(), commit.leader(), "Last block of the committed sub dag should have the same digest as the leader of the commit");
+                let leader = commit
+                    .blocks()
+                    .iter()
+                    .find(|b| b.reference() == commit.leader())
+                    .expect("Certified commit should contain the leader block");
+
                 // There is no knowledge of direct commit with certified commits, so assuming indirect commit.
                 let leader = DecidedLeader::Commit(leader.clone(), /* direct */ false);
                 UniversalCommitter::update_metrics(&self.context, &leader, Decision::Certified);

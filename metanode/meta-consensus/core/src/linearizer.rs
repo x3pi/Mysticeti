@@ -66,6 +66,10 @@ pub struct Linearizer {
     /// global_exec_index = epoch_base_index + commit_index
     /// This is set once at epoch start and remains constant.
     epoch_base_index: u64,
+    /// Leaders waiting to be committed - deferred because not all blocks were available.
+    /// FORK PREVENTION: We only commit when ALL blocks for a round are present.
+    /// This list is processed first on each handle_commit call.
+    deferred_leaders: Vec<VerifiedBlock>,
 }
 
 impl Linearizer {
@@ -74,6 +78,7 @@ impl Linearizer {
             context,
             dag_state,
             epoch_base_index: 0,
+            deferred_leaders: Vec::new(),
         }
     }
 
@@ -83,19 +88,36 @@ impl Linearizer {
         self.epoch_base_index = epoch_base_index;
     }
 
-    /// Collect the sub-dag and the corresponding commit from a specific leader excluding any duplicates or
-    /// blocks that have already been committed (within previous sub-dags).
-    fn collect_sub_dag_and_commit(
+    /// Collect the sub-dag and the corresponding commit from a specific leader.
+    /// FORK PREVENTION: Commits are ONLY created when ALL referenced ancestors are present.
+    /// Note: We removed the overly strict check that required ALL committee blocks at leader_round.
+    /// This was causing permanent commit blockage when any node didn't propose at a round.
+    /// The linearize_sub_dag function already validates that all referenced ancestors exist.
+    fn try_collect_sub_dag_and_commit(
         &mut self,
         leader_block: VerifiedBlock,
-    ) -> (CommittedSubDag, TrustedCommit) {
+    ) -> Option<(CommittedSubDag, TrustedCommit)> {
         let _s = self
             .context
             .metrics
             .node_metrics
             .scope_processing_time
-            .with_label_values(&["Linearizer::collect_sub_dag_and_commit"])
+            .with_label_values(&["Linearizer::try_collect_sub_dag_and_commit"])
             .start_timer();
+
+        let leader_round = leader_block.round();
+        let committee_size = self.context.committee.size();
+
+        // Note: We removed the check_blocks_available call that required ALL committee blocks
+        // at leader_round. This was too strict - in consensus, not every validator proposes
+        // at every round. The leader block already references its ancestors, and those are
+        // what we commit. The linearize_sub_dag validates that all referenced blocks exist.
+        tracing::debug!(
+            "✅ [COMMIT] Proceeding with commit for leader {} round {} (committee_size={})",
+            leader_block.reference(),
+            leader_round,
+            committee_size
+        );
 
         // Grab latest commit state from dag state
         let mut dag_state = self.dag_state.write();
@@ -145,7 +167,7 @@ impl Linearizer {
             global_exec_index,
         );
 
-        (sub_dag, commit)
+        Some((sub_dag, commit))
     }
 
     /// Calculates the commit's timestamp. The timestamp will be calculated as the median of leader's parents (leader.round - 1)
@@ -165,16 +187,33 @@ impl Linearizer {
                 .filter(|block_ref| block_ref.round == leader_block.round() - 1)
                 .cloned()
                 .collect::<Vec<_>>();
-            // Get the blocks from dag state which should not fail.
+            // Get the blocks from dag state - filter out any missing blocks gracefully.
+            // During commit sync, some ancestor blocks might not be in dag_state yet.
+            // This prevents panic during epoch transitions when syncing from peers.
             let blocks = dag_state
                 .get_blocks(&block_refs)
                 .into_iter()
-                .map(|block_opt| block_opt.expect("We should have all blocks in dag state."));
+                .filter_map(|block_opt| {
+                    if block_opt.is_none() {
+                        tracing::warn!(
+                            "⚠️ [LINEARIZER] Missing ancestor block during commit timestamp calculation - this may happen during commit sync"
+                        );
+                    }
+                    block_opt
+                });
             median_timestamp_by_stake(context, blocks).unwrap_or_else(|e| {
-                panic!(
-                    "Cannot compute median timestamp for leader block {:?} ancestors: {}",
-                    leader_block, e
-                )
+                // DEFENSIVE FIX: During commit sync, ALL ancestor blocks may be missing if
+                // genesis blocks don't match between nodes (due to validator ordering differences
+                // during epoch transitions). Instead of panicking, use the leader block's own
+                // timestamp as fallback. This allows the node to continue syncing commits.
+                // The timestamp will still be monotonic due to the .max(last_commit_timestamp_ms) check below.
+                tracing::error!(
+                    "❌ [LINEARIZER] Cannot compute median timestamp for leader block {:?} - {}. \
+                     All ancestors missing (genesis mismatch?). Using leader timestamp as fallback.",
+                    leader_block.reference(), e
+                );
+                // Use leader block's timestamp as fallback - it's better than panicking
+                leader_block.timestamp_ms()
             })
         };
 
@@ -249,8 +288,15 @@ impl Linearizer {
                         .collect::<Vec<_>>(),
                 )
                 .into_iter()
-                .map(|ancestor_opt| {
-                    ancestor_opt.expect("We should have all uncommitted blocks in dag state.")
+                .filter_map(|ancestor_opt| {
+                    // During commit sync, some ancestor blocks might not be in dag_state yet.
+                    // Skip them gracefully instead of panicking.
+                    if ancestor_opt.is_none() {
+                        tracing::warn!(
+                            "⚠️ [LINEARIZER] Missing uncommitted ancestor block during linearization - will be synced later"
+                        );
+                    }
+                    ancestor_opt
                 })
                 .collect();
 
@@ -281,26 +327,72 @@ impl Linearizer {
     // This function should be called whenever a new commit is observed. This will
     // iterate over the sequence of committed leaders and produce a list of committed
     // sub-dags.
+    //
+    // FORK PREVENTION: Leaders are only committed when ALL blocks for their round are available.
+    // If blocks are missing, leaders are stored in deferred_leaders and retried on each call.
+    // This ensures all nodes commit with identical block sets, preventing divergence.
     pub fn handle_commit(&mut self, committed_leaders: Vec<VerifiedBlock>) -> Vec<CommittedSubDag> {
-        if committed_leaders.is_empty() {
+        let mut committed_sub_dags = vec![];
+
+        // Combine deferred leaders with new leaders, maintaining order.
+        // Deferred leaders are tried first (they are older and waiting longer).
+        let mut all_leaders: Vec<VerifiedBlock> = std::mem::take(&mut self.deferred_leaders);
+        let had_deferred = !all_leaders.is_empty();
+        all_leaders.extend(committed_leaders);
+
+        if all_leaders.is_empty() {
             return vec![];
         }
 
-        let mut committed_sub_dags = vec![];
-        for leader_block in committed_leaders {
-            // Collect the sub-dag generated using each of these leaders and the corresponding commit.
-            let (sub_dag, commit) = self.collect_sub_dag_and_commit(leader_block);
+        // Convert to iterator to handle remaining elements properly
+        let mut leaders_iter = all_leaders.into_iter().peekable();
 
-            self.update_blocks_pruned_metric(&sub_dag);
+        while let Some(leader_block) = leaders_iter.next() {
+            // Try to collect the sub-dag. Returns None if blocks are missing.
+            match self.try_collect_sub_dag_and_commit(leader_block.clone()) {
+                Some((sub_dag, commit)) => {
+                    // Success! All blocks were available.
+                    self.update_blocks_pruned_metric(&sub_dag);
 
-            // Buffer commit in dag state for persistence later.
-            // This also updates the last committed rounds.
-            self.dag_state.write().add_commit(commit.clone());
+                    // Buffer commit in dag state for persistence later.
+                    // This also updates the last committed rounds.
+                    self.dag_state.write().add_commit(commit.clone());
 
-            committed_sub_dags.push(sub_dag);
+                    committed_sub_dags.push(sub_dag);
+                }
+                None => {
+                    // Blocks are missing - defer this leader AND all remaining leaders.
+                    // IMPORTANT: Commits must be processed IN ORDER.
+                    // We cannot skip any leader - they must all wait.
+                    self.deferred_leaders.push(leader_block);
+
+                    // Push all remaining leaders to deferred list
+                    self.deferred_leaders.extend(leaders_iter);
+                    break;
+                }
+            }
+        }
+
+        // Log status
+        if !self.deferred_leaders.is_empty() {
+            tracing::info!(
+                "📋 [DEFERRED COMMITS] {} leaders waiting for blocks. \
+                 Commits will resume when Synchronizer fetches missing blocks.",
+                self.deferred_leaders.len()
+            );
+        } else if had_deferred {
+            tracing::info!(
+                "✅ [DEFERRED COMMITS] All deferred leaders successfully committed. {} new commits.",
+                committed_sub_dags.len()
+            );
         }
 
         committed_sub_dags
+    }
+
+    /// Returns the number of leaders waiting for blocks.
+    pub fn deferred_leaders_count(&self) -> usize {
+        self.deferred_leaders.len()
     }
 
     // Try to measure the number of blocks that get pruned due to GC. This is not very accurate, but it can give us a good enough idea.

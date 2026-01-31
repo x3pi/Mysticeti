@@ -24,14 +24,174 @@ pub mod proto {
 
 use proto::{CommittedBlock, CommittedEpochData, TransactionExe, GetValidatorsAtBlockRequest, GetCurrentEpochRequest, GetEpochStartTimestampRequest, AdvanceEpochRequest, Request, Response, ValidatorInfo};
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 
-/// Client to send committed blocks to Go executor via Unix Domain Socket
-/// Only enabled when config file exists (typically only node 0)
+// ============================================================================
+// Socket Abstraction Layer - Support both Unix and TCP sockets
+// ============================================================================
+
+/// Socket address type - supports both Unix domain sockets and TCP sockets
+#[derive(Debug, Clone)]
+pub enum SocketAddress {
+    /// Unix domain socket path (e.g., "/tmp/socket.sock")
+    Unix(String),
+    /// TCP socket address (e.g., "192.168.1.100:9001")
+    Tcp(SocketAddr),
+}
+
+impl SocketAddress {
+    /// Parse socket address from string with auto-detection
+    /// 
+    /// Format:
+    /// - Unix: "/tmp/socket.sock" or "unix:///tmp/socket.sock"
+    /// - TCP: "tcp://host:port" or "host:port"
+    /// 
+    /// # Examples
+    /// ```
+    /// let unix_addr = SocketAddress::parse("/tmp/socket.sock").unwrap();
+    /// let tcp_addr = SocketAddress::parse("tcp://192.168.1.100:9001").unwrap();
+    /// let tcp_addr2 = SocketAddress::parse("192.168.1.100:9001").unwrap();
+    /// ```
+    pub fn parse(addr: &str) -> Result<Self> {
+        if addr.starts_with("tcp://") {
+            // TCP format: "tcp://host:port"
+            let addr_str = addr.strip_prefix("tcp://").unwrap();
+            let sock_addr: SocketAddr = addr_str.parse()
+                .map_err(|e| anyhow::anyhow!("Invalid TCP address '{}': {}", addr_str, e))?;
+            Ok(SocketAddress::Tcp(sock_addr))
+        } else if addr.starts_with("unix://") {
+            // Unix format: "unix:///tmp/socket.sock"
+            let path = addr.strip_prefix("unix://").unwrap();
+            Ok(SocketAddress::Unix(path.to_string()))
+        } else if addr.contains(':') && !addr.starts_with('/') {
+            // TCP format without prefix: "host:port" or "192.168.1.100:9001"
+            let sock_addr: SocketAddr = addr.parse()
+                .map_err(|e| anyhow::anyhow!("Invalid TCP address '{}': {}", addr, e))?;
+            Ok(SocketAddress::Tcp(sock_addr))
+        } else {
+            // Default to Unix socket (path format)
+            Ok(SocketAddress::Unix(addr.to_string()))
+        }
+    }
+
+    /// Get display string for logging
+    pub fn as_str(&self) -> String {
+        match self {
+            SocketAddress::Unix(path) => path.clone(),
+            SocketAddress::Tcp(addr) => format!("tcp://{}", addr),
+        }
+    }
+}
+
+/// Unified socket stream - wraps either Unix or TCP stream
+pub enum SocketStream {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl SocketStream {
+    /// Connect to a socket address with retry logic
+    /// 
+    /// For TCP: includes timeout and TCP keepalive settings
+    /// For Unix: connects directly to socket file
+    pub async fn connect(addr: &SocketAddress, timeout_secs: u64) -> Result<Self> {
+        match addr {
+            SocketAddress::Unix(path) => {
+                let stream = UnixStream::connect(path).await
+                    .map_err(|e| anyhow::anyhow!("Failed to connect to Unix socket '{}': {}", path, e))?;
+                Ok(SocketStream::Unix(stream))
+            }
+            SocketAddress::Tcp(sock_addr) => {
+                use tokio::time::{timeout, Duration};
+                
+                // Connect with timeout
+                let stream = timeout(
+                    Duration::from_secs(timeout_secs),
+                    TcpStream::connect(sock_addr)
+                ).await
+                    .map_err(|_| anyhow::anyhow!("TCP connection timeout after {}s to {}", timeout_secs, sock_addr))?
+                    .map_err(|e| anyhow::anyhow!("Failed to connect to TCP socket '{}': {}", sock_addr, e))?;
+                
+                // Enable TCP keepalive to detect dead connections
+                let socket = socket2::Socket::from(stream.into_std()?);
+                socket.set_keepalive(true)
+                    .map_err(|e| anyhow::anyhow!("Failed to set TCP keepalive: {}", e))?;
+                
+                // Convert back to tokio TcpStream
+                let stream = TcpStream::from_std(socket.into())?;
+                
+                Ok(SocketStream::Tcp(stream))
+            }
+        }
+    }
+
+    /// Check if stream is writable (for connection health check)
+    pub async fn writable(&mut self) -> std::io::Result<()> {
+        match self {
+            SocketStream::Unix(s) => s.writable().await,
+            SocketStream::Tcp(s) => s.writable().await,
+        }
+    }
+}
+
+// Implement AsyncRead for SocketStream
+impl AsyncRead for SocketStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            SocketStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            SocketStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+// Implement AsyncWrite for SocketStream
+impl AsyncWrite for SocketStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            SocketStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            SocketStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            SocketStream::Unix(s) => Pin::new(s).poll_flush(cx),
+            SocketStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            SocketStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            SocketStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+// ============================================================================
+// ExecutorClient - Now supports both Unix and TCP sockets
+// ============================================================================
+
+
+/// Client to send committed blocks to Go executor via Unix Domain Socket or TCP Socket
+/// Supports both local (Unix) and network (TCP) deployment
 pub struct ExecutorClient {
-    socket_path: String,
-    connection: Arc<Mutex<Option<UnixStream>>>,
-    request_socket_path: String, // For sending requests (Rust -> Go)
-    request_connection: Arc<Mutex<Option<UnixStream>>>,
+    socket_address: SocketAddress,  // Changed from socket_path: String
+    connection: Arc<Mutex<Option<SocketStream>>>,  // Changed from UnixStream
+    request_socket_address: SocketAddress,  // Changed from request_socket_path: String
+    request_connection: Arc<Mutex<Option<SocketStream>>>,  // Changed from UnixStream
     enabled: bool,
     can_commit: bool, // Only node 0 can actually commit transactions to Go state
     /// Buffer for out-of-order blocks to ensure sequential sending
@@ -75,12 +235,27 @@ impl ExecutorClient {
         // When creating new executor client (e.g., after restart or epoch transition),
         // buffer should be empty to avoid conflicts with old commits
         let send_buffer = Arc::new(Mutex::new(BTreeMap::new()));
-        info!("🔧 [EXECUTOR CLIENT] Creating new executor client with initial_next_expected={}, buffer is empty, storage_path={:?}", initial_next_expected, storage_path);
+        
+        // Parse socket addresses with auto-detection
+        let socket_address = SocketAddress::parse(&send_socket_path)
+            .unwrap_or_else(|e| {
+                warn!("⚠️ [EXECUTOR CLIENT] Failed to parse send socket '{}': {}. Defaulting to Unix socket.", send_socket_path, e);
+                SocketAddress::Unix(send_socket_path.clone())
+            });
+        
+        let request_socket_address = SocketAddress::parse(&receive_socket_path)
+            .unwrap_or_else(|e| {
+                warn!("⚠️ [EXECUTOR CLIENT] Failed to parse receive socket '{}': {}. Defaulting to Unix socket.", receive_socket_path, e);
+                SocketAddress::Unix(receive_socket_path.clone())
+            });
+        
+        info!("🔧 [EXECUTOR CLIENT] Creating executor client: send={}, receive={}, initial_next_expected={}, storage_path={:?}", 
+            socket_address.as_str(), request_socket_address.as_str(), initial_next_expected, storage_path);
         
         Self {
-            socket_path: send_socket_path,
+            socket_address,
             connection: Arc::new(Mutex::new(None)),
-            request_socket_path: receive_socket_path,
+            request_socket_address,
             request_connection: Arc::new(Mutex::new(None)),
             enabled,
             can_commit,
@@ -190,13 +365,13 @@ impl ExecutorClient {
             match stream.writable().await {
                 Ok(_) => {
                     // Connection is still valid
-                    trace!("🔌 [EXECUTOR] Reusing existing connection to {}", self.socket_path);
+                    trace!("🔌 [EXECUTOR] Reusing existing connection to {}", self.socket_address.as_str());
                     return Ok(());
                 }
                 Err(e) => {
                     // Connection is dead, close it
                     warn!("⚠️  [EXECUTOR] Existing connection to {} is dead: {}, reconnecting...",
-                        self.socket_path, e);
+                        self.socket_address.as_str(), e);
                     *conn_guard = None;
                 }
             }
@@ -207,14 +382,15 @@ impl ExecutorClient {
         let mut attempt: u32 = 0;
         let mut delay = std::time::Duration::from_millis(500); // Start with 500ms
         const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5); // Cap at 5 seconds
+        const CONNECT_TIMEOUT_SECS: u64 = 30; // 30 seconds timeout for TCP connections
 
         loop {
             attempt += 1;
 
-            match UnixStream::connect(&self.socket_path).await {
+            match SocketStream::connect(&self.socket_address, CONNECT_TIMEOUT_SECS).await {
                 Ok(stream) => {
                     info!("🔌 [EXECUTOR] ✅ Connected to executor at {} (attempt {}, after {:.2}s waiting)",
-                        self.socket_path, attempt, delay.as_secs_f32() * (attempt - 1) as f32);
+                        self.socket_address.as_str(), attempt, delay.as_secs_f32() * (attempt - 1) as f32);
                     *conn_guard = Some(stream);
                     return Ok(());
                 }
@@ -222,11 +398,11 @@ impl ExecutorClient {
                     // CRITICAL: Don't give up - keep trying with exponential backoff
                     // This ensures Rust can connect even if Go Master starts later
                     if attempt == 1 {
-                        info!("🔄 [EXECUTOR] Waiting for Go Master to create executor socket at {}...", self.socket_path);
+                        info!("🔄 [EXECUTOR] Waiting for Go Master to create executor socket at {}...", self.socket_address.as_str());
                     } else if attempt % 10 == 0 {
                         // Log every 10 attempts to avoid spam
                         warn!("⏳ [EXECUTOR] Still waiting for Go Master socket {} (attempt {}, delay {}ms): {}",
-                            self.socket_path, attempt, delay.as_millis(), e);
+                            self.socket_address.as_str(), attempt, delay.as_millis(), e);
                     }
 
                     tokio::time::sleep(delay).await;
@@ -1053,12 +1229,12 @@ impl ExecutorClient {
         if let Some(ref mut stream) = *conn_guard {
             match stream.writable().await {
                 Ok(_) => {
-                    trace!("🔌 [EXECUTOR-REQ] Reusing existing request connection to {}", self.request_socket_path);
+                    trace!("🔌 [EXECUTOR-REQ] Reusing existing request connection to {}", self.request_socket_address.as_str());
                     return Ok(());
                 }
                 Err(e) => {
                     warn!("⚠️  [EXECUTOR-REQ] Existing request connection to {} is dead: {}, reconnecting...", 
-                        self.request_socket_path, e);
+                        self.request_socket_address.as_str(), e);
                     *conn_guard = None;
                 }
             }
@@ -1067,23 +1243,24 @@ impl ExecutorClient {
         // Connect to socket with retry logic
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+        const CONNECT_TIMEOUT_SECS: u64 = 30; // 30 seconds timeout for TCP connections
         
         for attempt in 1..=MAX_RETRIES {
-            match UnixStream::connect(&self.request_socket_path).await {
+            match SocketStream::connect(&self.request_socket_address, CONNECT_TIMEOUT_SECS).await {
                 Ok(stream) => {
                     info!("🔌 [EXECUTOR-REQ] Connected to Go request socket at {} (attempt {}/{})", 
-                        self.request_socket_path, attempt, MAX_RETRIES);
+                        self.request_socket_address.as_str(), attempt, MAX_RETRIES);
                     *conn_guard = Some(stream);
                     return Ok(());
                 }
                 Err(e) => {
                     if attempt < MAX_RETRIES {
                         warn!("⚠️  [EXECUTOR-REQ] Failed to connect to Go request socket at {} (attempt {}/{}): {}, retrying...", 
-                            self.request_socket_path, attempt, MAX_RETRIES, e);
+                            self.request_socket_address.as_str(), attempt, MAX_RETRIES, e);
                         tokio::time::sleep(RETRY_DELAY).await;
                     } else {
                         warn!("⚠️  [EXECUTOR-REQ] Failed to connect to Go request socket at {} after {} attempts: {}", 
-                            self.request_socket_path, MAX_RETRIES, e);
+                            self.request_socket_address.as_str(), MAX_RETRIES, e);
                         return Err(e.into());
                     }
                 }

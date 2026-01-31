@@ -61,6 +61,11 @@ impl CommitteeSource {
             local_epoch, local_block, local_timestamp
         );
 
+        // DIAGNOSTIC: Detect potential timestamp reuse problem
+        if local_timestamp == 0 {
+            warn!("🚨 [TIMESTAMP DEBUG] Local returned ZERO timestamp! This will cause genesis issues.");
+        }
+
         // If no peer sockets configured, use local
         if config.peer_go_master_sockets.is_empty() {
             info!("ℹ️ [COMMITTEE SOURCE] No peer sockets configured, using local Go Master");
@@ -141,7 +146,7 @@ impl CommitteeSource {
         );
 
         Ok(Self {
-            socket_path: best_socket,
+            socket_path: best_socket.clone(),
             epoch: best_epoch,
             epoch_timestamp_ms: best_timestamp,
             last_block: best_block,

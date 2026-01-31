@@ -12,19 +12,18 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use consensus_config::AuthorityIndex;
 use consensus_types::block::{BlockRef, Round};
-use futures::{Stream, StreamExt, ready, stream, task};
+use futures::{ready, stream, task, Stream, StreamExt};
+use meta_macros::fail_point_async;
 use mysten_metrics::spawn_monitored_task;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom as _;
-use meta_macros::fail_point_async;
 use tap::TapFallible;
 use tokio::sync::broadcast;
 use tokio_util::sync::ReusableBoxFuture;
 use tracing::{debug, info, warn};
 
 use crate::{
-    CommitIndex,
-    block::{BlockAPI as _, ExtendedBlock, GENESIS_ROUND, SignedBlock, VerifiedBlock},
+    block::{BlockAPI as _, ExtendedBlock, SignedBlock, VerifiedBlock, GENESIS_ROUND},
     block_verifier::BlockVerifier,
     commit::{CommitAPI as _, CommitRange, TrustedCommit},
     commit_vote_monitor::CommitVoteMonitor,
@@ -34,12 +33,14 @@ use crate::{
     epoch_change::{EpochChangeProposal, EpochChangeVote},
     epoch_change_provider::EpochChangeProcessor,
     error::{ConsensusError, ConsensusResult},
+    legacy_store::LegacyEpochStoreManager,
     network::{BlockStream, ExtendedSerializedBlock, NetworkService},
     round_tracker::PeerRoundTracker,
     stake_aggregator::{QuorumThreshold, StakeAggregator},
     storage::Store,
     synchronizer::SynchronizerHandle,
     transaction_certifier::TransactionCertifier,
+    CommitIndex,
 };
 
 pub(crate) const COMMIT_LAG_MULTIPLIER: u32 = 5;
@@ -58,6 +59,8 @@ pub(crate) struct AuthorityService<C: CoreThreadDispatcher> {
     store: Arc<dyn Store>,
     round_tracker: Arc<RwLock<PeerRoundTracker>>,
     epoch_change_processor: Arc<RwLock<Option<Box<dyn EpochChangeProcessor>>>>,
+    /// Legacy store manager for querying previous epochs (optional for backward compatibility)
+    legacy_store_manager: Option<Arc<LegacyEpochStoreManager>>,
 }
 
 impl<C: CoreThreadDispatcher> AuthorityService<C> {
@@ -73,6 +76,7 @@ impl<C: CoreThreadDispatcher> AuthorityService<C> {
         dag_state: Arc<RwLock<DagState>>,
         store: Arc<dyn Store>,
         epoch_change_processor: Option<Box<dyn EpochChangeProcessor>>,
+        legacy_store_manager: Option<Arc<LegacyEpochStoreManager>>,
     ) -> Self {
         let subscription_counter = Arc::new(SubscriptionCounter::new(context.clone()));
         Self {
@@ -88,6 +92,7 @@ impl<C: CoreThreadDispatcher> AuthorityService<C> {
             store,
             round_tracker,
             epoch_change_processor: Arc::new(RwLock::new(epoch_change_processor)),
+            legacy_store_manager,
         }
     }
 
@@ -266,7 +271,8 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
 
         // Process epoch change data from block before accepting into DAG
         let proposal_bytes = verified_block.epoch_change_proposal().map(|v| v.as_slice());
-        let votes_bytes: Vec<Vec<u8>> = verified_block.epoch_change_votes()
+        let votes_bytes: Vec<Vec<u8>> = verified_block
+            .epoch_change_votes()
             .iter()
             .map(|v| v.clone())
             .collect();
@@ -534,9 +540,34 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
             commit_range.start() + self.context.parameters.commit_sync_batch_size as CommitIndex
                 - 1,
         );
+
+        // First try to get commits from current store
         let mut commits = self
             .store
             .scan_commits((commit_range.start()..=inclusive_end).into())?;
+
+        // If current store is empty, try legacy stores (for lagging node sync)
+        if commits.is_empty() {
+            if let Some(ref legacy_manager) = self.legacy_store_manager {
+                for (epoch, legacy_store) in legacy_manager.get_all_stores() {
+                    if let Ok(legacy_commits) =
+                        legacy_store.scan_commits((commit_range.start()..=inclusive_end).into())
+                    {
+                        if !legacy_commits.is_empty() {
+                            info!(
+                                "📦 [LEGACY SYNC] Found {} commits in epoch {} store for range {:?}",
+                                legacy_commits.len(),
+                                epoch,
+                                commit_range
+                            );
+                            commits = legacy_commits;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut certifier_block_refs = vec![];
         'commit: while let Some(c) = commits.last() {
             let index = c.index();
@@ -1033,6 +1064,7 @@ mod tests {
             dag_state,
             store,
             None,
+            None, // legacy_store_manager
         ));
 
         // Test delaying blocks with time drift.
@@ -1152,6 +1184,7 @@ mod tests {
             dag_state.clone(),
             store,
             None,
+            None, // legacy_store_manager
         ));
 
         // GIVEN: 40 rounds of blocks in the dag state.
@@ -1320,6 +1353,7 @@ mod tests {
             dag_state.clone(),
             store,
             None,
+            None, // legacy_store_manager
         ));
 
         // Create some blocks for a few authorities. Create some equivocations as well and store in dag state.

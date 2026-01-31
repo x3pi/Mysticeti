@@ -60,9 +60,11 @@ impl CommitObserver {
         dag_state: Arc<RwLock<DagState>>,
         transaction_certifier: TransactionCertifier,
         leader_schedule: Arc<LeaderSchedule>,
+        epoch_base_index: u64,
     ) -> Self {
         let store = dag_state.read().store();
-        let commit_interpreter = Linearizer::new(context.clone(), dag_state.clone());
+        let mut commit_interpreter = Linearizer::new(context.clone(), dag_state.clone());
+        commit_interpreter.set_epoch_base_index(epoch_base_index);
         let commit_finalizer_handle = CommitFinalizer::start(
             context.clone(),
             dag_state.clone(),
@@ -133,7 +135,7 @@ impl CommitObserver {
         let schedule_updated = self
             .leader_schedule
             .leader_schedule_updated(&self.dag_state);
-        if schedule_updated {
+        if schedule_updated && !committed_sub_dags.is_empty() {
             let reputation_scores_desc = self
                 .leader_schedule
                 .leader_swap_table
@@ -401,6 +403,7 @@ mod tests {
             dag_state.clone(),
             transaction_certifier.clone(),
             leader_schedule.clone(),
+            0,
         )
         .await;
 
@@ -552,6 +555,7 @@ mod tests {
             dag_state.clone(),
             transaction_certifier.clone(),
             leader_schedule.clone(),
+            0,
         )
         .await;
 
@@ -654,6 +658,7 @@ mod tests {
                 dag_state.clone(),
                 transaction_certifier.clone(),
                 leader_schedule.clone(),
+                0,
             )
             .await;
 
@@ -702,6 +707,7 @@ mod tests {
                 dag_state.clone(),
                 transaction_certifier.clone(),
                 leader_schedule.clone(),
+                0,
             )
             .await;
 
@@ -729,6 +735,7 @@ mod tests {
                 dag_state.clone(),
                 transaction_certifier.clone(),
                 leader_schedule.clone(),
+                0,
             )
             .await;
 
@@ -776,6 +783,7 @@ mod tests {
                 dag_state.clone(),
                 transaction_certifier.clone(),
                 leader_schedule.clone(),
+                0,
             )
             .await;
 

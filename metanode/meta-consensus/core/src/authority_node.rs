@@ -51,6 +51,7 @@ impl ConsensusAuthority {
     pub async fn start(
         network_type: NetworkType,
         epoch_start_timestamp_ms: u64,
+        epoch_base_index: u64,
         own_index: AuthorityIndex,
         committee: Committee,
         parameters: Parameters,
@@ -72,6 +73,7 @@ impl ConsensusAuthority {
             NetworkType::Tonic => {
                 let authority = AuthorityNode::start(
                     epoch_start_timestamp_ms,
+                    epoch_base_index,
                     own_index,
                     committee,
                     parameters,
@@ -109,6 +111,14 @@ impl ConsensusAuthority {
             Self::WithTonic(authority) => &authority.context,
         }
     }
+
+    /// Extract the store for use in LegacyEpochStoreManager.
+    /// This should be called before stop() to preserve the store for legacy sync.
+    pub fn take_store(&self) -> Arc<dyn crate::storage::Store> {
+        match self {
+            Self::WithTonic(authority) => authority.store.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,6 +134,9 @@ where
     start_time: Instant,
     transaction_client: Arc<TransactionClient>,
     synchronizer: Arc<SynchronizerHandle>,
+    /// Store reference for potential extraction during epoch transition.
+    /// This allows the store to be kept open for legacy sync even after authority stops.
+    store: Arc<dyn crate::storage::Store>,
 
     commit_syncer_handle: CommitSyncerHandle,
     round_prober_handle: RoundProberHandle,
@@ -145,6 +158,7 @@ where
 {
     pub(crate) async fn start(
         epoch_start_timestamp_ms: u64,
+        epoch_base_index: u64,
         own_index: AuthorityIndex,
         committee: Committee,
         parameters: Parameters,
@@ -287,6 +301,7 @@ where
             dag_state.clone(),
             transaction_certifier.clone(),
             leader_schedule.clone(),
+            epoch_base_index,
         )
         .await;
 
@@ -369,8 +384,9 @@ where
             signals_receivers.block_broadcast_receiver(),
             transaction_certifier,
             dag_state.clone(),
-            store,
-            None,
+            store.clone(),
+            None, // epoch_change_processor
+            None, // legacy_store_manager - set later in transition if needed
         ));
 
         let subscriber = {
@@ -400,6 +416,7 @@ where
             start_time,
             transaction_client: Arc::new(tx_client),
             synchronizer,
+            store,
             commit_syncer_handle,
             round_prober_handle,
             proposed_block_handler,
@@ -499,6 +516,7 @@ mod tests {
         let authority = ConsensusAuthority::start(
             network_type,
             0,
+            0,
             own_index,
             committee,
             parameters,
@@ -510,6 +528,7 @@ mod tests {
             commit_consumer,
             registry,
             0,
+            None,
         )
         .await;
 
@@ -876,6 +895,7 @@ mod tests {
         let authority = ConsensusAuthority::start(
             network_type,
             0,
+            0,
             index,
             committee,
             parameters,
@@ -887,6 +907,7 @@ mod tests {
             commit_consumer,
             registry,
             boot_counter,
+            None,
         )
         .await;
 

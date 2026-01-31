@@ -55,6 +55,8 @@ hostname = "0.3.1"
 async-trait = "0.1.80"
 prost = "0.14.1"
 sha3 = "0.10.6"
+socket2 = "0.5"  # For TCP socket keepalive support
+
 
 # CLI
 clap = { version = "4.4", features = ["derive", "wrap_help"] }

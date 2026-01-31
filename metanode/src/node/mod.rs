@@ -84,6 +84,9 @@ pub async fn set_transition_handler_node(node: Arc<tokio::sync::Mutex<ConsensusN
 pub struct ConsensusNode {
     // Made fields pub(crate) so submodules can access them
     pub(crate) authority: Option<ConsensusAuthority>,
+    /// Legacy epoch store manager - keeps RocksDB stores from previous epochs
+    /// open for read-only sync access. Only stores (not full authorities) are kept.
+    pub(crate) legacy_store_manager: Arc<consensus_core::LegacyEpochStoreManager>,
     pub(crate) node_mode: NodeMode,
     pub(crate) execution_lock: Arc<tokio::sync::RwLock<u64>>,
     pub(crate) reconfig_state: Arc<tokio::sync::RwLock<consensus_core::ReconfigState>>,
@@ -679,6 +682,7 @@ impl ConsensusNode {
                 ConsensusAuthority::start(
                     NetworkType::Tonic,
                     epoch_timestamp_ms,
+                    epoch_base_exec_index,
                     own_index,
                     committee.clone(),
                     parameters.clone(),
@@ -728,6 +732,7 @@ impl ConsensusNode {
 
         let mut node = Self {
             authority,
+            legacy_store_manager: Arc::new(consensus_core::LegacyEpochStoreManager::new(1)), // Keep 1 previous epoch
             node_mode: if is_in_committee {
                 NodeMode::Validator
             } else {

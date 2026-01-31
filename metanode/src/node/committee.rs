@@ -99,7 +99,12 @@ pub fn build_committee_from_validator_list(
     epoch: u64,
 ) -> Result<Committee> {
     let mut sorted_validators: Vec<_> = validators.into_iter().collect();
-    sorted_validators.sort_by(|a, b| a.address.cmp(&b.address));
+    // CRITICAL FIX: Sort by authority_key (BLS public key) for DETERMINISTIC ordering
+    // Previously sorted by 'address' (P2P multiaddr like /ip4/127.0.0.1/tcp/9000)
+    // but Go sorts by 'Address().Hex()' (wallet address like 0x1234...)
+    // These are DIFFERENT fields causing different ordering → different genesis hashes → FORK!
+    // Now we sort by authority_key which is unique per validator and stable across contexts
+    sorted_validators.sort_by(|a, b| a.authority_key.cmp(&b.authority_key));
 
     let mut authorities = Vec::new();
 
