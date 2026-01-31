@@ -307,6 +307,23 @@ pub async fn transition_to_epoch_from_system_tx(
         .update_epoch(new_epoch, epoch_timestamp_to_use)
         .await;
 
+    // CRITICAL FIX: Notify Go about epoch change BEFORE fetching committee
+    // Go needs to advance its epoch state before it can return committee data for new epoch
+    // Without this, fetch_committee will fail with "epoch X boundary block not stored"
+    info!(
+        "📤 [EPOCH ADVANCE] Notifying Go about epoch {} transition (boundary: {})",
+        new_epoch, synced_index
+    );
+    if let Err(e) = executor_client
+        .advance_epoch(new_epoch, epoch_timestamp_to_use, synced_index)
+        .await
+    {
+        warn!(
+            "⚠️ [EPOCH ADVANCE] Failed to notify Go about epoch {}: {}. Continuing anyway...",
+            new_epoch, e
+        );
+    }
+
     // Prepare DB
     let db_path = node
         .storage_path
