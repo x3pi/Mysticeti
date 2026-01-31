@@ -28,25 +28,53 @@ pub async fn transition_to_epoch_from_system_tx(
     // CRITICAL FIX: Prevent duplicate epoch transitions
     // Multiple EndOfEpoch transactions can trigger multiple transitions to the same epoch
     // This causes RocksDB lock conflicts when trying to open the same DB path twice
-    if node.current_epoch >= new_epoch {
+    let is_sync_only = matches!(node.node_mode, NodeMode::SyncOnly);
+    let is_same_epoch = node.current_epoch == new_epoch;
+    
+    // CASE 1: Same epoch, but SyncOnly needs to become Validator
+    // This is a MODE-ONLY transition - skip full epoch transition, just start authority
+    if is_same_epoch && is_sync_only {
         info!(
-            "ℹ️ [TRANSITION SKIP] Already at epoch {} (requested: {}). Skipping duplicate transition.",
+            "🔄 [MODE TRANSITION] SyncOnly → Validator in epoch {} (not a full epoch transition)",
+            new_epoch
+        );
+        return transition_mode_only(node, new_epoch, new_epoch_timestamp_ms, synced_global_exec_index, config).await;
+    }
+    
+    // CASE 2: Already at this epoch and already Validator - skip
+    if node.current_epoch >= new_epoch && !is_sync_only {
+        info!(
+            "ℹ️ [TRANSITION SKIP] Already at epoch {} (requested: {}) and already Validator. Skipping.",
             node.current_epoch, new_epoch
         );
         return Ok(());
     }
-
+    
+    // CASE 3: Current epoch ahead of requested - skip
+    if node.current_epoch > new_epoch {
+        info!(
+            "ℹ️ [TRANSITION SKIP] Current epoch {} is AHEAD of requested {}. Skipping.",
+            node.current_epoch, new_epoch
+        );
+        return Ok(());
+    }
+    
+    // CASE 4: Full epoch transition (epoch actually changing)
+    info!(
+        "🔄 [FULL EPOCH TRANSITION] Processing: epoch {} -> {} (current_mode={:?})",
+        node.current_epoch, new_epoch, node.node_mode
+    );
+    
     if node.is_transitioning.swap(true, Ordering::SeqCst) {
-        warn!("⚠️ Transition already in progress, skipping.");
+        warn!("⚠️ Full epoch transition already in progress, skipping.");
         node.is_transitioning.store(false, Ordering::SeqCst);
         return Ok(());
     }
-
+    
     info!(
-        "🔄 TRANSITION: epoch {} -> {}",
+        "🔄 FULL TRANSITION: epoch {} -> {}",
         node.current_epoch, new_epoch
     );
-    // No sleep needed here - proceed immediately with transition
 
     // Reset flag guard
     struct Guard(Arc<std::sync::atomic::AtomicBool>);
@@ -998,4 +1026,180 @@ async fn trigger_lvm_snapshot(bin_path: &std::path::Path, epoch_id: u64) {
             );
         }
     }
+}
+
+/// MODE-ONLY TRANSITION: SyncOnly → Validator within the SAME epoch
+/// This happens when a node joins the committee mid-epoch (e.g., added to committee after epoch started)
+/// Unlike full epoch transition, this:
+/// - Does NOT recreate DB (uses existing epoch DB)
+/// - Does NOT wait for commit_processor sync
+/// - Just starts the authority components
+pub async fn transition_mode_only(
+    node: &mut ConsensusNode,
+    epoch: u64,
+    epoch_timestamp_ms: u64,
+    synced_global_exec_index: u64,
+    config: &NodeConfig,
+) -> Result<()> {
+    // Guard against concurrent transitions
+    if node.is_transitioning.swap(true, Ordering::SeqCst) {
+        warn!("⚠️ Mode transition already in progress, skipping.");
+        node.is_transitioning.store(false, Ordering::SeqCst);
+        return Ok(());
+    }
+    
+    struct Guard(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.0.load(Ordering::SeqCst) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+    let _guard = Guard(node.is_transitioning.clone());
+    
+    info!(
+        "🔄 [MODE TRANSITION] Starting SyncOnly → Validator for epoch {} (no DB recreation)",
+        epoch
+    );
+
+    // Use existing epoch DB path
+    let db_path = node
+        .storage_path
+        .join("epochs")
+        .join(format!("epoch_{}", epoch))
+        .join("consensus_db");
+    
+    // Create if doesn't exist (shouldn't happen but be safe)
+    if !db_path.exists() {
+        std::fs::create_dir_all(&db_path)?;
+        warn!("⚠️ [MODE TRANSITION] DB path didn't exist, created: {:?}", db_path);
+    }
+
+    // Fetch committee using same pattern as epoch_monitor
+    let committee_source = crate::node::committee_source::CommitteeSource::discover(config).await?;
+    
+    let committee = committee_source
+        .fetch_committee(&config.executor_send_socket_path, epoch)
+        .await?;
+
+    // Update node mode (this also handles Go handoff)
+    node.check_and_update_node_mode(&committee, config).await?;
+
+    // Find our index in committee
+    let own_protocol_pubkey = node.protocol_keypair.public();
+    if let Some((idx, _)) = committee
+        .authorities()
+        .find(|(_, a)| a.protocol_key == own_protocol_pubkey)
+    {
+        node.own_index = idx;
+        info!(
+            "✅ [MODE TRANSITION] Found self in committee at index {}",
+            idx
+        );
+    } else {
+        // Shouldn't happen - we called this because we're in committee
+        warn!("⚠️ [MODE TRANSITION] Not found in committee - this shouldn't happen!");
+        return Ok(());
+    }
+
+    // Update epoch state
+    node.current_epoch = epoch;
+    node.last_global_exec_index = synced_global_exec_index;
+    // Note: shared_last_global_exec_index is Arc<Mutex<u64>>, updated via commit_processor
+    node.current_commit_index.store(0, Ordering::SeqCst);
+
+    // Use verified timestamp from CommitteeSource or fallback to passed value
+    let verified_epoch_timestamp_ms = committee_source.epoch_timestamp_ms;
+    let epoch_timestamp_to_use = if verified_epoch_timestamp_ms > 0 {
+        verified_epoch_timestamp_ms
+    } else {
+        epoch_timestamp_ms
+    };
+    
+    info!(
+        "✅ [MODE TRANSITION] Using epoch_timestamp={} ms (verified={})",
+        epoch_timestamp_to_use, verified_epoch_timestamp_ms > 0
+    );
+
+    // Now setup authority components (same as in full transition)
+    let (commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
+    let epoch_cb = crate::consensus::commit_callbacks::create_epoch_transition_callback(
+        node.epoch_transition_sender.clone(),
+    );
+
+    let exec_client_proc = if node.executor_commit_enabled {
+        Some(Arc::new(ExecutorClient::new_with_initial_index(
+            true,
+            true,
+            config.executor_send_socket_path.clone(),
+            config.executor_receive_socket_path.clone(),
+            synced_global_exec_index + 1,
+            Some(node.storage_path.clone()),
+        )))
+    } else {
+        None
+    };
+
+    let mut processor =
+        crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
+            .with_commit_index_callback(
+                crate::consensus::commit_callbacks::create_commit_index_callback(
+                    node.current_commit_index.clone(),
+                ),
+            )
+            .with_global_exec_index_callback(
+                crate::consensus::commit_callbacks::create_global_exec_index_callback(
+                    node.shared_last_global_exec_index.clone(),
+                ),
+            )
+            .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
+            .with_epoch_info(epoch, synced_global_exec_index)
+            .with_is_transitioning(node.is_transitioning.clone())
+            .with_pending_transactions_queue(node.pending_transactions_queue.clone())
+            .with_epoch_transition_callback(epoch_cb);
+
+    if let Some(c) = exec_client_proc {
+        processor = processor.with_executor_client(c);
+    }
+
+    tokio::spawn(async move {
+        let _ = processor.run().await;
+    });
+    tokio::spawn(async move { while block_receiver.recv().await.is_some() {} });
+
+    // Start Authority
+    let mut params = node.parameters.clone();
+    params.db_path = db_path;
+    node.boot_counter += 1;
+
+    node.authority = Some(
+        ConsensusAuthority::start(
+            NetworkType::Tonic,
+            epoch_timestamp_to_use,
+            synced_global_exec_index,
+            node.own_index,
+            committee,
+            params,
+            node.protocol_config.clone(),
+            node.protocol_keypair.clone(),
+            node.network_keypair.clone(),
+            node.clock.clone(),
+            node.transaction_verifier.clone(),
+            commit_consumer,
+            Registry::new(),
+            node.boot_counter,
+            Some(node.system_transaction_provider.clone() as Arc<dyn SystemTransactionProvider>),
+        )
+        .await,
+    );
+
+    // Note: proxy update is handled by check_and_update_node_mode
+
+    info!(
+        "✅ [MODE TRANSITION] Successfully transitioned to Validator mode for epoch {}",
+        epoch
+    );
+
+    Ok(())
 }

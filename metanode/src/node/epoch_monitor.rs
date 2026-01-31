@@ -129,19 +129,174 @@ pub fn start_epoch_monitor(
                 // 1. We started with stale epoch from local Go Master
                 // 2. Go Master has now synced correct epoch from network
                 //
-                // SyncOnly nodes should use Go's updated epoch for transition
-                // rather than requiring restart.
-                if go_epoch > current_epoch {
+                // SyncOnly nodes MUST restart consensus with the new epoch
+                // so that blockchain can accept blocks from the new epoch.
+                // Without this, block verifier rejects all blocks as "wrong epoch".
+                if go_epoch > last_known_epoch {
                     warn!(
-                        "🔄 [EPOCH MONITOR] Go epoch ({}) advanced beyond startup epoch ({}). Using Go's epoch for transition.",
-                        go_epoch, current_epoch
+                        "🔄 [EPOCH CATCHUP] Go epoch ({}) advanced beyond Rust epoch ({}). Preparing epoch transition...",
+                        go_epoch, last_known_epoch
                     );
-                    info!(
-                        "🔄 [EPOCH MONITOR] Will use epoch {} from Go Master for committee check.",
-                        go_epoch
-                    );
-                    // Continue to check committee with the new epoch
-                    // Don't exit - we can still transition if we're in the updated committee
+
+                    // Get epoch boundary data for the new epoch
+                    let (new_epoch, new_epoch_timestamp_ms, boundary_block, validators) =
+                        match client_arc.get_epoch_boundary_data(go_epoch).await {
+                            Ok(data) => {
+                                info!(
+                                    "📊 [EPOCH CATCHUP] Got new epoch data: epoch={}, timestamp_ms={}, boundary_block={}",
+                                    data.0, data.1, data.2
+                                );
+                                data
+                            }
+                            Err(e) => {
+                                warn!("⚠️ [EPOCH CATCHUP] Failed to get epoch boundary data: {}. Will retry...", e);
+                                last_known_epoch = go_epoch;
+                                continue;
+                            }
+                        };
+
+                    // SYNC BARRIER: Wait for Go Master to sync ALL blocks before transition
+                    // This prevents missing blocks during epoch transition
+                    let peer_last_block =
+                        match crate::node::committee_source::CommitteeSource::discover(
+                            &config_clone,
+                        )
+                        .await
+                        {
+                            Ok(source) => {
+                                info!(
+                                "📊 [EPOCH CATCHUP SYNC BARRIER] Peer source: last_block={}, epoch={}, is_peer={}",
+                                source.last_block, source.epoch, source.is_peer
+                            );
+                                source.last_block
+                            }
+                            Err(e) => {
+                                warn!("⚠️ [EPOCH CATCHUP SYNC BARRIER] Failed to discover peer: {}. Using boundary_block.", e);
+                                boundary_block
+                            }
+                        };
+
+                    let go_last_block = match client_arc.get_last_block_number().await {
+                        Ok(b) => b,
+                        Err(_) => 0,
+                    };
+
+                    if go_last_block < peer_last_block {
+                        info!(
+                            "⏳ [EPOCH CATCHUP SYNC BARRIER] Go Master ({}) behind peer ({}). Waiting for sync...",
+                            go_last_block, peer_last_block
+                        );
+
+                        // Wait for Go to sync (max 60 seconds)
+                        let mut sync_attempts = 0;
+                        const MAX_SYNC_ATTEMPTS: u32 = 120;
+
+                        loop {
+                            sync_attempts += 1;
+                            if sync_attempts > MAX_SYNC_ATTEMPTS {
+                                warn!(
+                                    "⚠️ [EPOCH CATCHUP SYNC BARRIER] Timeout after 60s. Go={}, Peer={}. Proceeding anyway...",
+                                    go_last_block, peer_last_block
+                                );
+                                break;
+                            }
+
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+
+                            match client_arc.get_last_block_number().await {
+                                Ok(current_go_block) => {
+                                    if current_go_block >= peer_last_block {
+                                        info!(
+                                            "✅ [EPOCH CATCHUP SYNC BARRIER] Go Master synced to block {} (peer={}). Ready for transition!",
+                                            current_go_block, peer_last_block
+                                        );
+                                        break;
+                                    }
+                                    if sync_attempts % 10 == 0 {
+                                        info!(
+                                            "⏳ [EPOCH CATCHUP SYNC BARRIER] Waiting... Go={}, Peer={}, attempt={}/{}",
+                                            current_go_block, peer_last_block, sync_attempts, MAX_SYNC_ATTEMPTS
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("⚠️ [EPOCH CATCHUP SYNC BARRIER] Error: {}", e);
+                                }
+                            }
+                        }
+                    } else {
+                        info!(
+                            "✅ [EPOCH CATCHUP SYNC BARRIER] Go Master already synced: Go={} >= Peer={}",
+                            go_last_block, peer_last_block
+                        );
+                    }
+
+                    // Check if node is in committee for the new epoch
+                    let is_in_committee = if !own_protocol_key_base64.is_empty() {
+                        validators
+                            .iter()
+                            .any(|v| v.protocol_key == own_protocol_key_base64)
+                    } else {
+                        validators.iter().any(|v| v.name == hostname)
+                    };
+
+                    // Get node and transition to new epoch
+                    if let Some(node_arc) = crate::node::get_transition_handler_node().await {
+                        let mut node_guard = node_arc.lock().await;
+
+                        // Use Go's latest block as synced index (after sync barrier)
+                        let synced_global_exec_index =
+                            match client_arc.get_last_block_number().await {
+                                Ok(b) => b,
+                                Err(_) => boundary_block,
+                            };
+
+                        if is_in_committee {
+                            // Node is in committee -> transition to VALIDATOR mode
+                            info!(
+                                "🎉 [EPOCH CATCHUP] Node {} is in epoch {} committee! Transitioning to VALIDATOR. (synced_index={})",
+                                hostname, new_epoch, synced_global_exec_index
+                            );
+                        } else {
+                            // Node not in committee -> stay in SYNCONLY mode but update epoch
+                            info!(
+                                "🔄 [EPOCH CATCHUP] Transitioning SyncOnly node to epoch {} (synced_index={})",
+                                new_epoch, synced_global_exec_index
+                            );
+                        }
+
+                        match node_guard
+                            .transition_to_epoch_from_system_tx(
+                                new_epoch,
+                                new_epoch_timestamp_ms,
+                                synced_global_exec_index,
+                                &config_clone,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                if is_in_committee {
+                                    info!(
+                                        "✅ [EPOCH CATCHUP] Successfully transitioned to VALIDATOR for epoch {}! Starting block proposal.",
+                                        new_epoch
+                                    );
+                                    // Exit monitor - node is now validator
+                                    return;
+                                } else {
+                                    info!(
+                                        "✅ [EPOCH CATCHUP] Successfully transitioned to epoch {}. Epoch catchup complete.",
+                                        new_epoch
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "❌ [EPOCH CATCHUP] Failed to transition to epoch {}: {}",
+                                    new_epoch, e
+                                );
+                            }
+                        }
+                    }
                 }
 
                 last_known_epoch = go_epoch;

@@ -74,6 +74,46 @@ mkdir -p "$GO_PROJECT_ROOT/cmd/simple_chain/sample/node4/data-write/data/xapian_
 print_info "✅ Đã xóa tất cả dữ liệu Go/Rust, giữ nguyên config/keys"
 
 # ==============================================================================
+# Step 1: FORCE RESET Genesis Timestamp to Current Time
+# ==============================================================================
+print_step "Bước 0.5: Force reset genesis timestamp to current time..."
+
+GENESIS_PATH="$GO_PROJECT_ROOT/cmd/simple_chain/genesis.json"
+if [ -f "$GENESIS_PATH" ]; then
+    python3 << 'PYTHON_EOF'
+import json
+import time
+
+genesis_path = "/home/abc/chain-n/mtn-simple-2025/cmd/simple_chain/genesis.json"
+current_ms = int(time.time() * 1000)
+
+try:
+    with open(genesis_path, 'r') as f:
+        genesis = json.load(f)
+    
+    if 'config' not in genesis:
+        genesis['config'] = {}
+    
+    old_ts = genesis['config'].get('epoch_timestamp_ms', 0)
+    genesis['config']['epoch_timestamp_ms'] = current_ms
+    
+    with open(genesis_path, 'w') as f:
+        json.dump(genesis, f, indent=2)
+    
+    print(f"   ✅ Reset epoch_timestamp_ms: {old_ts} -> {current_ms}")
+except Exception as e:
+    print(f"   ⚠️  Could not reset timestamp: {e}")
+PYTHON_EOF
+    print_info "✅ Genesis timestamp reset to current time"
+else
+    print_info "⚠️ genesis.json not found, will be created fresh"
+fi
+
+# Also reset backup file
+rm -f /tmp/epoch_data_backup.json /tmp/epoch_data_backup_*.json 2>/dev/null || true
+print_info "✅ Removed old epoch backup files"
+
+# ==============================================================================
 # Step 1: Run the main mixed system script with KEEP_KEYS
 # ==============================================================================
 print_step "Bước 1: Chạy Mixed System (giữ keys)..."

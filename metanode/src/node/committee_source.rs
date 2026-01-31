@@ -217,11 +217,32 @@ impl CommitteeSource {
                     );
 
                     // Build committee from boundary validators using TARGET EPOCH
-                    return crate::node::committee::build_committee_from_validator_info_list(
+                    // CRITICAL: Also retry if build_committee fails to ensure epoch transition succeeds
+                    match crate::node::committee::build_committee_from_validator_info_list(
                         &validators,
                         target_epoch,
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(committee) => {
+                            info!(
+                                "✅ [COMMITTEE SOURCE] Successfully built committee with {} authorities",
+                                committee.size()
+                            );
+                            return Ok(committee);
+                        }
+                        Err(e) => {
+                            if should_log {
+                                warn!(
+                                    "⚠️ [COMMITTEE SOURCE] build_committee failed: {} (attempt {}). Will retry...",
+                                    e, attempt
+                                );
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                            delay_ms = std::cmp::min(delay_ms * 2, MAX_DELAY_MS);
+                            continue; // Keep retrying - epoch transition MUST succeed
+                        }
+                    }
                 }
                 Err(e) => {
                     if should_log {
