@@ -110,10 +110,69 @@ message WaitForSyncToBlockRequest {
     uint64 timeout_seconds = 2;    // Maximum time to wait (0 = use default)
 }
 
+
 message WaitForSyncToBlockResponse {
     bool reached = 1;              // True if target block was reached
     uint64 current_block = 2;      // Current block number
     string message = 3;
+}
+
+// NotifyEpochChange - Pushed from Go to Rust (SyncOnly) when epoch changes
+// This allows event-driven transitions instead of polling
+message NotifyEpochChangeRequest {
+    uint64 new_epoch = 1;
+    uint64 epoch_timestamp_ms = 2;
+    uint64 boundary_block = 3;
+}
+
+message NotifyEpochChangeResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ============================================================================
+// SYNCONLY BLOCK SYNC APIs
+// These APIs enable SyncOnly nodes to fetch and sync blocks from peers
+// ============================================================================
+
+// BlockData - Contains all data needed to sync a block
+message BlockData {
+    uint64 block_number = 1;         // Block number (global_exec_index)
+    bytes block_hash = 2;            // Block hash (32 bytes)
+    uint64 epoch = 3;                // Epoch this block belongs to
+    uint64 timestamp_ms = 4;         // Block timestamp (consensus timestamp)
+    bytes parent_hash = 5;           // Parent block hash
+    bytes state_root = 6;            // State root after executing this block
+    bytes transactions_root = 7;     // Transactions merkle root
+    bytes receipts_root = 8;         // Receipts merkle root
+    uint64 gas_used = 9;             // Total gas used
+    uint64 gas_limit = 10;           // Block gas limit
+    bytes extra_data = 11;           // Extra data (validator signature, etc.)
+}
+
+// GetBlocksRangeRequest - Request blocks by range for sync
+message GetBlocksRangeRequest {
+    uint64 from_block = 1;           // Start block number (inclusive)
+    uint64 to_block = 2;             // End block number (inclusive)
+}
+
+// GetBlocksRangeResponse - Response with block data
+message GetBlocksRangeResponse {
+    repeated BlockData blocks = 1;   // Block data in order
+    uint64 count = 2;                // Number of blocks returned
+    string error = 3;                // Error message if any
+}
+
+// SyncBlocksRequest - Push blocks to local Go for sync
+message SyncBlocksRequest {
+    repeated BlockData blocks = 1;   // Blocks to sync
+}
+
+// SyncBlocksResponse - Response after syncing blocks
+message SyncBlocksResponse {
+    uint64 synced_count = 1;         // Number of blocks synced
+    uint64 last_synced_block = 2;    // Last synced block number
+    string error = 3;                // Error message if any
 }
 
 // Validator info từ Go state - các trường cần thiết cho committee.json + metadata + phí/phần thưởng
@@ -172,6 +231,9 @@ message Request {
         SetConsensusStartBlockRequest set_consensus_start_block_request = 10;  // NEW: Transition handoff
         SetSyncStartBlockRequest set_sync_start_block_request = 11;  // NEW: Transition handoff
         WaitForSyncToBlockRequest wait_for_sync_to_block_request = 12;  // NEW: Transition handoff
+        NotifyEpochChangeRequest notify_epoch_change_request = 20; // NEW: Event-driven notification (Go -> Rust)
+        GetBlocksRangeRequest get_blocks_range_request = 21;  // SYNC: Get blocks by range
+        SyncBlocksRequest sync_blocks_request = 22;  // SYNC: Push blocks for local sync
     }
 }
 
@@ -191,6 +253,9 @@ message Response {
         SetConsensusStartBlockResponse set_consensus_start_block_response = 10;  // NEW: Transition handoff
         SetSyncStartBlockResponse set_sync_start_block_response = 11;  // NEW: Transition handoff
         WaitForSyncToBlockResponse wait_for_sync_to_block_response = 12;  // NEW: Transition handoff
+        NotifyEpochChangeResponse notify_epoch_change_response = 20; // NEW: Event-driven notification (Go -> Rust)
+        GetBlocksRangeResponse get_blocks_range_response = 21;  // SYNC: Get blocks response
+        SyncBlocksResponse sync_blocks_response = 22;  // SYNC: Sync blocks response
     }
 }
 

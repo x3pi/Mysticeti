@@ -421,7 +421,7 @@ impl fmt::Debug for Slot {
 /// Note: `BlockDigest` is computed over this struct, so any added field (without `#[serde(skip)]`)
 /// will affect the values of `BlockDigest` and `BlockRef`.
 #[derive(Deserialize, Serialize)]
-pub(crate) struct SignedBlock {
+pub struct SignedBlock {
     inner: Block,
     signature: Bytes,
 }
@@ -545,7 +545,7 @@ pub struct VerifiedBlock {
 
 impl VerifiedBlock {
     /// Creates VerifiedBlock from a verified SignedBlock and its serialized bytes.
-    pub(crate) fn new_verified(signed_block: SignedBlock, serialized: Bytes) -> Self {
+    pub fn new_verified(signed_block: SignedBlock, serialized: Bytes) -> Self {
         let digest = Self::compute_digest(&serialized);
         VerifiedBlock {
             block: Arc::new(signed_block),

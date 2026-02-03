@@ -24,6 +24,7 @@ pub struct CommitteeChangeNotification {
 }
 
 /// Committee notification listener that receives push notifications from Go
+#[allow(dead_code)]
 pub struct CommitteeNotificationListener {
     socket_path: String,
 }
@@ -85,6 +86,7 @@ impl CommitteeNotificationListener {
 }
 
 /// Handle incoming connection from Go
+#[allow(dead_code)]
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     tx: mpsc::Sender<CommitteeChangeNotification>,
@@ -138,6 +140,7 @@ async fn handle_connection(
 
 /// Start a notification-driven epoch monitor
 /// This replaces the polling-based epoch monitor for faster response
+#[allow(dead_code)]
 pub fn start_notification_driven_monitor(
     socket_path: &str,
 ) -> (

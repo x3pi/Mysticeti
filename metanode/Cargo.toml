@@ -14,6 +14,7 @@ consensus-types = { path = "meta-consensus/types" }
 # Async runtime
 tokio = "=1.47.1"
 tokio-stream = { version = "0.1.14", features = ["sync", "net"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 
 # Serialization
 serde = { version = "1.0.144", features = ["derive", "rc"] }

@@ -150,11 +150,6 @@ pub struct NodeConfig {
     /// Seconds to wait for final transaction drain during gradual shutdown (default: 1)
     #[serde(default = "default_gradual_shutdown_final_drain_secs")]
     pub gradual_shutdown_final_drain_secs: Option<u64>,
-    /// Peer Go Master socket paths for epoch discovery (fallback if own Go Master is stale)
-    /// When node restarts and its own Go Master has stale epoch, it can query these peer masters
-    /// to get the correct network epoch. Format: ["/tmp/rust-go-standard-master.sock"]
-    #[serde(default)]
-    pub peer_go_master_sockets: Vec<String>,
     /// Poll interval in seconds for epoch monitor in SyncOnly mode (default: 5)
     #[serde(default = "default_epoch_monitor_poll_interval_secs")]
     pub epoch_monitor_poll_interval_secs: Option<u64>,
@@ -309,7 +304,6 @@ impl NodeConfig {
                 gradual_shutdown_consensus_cert_drain_secs: Some(1),
                 gradual_shutdown_final_drain_secs: Some(1),
                 adaptive_delay_ms: default_adaptive_delay_ms(),
-                peer_go_master_sockets: vec!["/tmp/rust-go-standard-master.sock".to_string()], // Fallback to main Go Master
                 epoch_monitor_poll_interval_secs: default_epoch_monitor_poll_interval_secs(),
                 peer_rpc_port: Some(19000 + idx as u16), // Default: 19000 + node_id for WAN sync
                 peer_rpc_addresses: vec![],              // Empty by default, configure for WAN sync

@@ -471,7 +471,7 @@ impl CommitProcessor {
                 let mut retry_count = 0;
                 loop {
                     match client
-                        .send_committed_subdag(subdag, epoch, global_exec_index)
+                        .send_committed_subdag(subdag, epoch, global_exec_index, None)
                         .await
                     {
                         Ok(_) => {
@@ -573,7 +573,7 @@ impl CommitProcessor {
             // Empty commit handling (heartbeat/tick)
             if let Some(ref client) = executor_client {
                 match client
-                    .send_committed_subdag(subdag, epoch, global_exec_index)
+                    .send_committed_subdag(subdag, epoch, global_exec_index, None)
                     .await
                 {
                     Ok(_) => {

@@ -69,6 +69,32 @@ pub struct GetBlocksResponse {
     pub error: Option<String>,
 }
 
+/// Simplified validator info for JSON transport
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorInfoSimple {
+    pub name: String,
+    pub address: String,
+    pub stake: u64,
+    pub protocol_key: String,
+    pub network_key: String,
+}
+
+/// Response for /get_epoch_boundary_data endpoint
+/// This allows late-joining validators to fetch epoch boundary data from peers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochBoundaryDataResponse {
+    /// Target epoch number
+    pub epoch: u64,
+    /// Epoch start timestamp in milliseconds
+    pub timestamp_ms: u64,
+    /// Boundary block (last block of previous epoch)
+    pub boundary_block: u64,
+    /// Validators for this epoch
+    pub validators: Vec<ValidatorInfoSimple>,
+    /// Error message if any
+    pub error: Option<String>,
+}
+
 /// Peer RPC Server for exposing node info over HTTP
 pub struct PeerRpcServer {
     /// Node ID
@@ -150,6 +176,8 @@ impl PeerRpcServer {
                 // Route request
                 if request.starts_with("GET /peer_info") {
                     Self::handle_peer_info(&mut stream, &executor, node_id, &net_addr).await;
+                } else if request.starts_with("GET /get_epoch_boundary_data") {
+                    Self::handle_get_epoch_boundary_data(&mut stream, &executor, &request).await;
                 } else if request.starts_with("GET /get_blocks") {
                     Self::handle_get_blocks(&mut stream, &executor, node_id, &request).await;
                 } else if request.starts_with("GET /health") {
@@ -233,11 +261,127 @@ impl PeerRpcServer {
         let _ = stream.write_all(response.as_bytes()).await;
     }
 
+    /// Handle /get_epoch_boundary_data request
+    /// URL format: GET /get_epoch_boundary_data?epoch=X
+    /// Returns epoch boundary data for the specified epoch (validators, timestamp, boundary block)
+    async fn handle_get_epoch_boundary_data(
+        stream: &mut tokio::net::TcpStream,
+        executor: &Arc<ExecutorClient>,
+        request: &str,
+    ) {
+        // Parse epoch from query parameter
+        let epoch = Self::parse_epoch_param(request);
+
+        if epoch.is_none() {
+            let response = EpochBoundaryDataResponse {
+                epoch: 0,
+                timestamp_ms: 0,
+                boundary_block: 0,
+                validators: vec![],
+                error: Some("Missing or invalid 'epoch' parameter".to_string()),
+            };
+            let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+            let http_response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{}",
+                json
+            );
+            let _ = stream.write_all(http_response.as_bytes()).await;
+            return;
+        }
+
+        let target_epoch = epoch.unwrap();
+        info!(
+            "🌐 [PEER RPC] /get_epoch_boundary_data request: epoch={}",
+            target_epoch
+        );
+
+        // Fetch from local Go Master
+        match executor.get_epoch_boundary_data(target_epoch).await {
+            Ok((epoch, timestamp_ms, boundary_block, validators)) => {
+                // Convert ValidatorInfo to ValidatorInfoSimple for JSON transport
+                let validators_simple: Vec<ValidatorInfoSimple> = validators
+                    .iter()
+                    .map(|v| ValidatorInfoSimple {
+                        name: v.name.clone(),
+                        address: v.address.clone(),
+                        stake: v.stake.parse::<u64>().unwrap_or(0),
+                        protocol_key: v.protocol_key.clone(),
+                        network_key: v.network_key.clone(),
+                    })
+                    .collect();
+
+                let response = EpochBoundaryDataResponse {
+                    epoch,
+                    timestamp_ms,
+                    boundary_block,
+                    validators: validators_simple,
+                    error: None,
+                };
+
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                let http_response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+                    json
+                );
+
+                if let Err(e) = stream.write_all(http_response.as_bytes()).await {
+                    error!(
+                        "🌐 [PEER RPC] Failed to write /get_epoch_boundary_data response: {}",
+                        e
+                    );
+                }
+
+                info!(
+                    "🌐 [PEER RPC] Served /get_epoch_boundary_data: epoch={}, timestamp={}, boundary_block={}, validators={}",
+                    epoch, timestamp_ms, boundary_block, validators.len()
+                );
+            }
+            Err(e) => {
+                warn!("🌐 [PEER RPC] Failed to get epoch boundary data: {}", e);
+                let response = EpochBoundaryDataResponse {
+                    epoch: target_epoch,
+                    timestamp_ms: 0,
+                    boundary_block: 0,
+                    validators: vec![],
+                    error: Some(format!("{}", e)),
+                };
+
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                let http_response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{}",
+                    json
+                );
+
+                if let Err(e) = stream.write_all(http_response.as_bytes()).await {
+                    error!("🌐 [PEER RPC] Failed to write error response: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Parse epoch parameter from request query string
+    fn parse_epoch_param(request: &str) -> Option<u64> {
+        if let Some(query_start) = request.find('?') {
+            let query_end = request[query_start..]
+                .find(' ')
+                .unwrap_or(request.len() - query_start);
+            let query = &request[query_start + 1..query_start + query_end];
+
+            for param in query.split('&') {
+                let parts: Vec<&str> = param.split('=').collect();
+                if parts.len() == 2 && parts[0] == "epoch" {
+                    return parts[1].parse().ok();
+                }
+            }
+        }
+        None
+    }
+
     /// Handle /get_blocks request
     /// URL format: GET /get_blocks?from=X&to=Y
     async fn handle_get_blocks(
         stream: &mut tokio::net::TcpStream,
-        _executor: &Arc<ExecutorClient>,
+        executor: &Arc<ExecutorClient>,
         node_id: usize,
         request: &str,
     ) {
@@ -272,25 +416,56 @@ impl PeerRpcServer {
             from, to, actual_to
         );
 
-        // For now, return empty blocks - actual block fetching requires Go integration
-        // TODO: Implement block fetching from local storage or Go Master
-        let blocks = std::collections::HashMap::<u64, String>::new();
+        // Fetch blocks from Go Master via executor_client
+        match executor.get_blocks_range(from, actual_to).await {
+            Ok(block_data_list) => {
+                // Convert proto::BlockData to HashMap<u64, String> for response
+                let mut blocks = std::collections::HashMap::new();
+                for block in &block_data_list {
+                    // Encode full block info as hex string for JSON transport
+                    // Using extra_data which contains the serialized block
+                    blocks.insert(block.block_number, hex::encode(&block.extra_data));
+                }
 
-        let response = GetBlocksResponse {
-            node_id,
-            blocks,
-            count: 0,
-            error: Some("Block fetching not yet implemented - use DAG sync".to_string()),
-        };
+                let count = blocks.len();
+                info!("🌐 [PEER RPC] Returning {} blocks from Go Master", count);
 
-        let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        let http_response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
-            json
-        );
+                let response = GetBlocksResponse {
+                    node_id,
+                    blocks,
+                    count,
+                    error: None,
+                };
 
-        if let Err(e) = stream.write_all(http_response.as_bytes()).await {
-            error!("🌐 [PEER RPC] Failed to write /get_blocks response: {}", e);
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                let http_response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+                    json
+                );
+
+                if let Err(e) = stream.write_all(http_response.as_bytes()).await {
+                    error!("🌐 [PEER RPC] Failed to write /get_blocks response: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("🌐 [PEER RPC] Failed to fetch blocks from Go Master: {}", e);
+                let response = GetBlocksResponse {
+                    node_id,
+                    blocks: std::collections::HashMap::new(),
+                    count: 0,
+                    error: Some(format!("Failed to fetch blocks: {}", e)),
+                };
+
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                let http_response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{}",
+                    json
+                );
+
+                if let Err(e) = stream.write_all(http_response.as_bytes()).await {
+                    error!("🌐 [PEER RPC] Failed to write error response: {}", e);
+                }
+            }
         }
     }
 
@@ -441,6 +616,96 @@ pub async fn query_peer_epochs_network(peer_addresses: &[String]) -> Result<(u64
     );
 
     Ok((best_epoch, best_block, best_address))
+}
+
+/// Query epoch boundary data from a remote peer via HTTP
+/// This is used by late-joining validators to get epoch boundary data from peers
+/// who have already witnessed the epoch transition
+pub async fn query_peer_epoch_boundary_data(
+    peer_address: &str,
+    epoch: u64,
+) -> Result<EpochBoundaryDataResponse> {
+    use tokio::net::TcpStream;
+
+    info!(
+        "🌐 [PEER RPC] Querying epoch boundary data for epoch {} from {}",
+        epoch, peer_address
+    );
+
+    // Connect with timeout
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(peer_address),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Connection timeout to {}", peer_address))?
+    .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", peer_address, e))?;
+
+    // Send HTTP GET request
+    let request = format!(
+        "GET /get_epoch_boundary_data?epoch={} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        epoch, peer_address
+    );
+    stream.write_all(request.as_bytes()).await?;
+
+    // Read response with timeout
+    let mut buffer = Vec::new();
+    let mut temp = [0u8; 16384]; // Larger buffer for validator data
+    let read_result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            match stream.read(&mut temp).await {
+                Ok(0) => break,
+                Ok(n) => buffer.extend_from_slice(&temp[..n]),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    match read_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to read response: {}", e)),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Timeout reading response from {}",
+                peer_address
+            ))
+        }
+    }
+
+    // Parse HTTP response
+    let response_str = String::from_utf8_lossy(&buffer);
+
+    // Find JSON body (after empty line)
+    let body_start = response_str
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| response_str.find("\n\n").map(|i| i + 2))
+        .unwrap_or(0);
+
+    let body = &response_str[body_start..];
+
+    // Parse JSON
+    let response: EpochBoundaryDataResponse = serde_json::from_str(body.trim()).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse epoch boundary data JSON: {} (body: {})",
+            e,
+            body.trim()
+        )
+    })?;
+
+    // Check for error in response
+    if let Some(error) = &response.error {
+        return Err(anyhow::anyhow!("Peer returned error: {}", error));
+    }
+
+    info!(
+        "🌐 [PEER RPC] Received epoch boundary data from {}: epoch={}, timestamp={}, boundary_block={}, validators={}",
+        peer_address, response.epoch, response.timestamp_ms, response.boundary_block, response.validators.len()
+    );
+
+    Ok(response)
 }
 
 #[cfg(test)]

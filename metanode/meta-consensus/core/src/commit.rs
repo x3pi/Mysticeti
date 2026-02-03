@@ -200,6 +200,8 @@ impl TrustedCommit {
         CommitRef {
             index: self.index(),
             digest: self.digest(),
+            global_exec_index: self.global_exec_index(), // NEW: propagate from Commit
+            epoch: 0, // Epoch not stored in Commit struct - will be set by caller if needed
         }
     }
 
@@ -326,27 +328,77 @@ impl fmt::Debug for CommitDigest {
 }
 
 /// Uniquely identifies a commit with its index and digest.
+/// Extended with global_exec_index and epoch for cross-epoch querying.
 #[derive(Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CommitRef {
+    /// Epoch-local commit index (within a single epoch)
     pub index: CommitIndex,
+    /// Commit digest for integrity verification
     pub digest: CommitDigest,
+    /// Global execution index - unique across all epochs
+    /// Corresponds to the execution layer block number
+    #[serde(default)]
+    pub global_exec_index: u64,
+    /// Epoch number this commit belongs to
+    #[serde(default)]
+    pub epoch: u32,
 }
 
 impl CommitRef {
+    /// Legacy constructor - creates CommitRef without global context
+    /// Used for backward compatibility
     pub fn new(index: CommitIndex, digest: CommitDigest) -> Self {
-        Self { index, digest }
+        Self {
+            index,
+            digest,
+            global_exec_index: 0,
+            epoch: 0,
+        }
+    }
+
+    /// Full constructor with global execution index and epoch
+    /// Recommended for new code - enables cross-epoch querying
+    pub fn new_with_global(
+        index: CommitIndex,
+        digest: CommitDigest,
+        global_exec_index: u64,
+        epoch: u32,
+    ) -> Self {
+        Self {
+            index,
+            digest,
+            global_exec_index,
+            epoch,
+        }
+    }
+
+    /// Check if this CommitRef has global context (non-zero global_exec_index)
+    pub fn has_global_context(&self) -> bool {
+        self.global_exec_index > 0
     }
 }
 
 impl fmt::Display for CommitRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "C{}({})", self.index, self.digest)
+        if self.global_exec_index > 0 {
+            write!(
+                f,
+                "C{}@G{}({})",
+                self.index, self.global_exec_index, self.digest
+            )
+        } else {
+            write!(f, "C{}({})", self.index, self.digest)
+        }
     }
 }
 
 impl fmt::Debug for CommitRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "C{}({:?})", self.index, self.digest)
+        write!(
+            f,
+            "C{}[E{},G{}]({:?})",
+            self.index, self.epoch, self.global_exec_index, self.digest
+        )
     }
 }
 

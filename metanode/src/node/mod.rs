@@ -26,8 +26,7 @@ use tracing::{info, warn}; // Added error
 use crate::config::NodeConfig;
 use crate::node::executor_client::ExecutorClient;
 use crate::node::tx_submitter::{TransactionClientProxy, TransactionSubmitter};
-// use consensus_core::storage::rocksdb_store::RocksDBStore;
-// use consensus_core::storage::Store; // Added Store trait
+use consensus_core::storage::rocksdb_store::RocksDBStore;
 
 // Declare submodules
 pub mod catchup;
@@ -36,8 +35,10 @@ pub mod committee_source;
 pub mod epoch_monitor;
 pub mod executor_client;
 pub mod notification_listener;
+pub mod notification_server;
 pub mod queue;
 pub mod recovery;
+pub mod rust_sync_node;
 pub mod startup;
 pub mod sync;
 pub mod transition;
@@ -52,6 +53,15 @@ pub enum NodeMode {
     Validator,
     /// Node is catching up with the network (syncing epoch/commits)
     SyncingUp,
+}
+
+/// Pending epoch transition that is deferred until sync is complete
+/// Used by SyncOnly nodes to ensure they don't advance epoch before syncing all blocks
+#[derive(Clone, Debug)]
+pub struct PendingEpochTransition {
+    pub epoch: u64,
+    pub timestamp_ms: u64,
+    pub boundary_block: u64,
 }
 
 // Global registry for transition handler to access node
@@ -115,15 +125,29 @@ pub struct ConsensusNode {
     pub(crate) is_transitioning: Arc<AtomicBool>,
     pub(crate) pending_transactions_queue: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
     pub(crate) system_transaction_provider: Arc<DefaultSystemTransactionProvider>,
-    pub(crate) epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u64)>, // CHANGED: u32 -> u64 for synced_global_exec_index
-    pub(crate) sync_task_handle: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) epoch_transition_sender: tokio::sync::mpsc::UnboundedSender<(u64, u64, u64)>,
+
+    // Handles for background tasks
+    pub(crate) sync_task_handle: Option<crate::node::rust_sync_node::RustSyncHandle>,
     pub(crate) epoch_monitor_handle: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) notification_server_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     pub(crate) executor_client: Option<Arc<ExecutorClient>>,
     /// Transactions submitted in current epoch that may need recovery during epoch transition
     pub(crate) epoch_pending_transactions: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
     /// Transaction hashes that have been committed in current epoch (for duplicate prevention)
     pub(crate) committed_transaction_hashes:
         Arc<tokio::sync::Mutex<std::collections::HashSet<Vec<u8>>>>,
+
+    /// Queued epoch transitions waiting for sync to complete (for SyncOnly nodes)
+    /// When a SyncOnly node receives AdvanceEpoch but hasn't synced to the boundary yet,
+    /// the transition is queued here and processed after sync catches up
+    pub(crate) pending_epoch_transitions: Arc<tokio::sync::Mutex<Vec<PendingEpochTransition>>>,
+
+    /// Holds commit_consumer to prevent channel close for SyncOnly nodes
+    /// When authority is None (SyncOnly), commit_consumer would be dropped causing
+    /// commit_receiver to close immediately. This field keeps it alive.
+    #[allow(dead_code)]
+    pub(crate) _commit_consumer_holder: Option<CommitConsumerArgs>,
 }
 
 impl ConsensusNode {
@@ -162,25 +186,23 @@ impl ConsensusNode {
             }
         };
 
-        // PEER EPOCH DISCOVERY: Query multiple Go Masters to get correct epoch
-        // This handles cases where the local Go Master has stale data after restart
-        let (go_epoch, peer_last_block, best_socket) = if !config.peer_go_master_sockets.is_empty()
-        {
-            match catchup::query_peer_epochs(
-                &config.peer_go_master_sockets,
-                &config.executor_receive_socket_path,
-            )
-            .await
-            {
+        // PEER EPOCH DISCOVERY: Query TCP peers to get correct epoch
+        let (go_epoch, peer_last_block, best_socket) = if !config.peer_rpc_addresses.is_empty() {
+            use crate::network::peer_rpc::query_peer_epochs_network;
+            match query_peer_epochs_network(&config.peer_rpc_addresses).await {
                 Ok(result) => {
                     info!(
-                        "✅ [PEER EPOCH] Using epoch {} from peer discovery",
-                        result.0
+                        "✅ [PEER EPOCH] Using epoch {} from TCP peer discovery (peer: {})",
+                        result.0, result.2
                     );
-                    result
+                    (
+                        result.0,
+                        result.1,
+                        config.executor_receive_socket_path.clone(),
+                    )
                 }
                 Err(e) => {
-                    warn!("⚠️ [PEER EPOCH] Failed to query peers, falling back to local Go Master: {}", e);
+                    warn!("⚠️ [PEER EPOCH] Failed to query TCP peers, falling back to local Go Master: {}", e);
                     let epoch = executor_client
                         .get_current_epoch()
                         .await
@@ -193,7 +215,7 @@ impl ConsensusNode {
                 }
             }
         } else {
-            // No peer sockets configured, use local Go Master
+            // No peer addresses configured, use local Go Master
             let epoch = executor_client
                 .get_current_epoch()
                 .await
@@ -283,13 +305,59 @@ impl ConsensusNode {
         // This ensures new validators only become active AFTER epoch transition.
         // get_validators_at_block() returns current state (includes newly registered validators)
         // get_epoch_boundary_data() returns validators at epoch boundary (actual committee)
-        let (boundary_block, epoch_timestamp_ms, _boundary_epoch, validators) =
-            peer_executor_client
+        //
+        // FALLBACK LOGIC: If local Go doesn't have epoch boundary for network epoch,
+        // fall back to local Go's epoch (for late-joining nodes that need to sync first)
+        let (current_epoch, epoch_timestamp_ms, boundary_block, validators) =
+            match peer_executor_client
                 .get_epoch_boundary_data(current_epoch)
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to fetch epoch boundary data from Go: {}", e)
-                })?;
+            {
+                Ok((epoch, timestamp, boundary, vals)) => {
+                    info!(
+                        "✅ [STARTUP] Got epoch boundary data for epoch {} from Go",
+                        epoch
+                    );
+                    (epoch, timestamp, boundary, vals)
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [STARTUP] Failed to get epoch boundary for epoch {}: {}. Falling back to local Go's epoch.",
+                        current_epoch, e
+                    );
+                    // Fall back to local Go's current epoch (which should have boundary data)
+                    let local_epoch = executor_client.get_current_epoch().await.unwrap_or(0);
+                    info!(
+                        "📊 [STARTUP] Falling back to local Go epoch {} (network epoch was {})",
+                        local_epoch, current_epoch
+                    );
+
+                    match executor_client.get_epoch_boundary_data(local_epoch).await {
+                        Ok((epoch, timestamp, boundary, vals)) => {
+                            info!(
+                                "✅ [STARTUP] Got epoch boundary data for local epoch {}",
+                                epoch
+                            );
+                            (epoch, timestamp, boundary, vals)
+                        }
+                        Err(e2) => {
+                            // Last resort: use epoch 0 with genesis parameters
+                            warn!(
+                                "⚠️ [STARTUP] No epoch boundary available (local epoch {} error: {}). Using epoch 0 genesis.",
+                                local_epoch, e2
+                            );
+                            // Try to get validators at block 0 for genesis
+                            let (genesis_validators, _genesis_epoch) = executor_client
+                                .get_validators_at_block(0)
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!("Failed to fetch genesis validators: {}", e)
+                                })?;
+                            (0u64, 0u64, 0u64, genesis_validators)
+                        }
+                    }
+                }
+            };
 
         info!(
             "📊 [STARTUP] Using epoch boundary data: epoch={}, boundary_block={}, epoch_timestamp={}ms, validators={}",
@@ -417,28 +485,18 @@ impl ConsensusNode {
             );
         }
 
-        // CALCULATE EPOCH BASE INDEX (Fix for Double-Counting Bug)
-        // Global = Base + CommitIndex
-        // Base = Global - CommitIndex
-        // We use the Persisted Pair for this because it's a guaranteed valid (Global, Commit) sample
-        let epoch_base_exec_index = if persisted_commit > 0
-            && persisted_index >= persisted_commit as u64
-        {
-            let base = persisted_index - persisted_commit as u64;
-            info!(
-                "✅ [STARTUP] Calculated Epoch Base Index: {} (Persisted: Global={}, Commit={})",
-                base, persisted_index, persisted_commit
-            );
-            base
-        } else {
-            // Fallback: If no persisted commit index (legacy), we assume last_global_exec_index is the Base?
-            // OR we assume commit index is 0?
-            // If we are restarting, and we don't have commit index, we risk the bug.
-            // But if we have 0, then Base = Tip. This is the old behavior.
-            warn!("⚠️ [STARTUP] Could not calculate Epoch Base (Persisted: Global={}, Commit={}). Using Tip {} as Base (Legacy/Fallback).", 
-                persisted_index, persisted_commit, last_global_exec_index);
-            last_global_exec_index
-        };
+        // EPOCH BASE INDEX: Use Go's boundary_block as authoritative source
+        // Go's GetEpochBoundaryData returns the boundary_block which is the last block of the previous epoch.
+        // For Epoch N, boundary_block is the global_exec_index at which Epoch N started.
+        // This is the CORRECT epoch base for calculating: global_exec_index = epoch_base + commit_index
+        //
+        // Previously, we tried to calculate this from (persisted_index - persisted_commit), but this fails
+        // when persisted state is missing or stale after epoch transitions.
+        let epoch_base_exec_index = boundary_block;
+        info!(
+            "✅ [STARTUP] Using epoch_base={} from Go boundary_block (epoch={}, persisted_global={}, persisted_commit={})",
+            epoch_base_exec_index, current_epoch, persisted_index, persisted_commit
+        );
 
         // Recovery check
         if config.executor_read_enabled && last_global_exec_index > 0 {
@@ -676,31 +734,38 @@ impl ConsensusNode {
             ClockSyncManager::start_drift_monitor(monitor_manager_clone);
         }
 
-        let authority = if is_in_committee {
+        // For SyncOnly nodes, we need to keep commit_consumer alive to prevent channel close
+        let (authority, commit_consumer_holder) = if is_in_committee {
             info!("🚀 Starting consensus authority node...");
-            Some(
-                ConsensusAuthority::start(
-                    NetworkType::Tonic,
-                    epoch_timestamp_ms,
-                    epoch_base_exec_index,
-                    own_index,
-                    committee.clone(),
-                    parameters.clone(),
-                    protocol_config.clone(),
-                    protocol_keypair.clone(),
-                    network_keypair.clone(),
-                    clock.clone(),
-                    transaction_verifier.clone(),
-                    commit_consumer,
-                    registry.clone(),
-                    0,
-                    Some(system_transaction_provider.clone() as Arc<dyn SystemTransactionProvider>),
-                )
-                .await,
+            (
+                Some(
+                    ConsensusAuthority::start(
+                        NetworkType::Tonic,
+                        epoch_timestamp_ms,
+                        epoch_base_exec_index,
+                        own_index,
+                        committee.clone(),
+                        parameters.clone(),
+                        protocol_config.clone(),
+                        protocol_keypair.clone(),
+                        network_keypair.clone(),
+                        clock.clone(),
+                        transaction_verifier.clone(),
+                        commit_consumer,
+                        registry.clone(),
+                        0,
+                        Some(system_transaction_provider.clone()
+                            as Arc<dyn SystemTransactionProvider>),
+                        None, // No legacy stores on initial startup
+                    )
+                    .await,
+                ),
+                None, // Authority owns commit_consumer
             )
         } else {
             info!("🔄 Starting as sync-only node");
-            None
+            info!("📡 Keeping commit_consumer alive for SyncOnly mode to prevent channel close");
+            (None, Some(commit_consumer)) // Keep commit_consumer alive
         };
 
         let transaction_client_proxy = if let Some(ref auth) = authority {
@@ -732,7 +797,7 @@ impl ConsensusNode {
 
         let mut node = Self {
             authority,
-            legacy_store_manager: Arc::new(consensus_core::LegacyEpochStoreManager::new(1)), // Keep 1 previous epoch
+            legacy_store_manager: Arc::new(consensus_core::LegacyEpochStoreManager::new(2)), // Keep 2 previous epochs for cross-epoch sync
             node_mode: if is_in_committee {
                 NodeMode::Validator
             } else {
@@ -764,10 +829,22 @@ impl ConsensusNode {
             epoch_transition_sender: epoch_tx_sender,
             sync_task_handle: None,
             epoch_monitor_handle: None,
+            notification_server_handle: None,
             executor_client: Some(executor_client_for_proc),
             epoch_pending_transactions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             committed_transaction_hashes,
+            pending_epoch_transitions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            _commit_consumer_holder: commit_consumer_holder,
         };
+
+        // CRITICAL FIX: Load previous epoch's RocksDB stores into legacy_store_manager
+        // This ensures SyncOnly nodes can fetch commits from previous epochs on startup
+        // Without this, validators starting directly in epoch 1 can't serve epoch 0 blocks
+        // load_legacy_epoch_stores(
+        //     &node.legacy_store_manager,
+        //     &config.storage_path,
+        //     current_epoch,
+        // );
 
         crate::consensus::epoch_transition::start_epoch_transition_handler(
             epoch_tx_receiver,
@@ -777,17 +854,22 @@ impl ConsensusNode {
 
         node.check_and_update_node_mode(&committee, &config).await?;
 
+        // Start sync task for SyncOnly nodes
         if matches!(node.node_mode, NodeMode::SyncOnly) {
             let _ = node.start_sync_task(&config).await;
-            // Start epoch monitor for SyncOnly nodes to auto-transition when added to committee
-            if let Ok(Some(handle)) = epoch_monitor::start_epoch_monitor(
-                node.node_mode.clone(),
-                &node.executor_client,
-                node.current_epoch,
-                &config,
-            ) {
-                node.epoch_monitor_handle = Some(handle);
-            }
+        }
+
+        // UNIFIED EPOCH MONITOR: Runs for ALL node modes (SyncOnly and Validator)
+        // This replaces the previous fragmented approach with a single, always-running monitor
+        // Key improvement: Monitor never exits, handles both mode transitions and epoch catchup
+        if let Ok(Some(handle)) =
+            epoch_monitor::start_unified_epoch_monitor(&node.executor_client, &config)
+        {
+            node.epoch_monitor_handle = Some(handle);
+            info!(
+                "🔄 Started unified epoch monitor for {:?} mode at epoch={}",
+                node.node_mode, node.current_epoch
+            );
         }
 
         recovery::perform_fork_detection_check(&node).await?;
@@ -913,14 +995,28 @@ impl ConsensusNode {
 
                     // First update mode so tasks see correct state
                     self.node_mode = new_mode.clone();
+
+                    // MODE TRANSITION STATE LOG
+                    info!(
+                        "📊 [MODE TRANSITION] SyncOnly → Validator: epoch={}, last_global_exec_index={}, commit_index={}",
+                        self.current_epoch,
+                        self.last_global_exec_index,
+                        self.current_commit_index.load(std::sync::atomic::Ordering::SeqCst)
+                    );
+
                     let _ = self.stop_sync_task().await;
-                    // CRITICAL FIX: Do NOT call stop_epoch_monitor() here!
-                    // If this transition is triggered BY epoch_monitor (which is the normal case),
-                    // calling stop_epoch_monitor().abort() would abort the current task mid-execution,
-                    // causing all spawned consensus tasks to be dropped immediately.
-                    // Instead, just take() the handle - epoch_monitor will exit naturally after
-                    // this transition completes successfully (see epoch_monitor.rs line ~141).
-                    let _ = self.epoch_monitor_handle.take();
+                    // CRITICAL FIX 2026-02-01: Restart epoch monitor after becoming Validator
+                    // The epoch monitor is designed to run continuously for ALL node modes.
+                    // Previously, we only take() the handle without restarting, which left
+                    // Validators without epoch monitoring backup when they miss EndOfEpoch txs.
+                    let _ = self.epoch_monitor_handle.take(); // Take old handle first
+                                                              // Start new epoch monitor for Validator mode
+                    if let Ok(Some(handle)) =
+                        epoch_monitor::start_unified_epoch_monitor(&self.executor_client, config)
+                    {
+                        info!("🔄 [EPOCH MONITOR] Restarted epoch monitor after promotion to Validator");
+                        self.epoch_monitor_handle = Some(handle);
+                    }
                 }
                 (NodeMode::Validator, NodeMode::SyncOnly) => {
                     // TRANSITION HANDOFF: Notify Go that consensus is ending
@@ -952,6 +1048,14 @@ impl ConsensusNode {
 
                     // First update mode so tasks see correct state
                     self.node_mode = new_mode.clone();
+
+                    // MODE TRANSITION STATE LOG
+                    info!(
+                        "📊 [MODE TRANSITION] Validator → SyncOnly: epoch={}, last_global_exec_index={}, commit_index={}",
+                        self.current_epoch,
+                        self.last_global_exec_index,
+                        self.current_commit_index.load(std::sync::atomic::Ordering::SeqCst)
+                    );
                     // CRITICAL FIX: Stop consensus authority before starting sync task
                     // Without this, old consensus components continue running alongside sync task,
                     // causing resource leaks and potential conflicts.
@@ -962,15 +1066,11 @@ impl ConsensusNode {
                         auth.stop().await;
                     }
                     let _ = self.start_sync_task(config).await;
-                    // Start epoch monitor so we can be promoted back if added to committee
-                    // CRITICAL: Pass new_mode (SyncOnly) NOT self.node_mode (was Validator)
-                    if let Ok(Some(handle)) = epoch_monitor::start_epoch_monitor(
-                        self.node_mode.clone(),
-                        &self.executor_client,
-                        self.current_epoch,
-                        config,
-                    ) {
-                        info!("🔍 [EPOCH MONITOR] Started epoch monitor for demotion to SyncOnly");
+                    // Start unified epoch monitor for demotion recovery
+                    if let Ok(Some(handle)) =
+                        epoch_monitor::start_unified_epoch_monitor(&self.executor_client, config)
+                    {
+                        info!("🔄 [EPOCH MONITOR] Started unified epoch monitor after demotion to SyncOnly");
                         self.epoch_monitor_handle = Some(handle);
                     }
                 }
@@ -983,11 +1083,53 @@ impl ConsensusNode {
     }
 
     pub async fn start_sync_task(&mut self, config: &NodeConfig) -> Result<()> {
+        // Start notification server for event-driven transitions
+        if let Err(e) = self.start_notification_server(config).await {
+            warn!("⚠️ Failed to start notification server: {}", e);
+        }
         sync::start_sync_task(self, config).await
     }
 
     pub async fn stop_sync_task(&mut self) -> Result<()> {
+        // Stop notification server as well when stopping sync
+        if let Some(handle) = self.notification_server_handle.take() {
+            info!("🛑 [NOTIFICATION SERVER] Stopping...");
+            handle.abort();
+        }
         sync::stop_sync_task(self).await
+    }
+
+    pub async fn start_notification_server(&mut self, config: &NodeConfig) -> Result<()> {
+        // Only start if not already running
+        if self.notification_server_handle.is_some() {
+            return Ok(());
+        }
+
+        let socket_path = std::path::PathBuf::from(&config.executor_receive_socket_path)
+            .parent()
+            .unwrap()
+            .join(format!("metanode-notification-{}.sock", config.node_id));
+        let sender = self.epoch_transition_sender.clone();
+
+        let server = notification_server::EpochNotificationServer::new(
+            socket_path,
+            move |epoch, timestamp, boundary| {
+                // Forward to transition handler
+                if let Err(e) = sender.send((epoch, timestamp, boundary)) {
+                    return Err(anyhow::anyhow!(
+                        "Failed to forward epoch notification: {}",
+                        e
+                    ));
+                }
+                Ok(())
+            },
+        );
+
+        let handle = tokio::spawn(async move { server.start().await });
+
+        self.notification_server_handle = Some(handle);
+        info!("🚀 [NOTIFICATION SERVER] Started background task");
+        Ok(())
     }
 
     /// Flush all buffered blocks to Go Master before shutdown
@@ -1070,4 +1212,72 @@ fn detect_local_epoch(storage_path: &std::path::Path) -> u64 {
     }
 
     max_epoch
+}
+
+/// Load previous epoch RocksDB stores into LegacyEpochStoreManager
+/// This enables nodes to serve historical commits when starting directly in a later epoch
+fn load_legacy_epoch_stores(
+    legacy_manager: &std::sync::Arc<consensus_core::LegacyEpochStoreManager>,
+    storage_path: &std::path::Path,
+    current_epoch: u64,
+) {
+    if current_epoch == 0 {
+        // No previous epochs to load
+        return;
+    }
+
+    let epochs_dir = storage_path.join("epochs");
+    if !epochs_dir.exists() {
+        info!("📦 [LEGACY STORE] No epochs directory found, skipping legacy store loading");
+        return;
+    }
+
+    // Load previous epochs (up to max_epochs in LegacyEpochStoreManager)
+    let mut loaded_count = 0;
+    for epoch in (0..current_epoch).rev() {
+        let epoch_db_path = epochs_dir
+            .join(format!("epoch_{}", epoch))
+            .join("consensus_db");
+
+        if epoch_db_path.exists() {
+            info!(
+                "📦 [LEGACY STORE] Found previous epoch {} database at {:?}",
+                epoch, epoch_db_path
+            );
+
+            // Create read-write store for the legacy epoch
+            // Note: RocksDB supports concurrent access from the same process
+            let legacy_store =
+                std::sync::Arc::new(RocksDBStore::new(epoch_db_path.to_str().unwrap_or("")));
+
+            legacy_manager.add_store(epoch, legacy_store);
+            loaded_count += 1;
+
+            info!(
+                "✅ [LEGACY STORE] Loaded epoch {} store for historical sync",
+                epoch
+            );
+
+            // Only load max_epochs number of stores
+            if loaded_count >= 1 {
+                break;
+            }
+        } else {
+            info!(
+                "⚠️ [LEGACY STORE] Epoch {} database not found at {:?}",
+                epoch, epoch_db_path
+            );
+        }
+    }
+
+    if loaded_count > 0 {
+        info!(
+            "📦 [LEGACY STORE] Successfully loaded {} previous epoch store(s) for sync",
+            loaded_count
+        );
+    } else {
+        warn!(
+            "⚠️ [LEGACY STORE] No previous epoch stores found. SyncOnly nodes may not be able to fetch historical commits."
+        );
+    }
 }

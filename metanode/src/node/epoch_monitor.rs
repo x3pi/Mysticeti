@@ -1,47 +1,39 @@
 // Copyright (c) MetaNode Team
 // SPDX-License-Identifier: Apache-2.0
 
-//! Epoch Monitor for SyncOnly nodes
+//! Unified Epoch Monitor
 //!
-//! Monitors epoch changes and triggers transition to Validator mode
-//! when the node is detected in the new committee.
+//! A single monitor that handles epoch transitions for BOTH SyncOnly and Validator nodes.
+//! This replaces the previous fragmented approach of separate monitors.
+//!
+//! ## Design Principles
+//! 1. **Single Source of Truth**: Go layer epoch is authoritative
+//! 2. **Always Running**: Monitor never exits - runs continuously for all node modes
+//! 3. **Fork-Safe**: Uses `boundary_block` from `get_epoch_boundary_data()`
+//! 4. **Unified Logic**: Same code path for SyncOnly and Validator nodes
 
 use crate::config::NodeConfig;
+use crate::node::executor_client::proto;
 use anyhow::Result;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use std::sync::Arc;
-
-/// Start the epoch monitor task for SyncOnly nodes
+/// Start the unified epoch monitor for ALL node types (SyncOnly and Validator)
 ///
-/// This task periodically polls Go's epoch and committee state.
-/// When a new epoch is detected and this node is in the committee,
-/// it triggers a transition to Validator mode.
+/// This monitor:
+/// 1. Polls Go epoch every N seconds
+/// 2. Detects when Rust epoch falls behind Go epoch
+/// 3. Fetches epoch boundary data (fork-safe)
+/// 4. Triggers appropriate transition (SyncOnly→Validator or epoch update)
 ///
-/// FORK-SAFETY: This monitor does NOT advance epochs unilaterally.
-/// It only transitions when the network (via Go's epoch number) has
-/// already advanced the epoch through consensus.
-pub fn start_epoch_monitor(
-    node_mode: crate::node::NodeMode,
+/// IMPORTANT: This monitor NEVER exits - it runs continuously for the lifetime of the node.
+/// This prevents the bug where Validators get stuck when they miss EndOfEpoch transactions.
+pub fn start_unified_epoch_monitor(
     executor_client: &Option<Arc<crate::node::executor_client::ExecutorClient>>,
-    current_epoch: u64,
     config: &NodeConfig,
 ) -> Result<Option<JoinHandle<()>>> {
-    // Debug assertions for Send/Sync
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-    assert_send::<NodeConfig>();
-    assert_sync::<NodeConfig>();
-    assert_send::<Arc<crate::node::executor_client::ExecutorClient>>();
-    assert_sync::<crate::node::executor_client::ExecutorClient>();
-    // Only start for SyncOnly nodes
-    if !matches!(node_mode, crate::node::NodeMode::SyncOnly) {
-        debug!("📊 [EPOCH MONITOR] Skipping - node is already validator");
-        return Ok(None);
-    }
-
     let client_arc = match executor_client {
         Some(client) => client.clone(),
         None => {
@@ -52,314 +44,189 @@ pub fn start_epoch_monitor(
 
     let node_id = config.node_id;
     let config_clone = config.clone();
-    let poll_interval_secs = config.epoch_monitor_poll_interval_secs.unwrap_or(5);
+    // Default poll interval: configurable, default 10 seconds
+    let poll_interval_secs = config.epoch_monitor_poll_interval_secs.unwrap_or(10);
 
     info!(
-        "🔍 [EPOCH MONITOR] Starting epoch monitor for SyncOnly node-{} (current_epoch={}, poll_interval={}s)",
-        node_id, current_epoch, poll_interval_secs
+        "🔄 [EPOCH MONITOR] Starting unified epoch monitor for node-{} (poll_interval={}s)",
+        node_id, poll_interval_secs
     );
 
-    // Start notification listener for real-time push from Go
-    // Use fixed socket path - Go notifier connects here when validators register/deregister
-    let socket_path = "/tmp/committee-notify.sock";
-    let (mut notification_rx, _listener_handle) =
-        super::notification_listener::start_notification_driven_monitor(socket_path);
+    // Load own protocol key for committee membership check
+    let own_protocol_key_base64 = match config.load_protocol_keypair() {
+        Ok(keypair) => {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            STANDARD.encode(keypair.public().to_bytes())
+        }
+        Err(e) => {
+            warn!(
+                "⚠️ [EPOCH MONITOR] Failed to load protocol keypair: {}. Falling back to hostname matching.",
+                e
+            );
+            String::new()
+        }
+    };
+    let hostname = format!("node-{}", node_id);
 
     let handle = tokio::spawn(async move {
-        let mut last_known_epoch = current_epoch;
-        // FIX: Use protocol_key matching instead of hostname
-        // Load protocol_key from config for identity verification
-        let own_protocol_key_base64 = match config_clone.load_protocol_keypair() {
-            Ok(keypair) => {
-                use base64::{engine::general_purpose::STANDARD, Engine as _};
-                STANDARD.encode(keypair.public().to_bytes())
-            }
-            Err(e) => {
-                warn!("⚠️ [EPOCH MONITOR] Failed to load protocol keypair: {}. Falling back to hostname matching.", e);
-                String::new()
-            }
-        };
-        let hostname = format!("node-{}", node_id);
-        let mut last_checked_block: u64 = 0;
-
         loop {
-            // Wait for either notification from Go OR timeout (fallback polling)
-            let should_check = tokio::select! {
-                // Immediate check when Go pushes notification
-                notification = notification_rx.recv() => {
-                    match notification {
-                        Some(n) => {
-                            info!("📢 [EPOCH MONITOR] Received committee change notification: {:?}", n.change_type);
-                            true
-                        }
-                        None => {
-                            warn!("⚠️ [EPOCH MONITOR] Notification channel closed");
-                            false
-                        }
-                    }
-                }
-                // Fallback: poll every N seconds
-                _ = tokio::time::sleep(Duration::from_secs(poll_interval_secs)) => {
-                    true
-                }
-            };
+            // Wait for poll interval
+            tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
 
-            if !should_check {
-                continue;
-            }
-
-            // Check current epoch from Go
-            let go_epoch = match client_arc.get_current_epoch().await {
-                Ok(e) => e,
+            // 1. Get LOCAL Go epoch (may be stale for late-joiners!)
+            let local_go_epoch = match client_arc.get_current_epoch().await {
+                Ok(epoch) => epoch,
                 Err(e) => {
-                    debug!("🔍 [EPOCH MONITOR] Failed to get epoch from Go: {}", e);
+                    debug!("⚠️ [EPOCH MONITOR] Failed to get local Go epoch: {}", e);
                     continue;
                 }
             };
 
-            // Log epoch change if detected
-            if go_epoch > last_known_epoch {
-                info!(
-                    "🔄 [EPOCH MONITOR] Detected epoch change: {} -> {}",
-                    last_known_epoch, go_epoch
-                );
+            // 2. Get NETWORK epoch from peers (critical for late-joiners!)
+            // Use peer_rpc_addresses for WAN-based discovery
+            let network_epoch = {
+                let peer_rpc = config_clone.peer_rpc_addresses.clone();
+                let _own_socket = config_clone.executor_receive_socket_path.clone();
 
-                // EPOCH CATCHUP LOGIC FOR SYNCONLY NODES
-                // When Go epoch > startup epoch, it means:
-                // 1. We started with stale epoch from local Go Master
-                // 2. Go Master has now synced correct epoch from network
-                //
-                // SyncOnly nodes MUST restart consensus with the new epoch
-                // so that blockchain can accept blocks from the new epoch.
-                // Without this, block verifier rejects all blocks as "wrong epoch".
-                if go_epoch > last_known_epoch {
-                    warn!(
-                        "🔄 [EPOCH CATCHUP] Go epoch ({}) advanced beyond Rust epoch ({}). Preparing epoch transition...",
-                        go_epoch, last_known_epoch
-                    );
-
-                    // Get epoch boundary data for the new epoch
-                    let (new_epoch, new_epoch_timestamp_ms, boundary_block, validators) =
-                        match client_arc.get_epoch_boundary_data(go_epoch).await {
-                            Ok(data) => {
+                if !peer_rpc.is_empty() {
+                    // WAN-based discovery (TCP) - recommended for cross-node sync
+                    match crate::network::peer_rpc::query_peer_epochs_network(&peer_rpc).await {
+                        Ok((epoch, _block, peer)) => {
+                            if epoch > local_go_epoch {
                                 info!(
-                                    "📊 [EPOCH CATCHUP] Got new epoch data: epoch={}, timestamp_ms={}, boundary_block={}",
-                                    data.0, data.1, data.2
+                                    "🌐 [EPOCH MONITOR] Network epoch {} from peer {} is AHEAD of local Go epoch {}",
+                                    epoch, peer, local_go_epoch
                                 );
-                                data
                             }
-                            Err(e) => {
-                                warn!("⚠️ [EPOCH CATCHUP] Failed to get epoch boundary data: {}. Will retry...", e);
-                                last_known_epoch = go_epoch;
-                                continue;
-                            }
-                        };
-
-                    // SYNC BARRIER: Wait for Go Master to sync ALL blocks before transition
-                    // This prevents missing blocks during epoch transition
-                    let peer_last_block =
-                        match crate::node::committee_source::CommitteeSource::discover(
-                            &config_clone,
-                        )
-                        .await
-                        {
-                            Ok(source) => {
-                                info!(
-                                "📊 [EPOCH CATCHUP SYNC BARRIER] Peer source: last_block={}, epoch={}, is_peer={}",
-                                source.last_block, source.epoch, source.is_peer
-                            );
-                                source.last_block
-                            }
-                            Err(e) => {
-                                warn!("⚠️ [EPOCH CATCHUP SYNC BARRIER] Failed to discover peer: {}. Using boundary_block.", e);
-                                boundary_block
-                            }
-                        };
-
-                    let go_last_block = match client_arc.get_last_block_number().await {
-                        Ok(b) => b,
-                        Err(_) => 0,
-                    };
-
-                    if go_last_block < peer_last_block {
-                        info!(
-                            "⏳ [EPOCH CATCHUP SYNC BARRIER] Go Master ({}) behind peer ({}). Waiting for sync...",
-                            go_last_block, peer_last_block
-                        );
-
-                        // Wait for Go to sync (max 60 seconds)
-                        let mut sync_attempts = 0;
-                        const MAX_SYNC_ATTEMPTS: u32 = 120;
-
-                        loop {
-                            sync_attempts += 1;
-                            if sync_attempts > MAX_SYNC_ATTEMPTS {
-                                warn!(
-                                    "⚠️ [EPOCH CATCHUP SYNC BARRIER] Timeout after 60s. Go={}, Peer={}. Proceeding anyway...",
-                                    go_last_block, peer_last_block
-                                );
-                                break;
-                            }
-
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-
-                            match client_arc.get_last_block_number().await {
-                                Ok(current_go_block) => {
-                                    if current_go_block >= peer_last_block {
-                                        info!(
-                                            "✅ [EPOCH CATCHUP SYNC BARRIER] Go Master synced to block {} (peer={}). Ready for transition!",
-                                            current_go_block, peer_last_block
-                                        );
-                                        break;
-                                    }
-                                    if sync_attempts % 10 == 0 {
-                                        info!(
-                                            "⏳ [EPOCH CATCHUP SYNC BARRIER] Waiting... Go={}, Peer={}, attempt={}/{}",
-                                            current_go_block, peer_last_block, sync_attempts, MAX_SYNC_ATTEMPTS
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("⚠️ [EPOCH CATCHUP SYNC BARRIER] Error: {}", e);
-                                }
-                            }
+                            epoch
                         }
-                    } else {
-                        info!(
-                            "✅ [EPOCH CATCHUP SYNC BARRIER] Go Master already synced: Go={} >= Peer={}",
-                            go_last_block, peer_last_block
-                        );
+                        Err(_) => local_go_epoch, // Fallback to local
                     }
-
-                    // Check if node is in committee for the new epoch
-                    let is_in_committee = if !own_protocol_key_base64.is_empty() {
-                        validators
-                            .iter()
-                            .any(|v| v.protocol_key == own_protocol_key_base64)
-                    } else {
-                        validators.iter().any(|v| v.name == hostname)
-                    };
-
-                    // Get node and transition to new epoch
-                    if let Some(node_arc) = crate::node::get_transition_handler_node().await {
-                        let mut node_guard = node_arc.lock().await;
-
-                        // CRITICAL FORK FIX: Use boundary_block from get_epoch_boundary_data()
-                        // NOT from get_last_block_number() which is node-specific!
-                        // boundary_block is the NETWORK CONSENSUS boundary from peer/local that
-                        // witnessed the epoch transition. Using local last_block would cause fork.
-                        let synced_global_exec_index = boundary_block;
-
-                        if is_in_committee {
-                            // Node is in committee -> transition to VALIDATOR mode
-                            info!(
-                                "🎉 [EPOCH CATCHUP] Node {} is in epoch {} committee! Transitioning to VALIDATOR. (synced_index={})",
-                                hostname, new_epoch, synced_global_exec_index
-                            );
-                        } else {
-                            // Node not in committee -> stay in SYNCONLY mode but update epoch
-                            info!(
-                                "🔄 [EPOCH CATCHUP] Transitioning SyncOnly node to epoch {} (synced_index={})",
-                                new_epoch, synced_global_exec_index
-                            );
-                        }
-
-                        match node_guard
-                            .transition_to_epoch_from_system_tx(
-                                new_epoch,
-                                new_epoch_timestamp_ms,
-                                synced_global_exec_index,
-                                &config_clone,
-                            )
-                            .await
-                        {
-                            Ok(()) => {
-                                if is_in_committee {
-                                    info!(
-                                        "✅ [EPOCH CATCHUP] Successfully transitioned to VALIDATOR for epoch {}! Starting block proposal.",
-                                        new_epoch
-                                    );
-                                    // Exit monitor - node is now validator
-                                    return;
-                                } else {
-                                    info!(
-                                        "✅ [EPOCH CATCHUP] Successfully transitioned to epoch {}. Epoch catchup complete.",
-                                        new_epoch
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "❌ [EPOCH CATCHUP] Failed to transition to epoch {}: {}",
-                                    new_epoch, e
-                                );
-                            }
-                        }
-                    }
+                } else {
+                    // No WAN peers configured - use local Go epoch
+                    // NOTE: LAN peer_executor_sockets was removed. For cross-node sync, configure peer_rpc_addresses.
+                    local_go_epoch
                 }
+            };
 
-                last_known_epoch = go_epoch;
+            // 3. Get current Rust epoch from node
+            let (rust_epoch, current_mode) =
+                if let Some(node_arc) = crate::node::get_transition_handler_node().await {
+                    let node_guard = node_arc.lock().await;
+                    (node_guard.current_epoch, node_guard.node_mode.clone())
+                } else {
+                    debug!("⚠️ [EPOCH MONITOR] Node not registered yet, waiting...");
+                    continue;
+                };
+
+            // 4. Check if transition needed (NETWORK epoch ahead of Rust)
+            // Use network_epoch instead of local_go_epoch!
+            if network_epoch <= rust_epoch {
+                // No transition needed - epochs are in sync with network
+                continue;
             }
 
-            // ALWAYS check committee, not just on epoch change!
-            // This allows nodes registered mid-epoch to transition immediately.
-            //
-            // FIX: Use get_epoch_boundary_data() for CONSISTENT validator snapshot
-            // This fetches validators at the EPOCH BOUNDARY BLOCK (last block of prev epoch)
-            // instead of latest block, preventing fork from inconsistent validator sets
-            let (boundary_epoch, target_epoch_timestamp_ms, boundary_block, validators) =
-                match client_arc.get_epoch_boundary_data(go_epoch).await {
+            let epoch_gap = network_epoch - rust_epoch;
+            info!(
+                "🔄 [EPOCH MONITOR] Epoch gap detected: Rust={} Network={} (gap={})",
+                rust_epoch, network_epoch, epoch_gap
+            );
+
+            // 4. Get epoch boundary data (FORK-SAFE!)
+            // First try local Go, then fallback to peer TCP RPC
+            // This is critical for late-joiners: local Go may not have boundary data
+            // because it hasn't witnessed the epoch transition yet.
+
+            // Try local Go first
+            let local_executor_client = client_arc.clone();
+            let boundary_data_result = local_executor_client
+                .get_epoch_boundary_data(network_epoch)
+                .await;
+
+            let (new_epoch, epoch_timestamp_ms, boundary_block, validators) =
+                match boundary_data_result {
                     Ok(data) => {
                         info!(
-                            "📊 [EPOCH MONITOR] Got epoch boundary data: epoch={}, timestamp_ms={}, boundary_block={}, validators={}",
-                            data.0, data.1, data.2, data.3.len()
-                        );
+                        "📊 [EPOCH MONITOR] Got boundary data from LOCAL: epoch={}, timestamp={}ms, boundary_block={}, validators={}",
+                        data.0, data.1, data.2, data.3.len()
+                    );
                         data
                     }
                     Err(e) => {
-                        // Fallback to old method if new API not available
-                        warn!("⚠️ [EPOCH MONITOR] get_epoch_boundary_data failed: {}. Falling back to legacy API.", e);
+                        // Local failed - try to fetch from peer via TCP RPC
+                        warn!(
+                        "⚠️ [EPOCH MONITOR] Local Go failed for epoch {}: {}. Trying peers via TCP RPC...",
+                        network_epoch, e
+                    );
 
-                        let last_block = match client_arc.get_last_block_number().await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!("⚠️ [EPOCH MONITOR] Failed to get last block number: {}", e);
-                                continue;
-                            }
-                        };
+                        let peer_rpc = &config_clone.peer_rpc_addresses;
+                        if peer_rpc.is_empty() {
+                            warn!("⚠️ [EPOCH MONITOR] No peers configured. Cannot fetch epoch boundary data. Will retry.");
+                            continue;
+                        }
 
-                        let validators = match client_arc.get_validators_at_block(last_block).await
-                        {
-                            Ok((v, _)) => v,
-                            Err(e) => {
-                                warn!("⚠️ [EPOCH MONITOR] Failed to get validators: {}", e);
-                                continue;
-                            }
-                        };
-
-                        let timestamp = match client_arc.get_epoch_start_timestamp().await {
-                            Ok(ts) => ts,
-                            Err(e) => {
-                                warn!(
-                                    "⚠️ [EPOCH MONITOR] Failed to get epoch_start_timestamp: {}",
-                                    e
+                        // Try each peer until one succeeds
+                        let mut peer_data = None;
+                        for peer_addr in peer_rpc.iter() {
+                            match crate::network::peer_rpc::query_peer_epoch_boundary_data(
+                                peer_addr,
+                                network_epoch,
+                            )
+                            .await
+                            {
+                                Ok(response) => {
+                                    info!(
+                                    "✅ [EPOCH MONITOR] Got boundary data from PEER {}: epoch={}, timestamp={}ms, boundary_block={}, validators={}",
+                                    peer_addr, response.epoch, response.timestamp_ms, response.boundary_block, response.validators.len()
                                 );
+
+                                    // Convert ValidatorInfoSimple back to ValidatorInfo
+                                    let validators: Vec<proto::ValidatorInfo> = response
+                                        .validators
+                                        .iter()
+                                        .map(|v| {
+                                            proto::ValidatorInfo {
+                                                name: v.name.clone(),
+                                                address: v.address.clone(),
+                                                stake: v.stake.to_string(),
+                                                protocol_key: v.protocol_key.clone(),
+                                                network_key: v.network_key.clone(),
+                                                authority_key: String::new(), // Not used in transition
+                                                description: String::new(),
+                                                website: String::new(),
+                                                image: String::new(),
+                                                commission_rate: 0,
+                                                min_self_delegation: String::new(),
+                                                accumulated_rewards_per_share: String::new(),
+                                            }
+                                        })
+                                        .collect();
+
+                                    peer_data = Some((
+                                        response.epoch,
+                                        response.timestamp_ms,
+                                        response.boundary_block,
+                                        validators,
+                                    ));
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!("⚠️ [EPOCH MONITOR] Peer {} failed: {}. Trying next peer...", peer_addr, e);
+                                }
+                            }
+                        }
+
+                        match peer_data {
+                            Some(data) => data,
+                            None => {
+                                warn!("⚠️ [EPOCH MONITOR] All peers failed to provide epoch {} boundary data. Will retry.", network_epoch);
                                 continue;
                             }
-                        };
-
-                        (go_epoch, timestamp, last_block, validators)
+                        }
                     }
                 };
 
-            // Skip if we already checked this block (avoid spamming)
-            if boundary_block == last_checked_block {
-                continue;
-            }
-            last_checked_block = boundary_block;
-
-            // FIX: Use protocol_key matching instead of hostname
-            // Fallback to hostname if protocol_key loading failed
+            // 5. Check committee membership for target epoch
             let is_in_committee = if !own_protocol_key_base64.is_empty() {
                 validators
                     .iter()
@@ -368,245 +235,51 @@ pub fn start_epoch_monitor(
                 validators.iter().any(|v| v.name == hostname)
             };
 
-            // FORK-SAFETY: Do NOT advance epoch unilaterally!
-            // SyncOnly nodes must wait for network consensus on epoch change.
-            // The epoch will advance when:
-            // 1. Existing validators produce an AdvanceEpoch system transaction
-            // 2. Go Master receives this via network sync from peers
-            // 3. Go's epoch number updates
-            // 4. We detect the change here
-            //
-            // We use Go's reported epoch directly - no speculation!
-            let target_epoch = boundary_epoch;
+            // 6. Log transition intent
+            let target_mode = if is_in_committee {
+                crate::node::NodeMode::Validator
+            } else {
+                crate::node::NodeMode::SyncOnly
+            };
 
-            // target_epoch_timestamp_ms already retrieved from get_epoch_boundary_data()
             info!(
-                "📊 [EPOCH MONITOR] Using epoch_start_timestamp_ms={} from epoch boundary data",
-                target_epoch_timestamp_ms
+                "🔄 [EPOCH MONITOR] Transitioning: epoch {} → {} | mode {:?} → {:?} | boundary_block={}",
+                rust_epoch, new_epoch, current_mode, target_mode, boundary_block
             );
 
-            // CRITICAL FIX: Only transition when BOTH conditions are met:
-            // 1. Node is in the committee
-            // 2. Epoch has ACTUALLY CHANGED from when we started
-            //
-            // Without epoch change check, new validators would incorrectly transition
-            // mid-epoch when they're registered. The new committee only takes effect
-            // at the NEXT epoch boundary, not immediately after registration.
-            //
-            // Example: Epoch 0 has 4 validators. Node 5 registers. Node 5 sees itself
-            // in the "current" committee but should NOT transition until epoch 1
-            // because other validators are still running with the 4-validator committee.
-            let epoch_has_changed = go_epoch > current_epoch;
+            // 7. Execute transition
+            if let Some(node_arc) = crate::node::get_transition_handler_node().await {
+                let mut node_guard = node_arc.lock().await;
 
-            if is_in_committee && epoch_has_changed {
-                // Node is in committee AND epoch has changed - safe to transition to Validator
-                info!(
-                    "🎉 [EPOCH MONITOR] Node {} is in committee for epoch {} (changed from {})! Preparing transition to Validator...",
-                    hostname, target_epoch, current_epoch
-                );
+                // Use boundary_block as synced_global_exec_index (FORK-SAFE!)
+                let synced_global_exec_index = boundary_block;
 
-                // FORK-SAFETY PEER EPOCH CHECK: Verify that at least one peer is also at the target epoch
-                // This prevents premature transition when local Go Master has advanced but peers haven't
-                let peer_epoch_verified =
-                    match crate::node::committee_source::CommitteeSource::discover(&config_clone)
-                        .await
-                    {
-                        Ok(source) => {
-                            if source.is_peer && source.epoch >= target_epoch {
-                                info!(
-                                "✅ [PEER EPOCH CHECK] Peer {} is at epoch {} (target={}). Safe to proceed!",
-                                source.socket_path, source.epoch, target_epoch
-                            );
-                                true
-                            } else if source.is_peer && source.epoch < target_epoch {
-                                warn!(
-                                "⏳ [PEER EPOCH CHECK] Peer {} still at epoch {} (target={}). Waiting for peers to advance...",
-                                source.socket_path, source.epoch, target_epoch
-                            );
-                                false
-                            } else {
-                                // No peer available - might be first validator or network partition
-                                // LOCAL-ONLY FALLBACK (Transition Autonomy): If no peers are configured
-                                // or reachable (is_peer=false), proceed using only local Go Master as
-                                // the source of truth. This is critical for:
-                                // - First validator in a new committee
-                                // - Isolated nodes like Node 4 in early join phases
-                                // - Single-node testnets
-                                info!(
-                                    "ℹ️ [PEER EPOCH CHECK] No peer available (is_peer=false). Using LOCAL-ONLY FALLBACK. Local epoch={}. Proceeding with transition!",
-                                    source.epoch
-                                );
-                                true // FIXED: Allow transition with local Go Master only
-                            }
-                        }
-                        Err(e) => {
-                            warn!("⚠️ [PEER EPOCH CHECK] Failed to discover peer source: {}. Will retry...", e);
-                            false
-                        }
-                    };
-
-                // If peer epoch not verified, skip this transition attempt and wait for next poll
-                if !peer_epoch_verified {
-                    info!(
-                        "⏳ [EPOCH MONITOR] Waiting for peer epoch verification before transition. Will check again in {}s...",
-                        poll_interval_secs
-                    );
-                    continue;
-                }
-
-                // FORK-SAFETY WAIT BARRIER: Ensure Go Master has synced all blocks from network peers
-                // Before joining consensus, we must ensure our Go Master has all blocks that
-                // network peers have already produced. Otherwise we'll create new blocks
-                // that conflict with existing blocks = FORK!
-
-                // Step 1: Query peer's last_global_exec_index via CommitteeSource
-                let peer_last_block =
-                    match crate::node::committee_source::CommitteeSource::discover(&config_clone)
-                        .await
-                    {
-                        Ok(source) => {
-                            info!(
-                            "📊 [SYNC BARRIER] Peer source: last_block={}, epoch={}, is_peer={}",
-                            source.last_block, source.epoch, source.is_peer
+                match node_guard
+                    .transition_to_epoch_from_system_tx(
+                        new_epoch,
+                        epoch_timestamp_ms,
+                        synced_global_exec_index,
+                        &config_clone,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        info!(
+                            "✅ [EPOCH MONITOR] Successfully transitioned to epoch {} as {:?}",
+                            new_epoch, target_mode
                         );
-                            source.last_block
-                        }
-                        Err(e) => {
-                            warn!("⚠️ [SYNC BARRIER] Failed to discover peer source: {}. Using boundary_block as fallback.", e);
-                            boundary_block
-                        }
-                    };
-
-                // Step 2: Wait for Go Master to sync up to peer's last block
-                let go_last_block = match client_arc.get_last_block_number().await {
-                    Ok(b) => b,
+                    }
                     Err(e) => {
-                        warn!("⚠️ [SYNC BARRIER] Failed to get Go last block: {}", e);
-                        0
+                        warn!(
+                            "❌ [EPOCH MONITOR] Failed to transition to epoch {}: {}",
+                            new_epoch, e
+                        );
                     }
-                };
-
-                if go_last_block < peer_last_block {
-                    info!(
-                        "⏳ [SYNC BARRIER] Go Master ({}) behind network ({}). Waiting for sync...",
-                        go_last_block, peer_last_block
-                    );
-
-                    // Poll until Go catches up (max 60 seconds)
-                    let mut sync_wait_attempts = 0;
-                    const MAX_SYNC_WAIT_ATTEMPTS: u32 = 120; // 60 seconds at 500ms intervals
-
-                    loop {
-                        sync_wait_attempts += 1;
-                        if sync_wait_attempts > MAX_SYNC_WAIT_ATTEMPTS {
-                            warn!(
-                                "⚠️ [SYNC BARRIER] Timeout waiting for Go sync after 60s. Go={}, Peer={}. Proceeding anyway...",
-                                go_last_block, peer_last_block
-                            );
-                            break;
-                        }
-
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-
-                        match client_arc.get_last_block_number().await {
-                            Ok(current_go_block) => {
-                                if current_go_block >= peer_last_block {
-                                    info!(
-                                        "✅ [SYNC BARRIER] Go Master synced to block {} (peer={}). Safe to join consensus!",
-                                        current_go_block, peer_last_block
-                                    );
-                                    break;
-                                }
-                                if sync_wait_attempts % 10 == 0 {
-                                    info!(
-                                        "⏳ [SYNC BARRIER] Still waiting... Go={}, Peer={}, attempt={}/{}",
-                                        current_go_block, peer_last_block, sync_wait_attempts, MAX_SYNC_WAIT_ATTEMPTS
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!("⚠️ [SYNC BARRIER] Error getting Go block: {}", e);
-                            }
-                        }
-                    }
-                } else {
-                    info!(
-                        "✅ [SYNC BARRIER] Go Master already synced: Go={} >= Peer={}. Safe to join!",
-                        go_last_block, peer_last_block
-                    );
                 }
-
-                // Get the node from global registry and trigger transition
-                if let Some(node_arc) = crate::node::get_transition_handler_node().await {
-                    let mut node_guard = node_arc.lock().await;
-
-                    // Check if still SyncOnly (might have changed)
-                    if !matches!(node_guard.node_mode, crate::node::NodeMode::SyncOnly) {
-                        info!("ℹ️ [EPOCH MONITOR] Node already transitioned, stopping monitor");
-                        return;
-                    }
-
-                    // CRITICAL FORK FIX: Use boundary_block from get_epoch_boundary_data()
-                    // NOT from get_last_block_number() which is node-specific!
-                    // boundary_block is the NETWORK CONSENSUS boundary from all validators.
-                    // Using local block number would cause this node to load different committee.
-                    let synced_global_exec_index = boundary_block;
-
-                    info!(
-                        "📊 [EPOCH MONITOR] Using synced_global_exec_index={} for transition",
-                        synced_global_exec_index
-                    );
-
-                    // FORK-SAFETY: Do NOT call advance_epoch here!
-                    // The epoch was already advanced by network consensus (we checked go_epoch > 0 above).
-                    // Go's state is already up-to-date.
-
-                    // Trigger the epoch transition with synced index
-                    // Pass synced_global_exec_index so transition knows where to start
-                    match node_guard
-                        .transition_to_epoch_from_system_tx(
-                            target_epoch,
-                            target_epoch_timestamp_ms,
-                            synced_global_exec_index, // FIXED: Use actual synced index, not 0
-                            &config_clone,
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            info!(
-                                "✅ [EPOCH MONITOR] Successfully transitioned to Validator mode for epoch {} (starting from global_exec_index={})",
-                                target_epoch, synced_global_exec_index
-                            );
-                            // Exit the monitor loop - node is now a validator
-                            return;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "❌ [EPOCH MONITOR] Failed to transition to Validator mode: {}",
-                                e
-                            );
-                            // Continue monitoring - might succeed on next epoch
-                        }
-                    }
-                } else {
-                    warn!("⚠️ [EPOCH MONITOR] Node not found in global registry");
-                }
-            } else if is_in_committee && !epoch_has_changed {
-                // Node is in committee but epoch hasn't changed yet
-                // This is the case when a new validator registered mid-epoch
-                // They must wait until next epoch boundary to join consensus
-                debug!(
-                    "📊 [EPOCH MONITOR] Node {} is in committee but epoch unchanged (current={}, go={}). Waiting for epoch boundary...",
-                    hostname, current_epoch, go_epoch
-                );
-            } else {
-                debug!(
-                    "📊 [EPOCH MONITOR] Node {} not in committee for epoch {} (found {} validators: {:?})",
-                    hostname, target_epoch, validators.len(), validators.iter().map(|v| v.name.clone()).collect::<Vec<_>>()
-                );
             }
 
-            last_known_epoch = go_epoch;
+            // CRITICAL: Do NOT exit the loop! Monitor continues running
+            // This is the key fix - monitor runs for the entire node lifetime
         }
     });
 
@@ -614,10 +287,39 @@ pub fn start_epoch_monitor(
 }
 
 /// Stop the epoch monitor task
-#[allow(dead_code)] // May be called externally or for non-self-triggered transitions
+#[allow(dead_code)]
 pub async fn stop_epoch_monitor(handle: Option<JoinHandle<()>>) {
     if let Some(h) = handle {
         h.abort();
-        info!("🛑 [EPOCH MONITOR] Stopped epoch monitor task");
+        info!("🛑 [EPOCH MONITOR] Stopped unified epoch monitor");
     }
+}
+
+// ============================================================================
+// LEGACY FUNCTIONS (kept for backwards compatibility, delegate to unified)
+// ============================================================================
+
+/// Legacy function - now delegates to unified monitor
+/// Kept for backwards compatibility with existing code
+#[allow(dead_code)]
+#[deprecated(note = "Use start_unified_epoch_monitor instead")]
+pub fn start_epoch_monitor(
+    _node_mode: crate::node::NodeMode,
+    executor_client: &Option<Arc<crate::node::executor_client::ExecutorClient>>,
+    _current_epoch: u64,
+    config: &NodeConfig,
+) -> Result<Option<JoinHandle<()>>> {
+    start_unified_epoch_monitor(executor_client, config)
+}
+
+/// Legacy function - now delegates to unified monitor
+/// Kept for backwards compatibility
+#[allow(dead_code)]
+#[deprecated(note = "Use start_unified_epoch_monitor instead")]
+pub fn start_validator_epoch_watchdog(
+    executor_client: &Option<Arc<crate::node::executor_client::ExecutorClient>>,
+    _current_epoch: u64,
+    config: &NodeConfig,
+) -> Result<Option<JoinHandle<()>>> {
+    start_unified_epoch_monitor(executor_client, config)
 }

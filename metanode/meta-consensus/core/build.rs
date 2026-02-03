@@ -69,6 +69,15 @@ fn build_tonic_services(out_dir: &Path) {
         )
         .method(
             tonic_build::manual::Method::builder()
+                .name("fetch_commits_by_global_range")
+                .route_name("FetchCommitsByGlobalRange")
+                .input_type("crate::network::tonic_network::FetchCommitsByGlobalRangeRequest")
+                .output_type("crate::network::tonic_network::FetchCommitsByGlobalRangeResponse")
+                .codec_path(codec_path)
+                .build(),
+        )
+        .method(
+            tonic_build::manual::Method::builder()
                 .name("fetch_latest_blocks")
                 .route_name("FetchLatestBlocks")
                 .input_type("crate::network::tonic_network::FetchLatestBlocksRequest")

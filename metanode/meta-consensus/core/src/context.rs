@@ -10,8 +10,8 @@ use meta_protocol_config::ProtocolConfig;
 use tempfile::TempDir;
 use tokio::time::Instant;
 
-use crate::metrics::Metrics;
 use crate::metrics::test_metrics;
+use crate::metrics::Metrics;
 
 /// Context contains per-epoch configuration and metrics shared by all components
 /// of this authority.
@@ -34,7 +34,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub(crate) fn new(
+    pub fn new(
         epoch_start_timestamp_ms: u64,
         own_index: AuthorityIndex,
         committee: Committee,

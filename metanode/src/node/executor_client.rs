@@ -6,7 +6,7 @@ use consensus_core::{CommittedSubDag, BlockAPI, SystemTransaction};
 use prost::Message;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tracing::{error, info, trace, warn};
@@ -312,6 +312,7 @@ impl ExecutorClient {
 
         if let Some(last_block_number) = last_block_number_opt {
             let go_next_expected = last_block_number + 1;
+            
             let current_next_expected = {
                 let next_expected_guard = self.next_expected_index.lock().await;
                 *next_expected_guard
@@ -331,8 +332,8 @@ impl ExecutorClient {
                     let mut next_expected_guard = self.next_expected_index.lock().await;
                     *next_expected_guard = go_next_expected;
                 }
-                warn!("⚠️  [INIT] Go Master is ahead (last_block_number={}, go_next_expected={} > current_next_expected={}). Updating next_expected_index from {} to {} to prevent duplicate commits.",
-                    last_block_number, go_next_expected, current_next_expected, current_next_expected, go_next_expected);
+                info!("📊 [INIT] Updating next_expected_index from {} to {} (last_block_number={}, go_next_expected={})",
+                    current_next_expected, go_next_expected, last_block_number, go_next_expected);
                 
                 // Clear any buffered commits that Go has already processed
                 let mut buffer = self.send_buffer.lock().await;
@@ -417,11 +418,14 @@ impl ExecutorClient {
     /// Send committed sub-DAG to executor
     /// CRITICAL FORK-SAFETY: global_exec_index and commit_index ensure deterministic execution order
     /// SEQUENTIAL BUFFERING: Blocks are buffered and sent in order to ensure Go receives them sequentially
+    /// LEADER_ADDRESS: Optional 20-byte Ethereum address of leader validator
+    /// When provided, Go uses this directly instead of looking up by index
     pub async fn send_committed_subdag(
         &self,
         subdag: &CommittedSubDag,
         epoch: u64,
         global_exec_index: u64,
+        leader_address: Option<Vec<u8>>,
     ) -> Result<()> {
         if !self.is_enabled() {
             return Ok(()); // Silently skip if not enabled
@@ -468,7 +472,7 @@ impl ExecutorClient {
         
         // Convert CommittedSubDag to protobuf CommittedEpochData
         // CRITICAL FORK-SAFETY: Include global_exec_index and commit_index for deterministic ordering
-        let epoch_data_bytes = self.convert_to_protobuf(subdag, epoch, global_exec_index)?;
+        let epoch_data_bytes = self.convert_to_protobuf(subdag, epoch, global_exec_index, leader_address)?;
 
         // Count total transactions after conversion (should match before)
         let total_tx: usize = total_tx_before;
@@ -599,23 +603,37 @@ impl ExecutorClient {
                 let min_buffered = *buffer.keys().next().unwrap_or(&0);
                 let gap = min_buffered.saturating_sub(*next_expected);
                 
-                // If gap is large, it means blocks are missing - log warning but do NOT skip
-                // We must send blocks sequentially, so we wait for the missing blocks
+                // If gap is large, sync with Go (SINGLE SOURCE OF TRUTH)
+                // This auto-recovers from desync situations
                 if gap > 100 {
-                    // #region agent log
-                    {
-                        use std::io::Write;
-                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                            let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:228","message":"LARGE GAP DETECTED - buffer may be stuck","data":{{"next_expected":{},"min_buffered":{},"gap":{},"buffer_size":{},"hypothesisId":"E"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                                ts.as_secs(), ts.as_nanos() % 1000000,
-                                ts.as_millis(),
-                                *next_expected, min_buffered, gap, buffer.len());
+                    // Drop locks before async call
+                    drop(buffer);
+                    drop(next_expected);
+                    
+                    warn!("⚠️  [SEQUENTIAL-BUFFER] Large gap detected: min_buffered={}, gap={}. Syncing with Go (SOURCE OF TRUTH)...", 
+                        min_buffered, gap);
+                    
+                    // Sync with Go to get correct next_expected
+                    if let Ok(go_last_block) = self.get_last_block_number().await {
+                        let go_next_expected = go_last_block + 1;
+                        
+                        let mut next_expected_guard = self.next_expected_index.lock().await;
+                        if go_next_expected > *next_expected_guard {
+                            info!("📊 [SINGLE-SOURCE-TRUTH] Updating next_expected from {} to {} (from Go last_block={})",
+                                *next_expected_guard, go_next_expected, go_last_block);
+                            *next_expected_guard = go_next_expected;
+                            
+                            // Clear old blocks that Go already has
+                            let mut buffer = self.send_buffer.lock().await;
+                            let before_clear = buffer.len();
+                            buffer.retain(|&k, _| k >= go_next_expected);
+                            let after_clear = buffer.len();
+                            if before_clear > after_clear {
+                                info!("🧹 [SINGLE-SOURCE-TRUTH] Cleared {} old blocks, kept {}", 
+                                    before_clear - after_clear, after_clear);
+                            }
                         }
                     }
-                    // #endregion
-                    warn!("⚠️  [SEQUENTIAL-BUFFER] Large gap detected: next_expected={}, min_buffered={}, gap={}. Missing blocks detected - waiting for blocks to arrive. Do NOT skip to maintain sequential ordering.",
-                        *next_expected, min_buffered, gap);
                 }
             }
         }
@@ -950,6 +968,7 @@ impl ExecutorClient {
         subdag: &CommittedSubDag,
         epoch: u64,
         global_exec_index: u64,
+        leader_address: Option<Vec<u8>>,
     ) -> Result<Vec<u8>> {
         // Build CommittedEpochData protobuf message using generated types
         let mut blocks = Vec::new();
@@ -1186,12 +1205,16 @@ impl ExecutorClient {
         // EPOCH TRACKING: Include epoch number for block header population in Go Master
         // CRITICAL FORK-SAFETY: Include commit_timestamp_ms for deterministic block hashes
         // Go Master MUST use this timestamp for BlockHeader instead of time.Now()
+        // CRITICAL FORK-SAFETY: Include leader_author_index for deterministic LeaderAddress
+        // Go Master MUST lookup validator address from committee using this index
         let epoch_data = CommittedEpochData {
             blocks,
             global_exec_index,
             commit_index: subdag.commit_ref.index as u32,
             epoch,
             commit_timestamp_ms: subdag.timestamp_ms, // Consensus timestamp from Linearizer::calculate_commit_timestamp()
+            leader_author_index: subdag.leader.author.value() as u32, // Leader authority index for Go to lookup validator address
+            leader_address: leader_address.unwrap_or_default(), // 20-byte Ethereum address from Rust committee lookup
         };
         
         // Encode to protobuf bytes using prost::Message::encode
@@ -1355,6 +1378,9 @@ impl ExecutorClient {
             
             // Debug: Check all possible payload types
             match &response.payload {
+                Some(proto::response::Payload::NotifyEpochChangeResponse(_)) => {
+                     warn!("🔍 [EXECUTOR-REQ] Payload is NotifyEpochChangeResponse (ignored in debug match)");
+                }
                 Some(proto::response::Payload::ValidatorInfoList(v)) => {
                     info!("🔍 [EXECUTOR-REQ] Payload is ValidatorInfoList with {} validators", v.validators.len());
                     // CRITICAL: Log each ValidatorInfo exactly as received from Go
@@ -1398,6 +1424,10 @@ impl ExecutorClient {
                 Some(proto::response::Payload::WaitForSyncToBlockResponse(_)) => {
                     warn!("🔍 [EXECUTOR-REQ] Payload is Transition Handoff response (not expected for this request)");
                 }
+                Some(proto::response::Payload::GetBlocksRangeResponse(_)) |
+                Some(proto::response::Payload::SyncBlocksResponse(_)) => {
+                    warn!("🔍 [EXECUTOR-REQ] Payload is Block Sync response (not expected for this request)");
+                }
                 None => {
                     warn!("🔍 [EXECUTOR-REQ] Payload is None - response structure may be incorrect");
                     warn!("🔍 [EXECUTOR-REQ] Full response debug: {:?}", response);
@@ -1405,6 +1435,9 @@ impl ExecutorClient {
             }
             
             match response.payload {
+                Some(proto::response::Payload::NotifyEpochChangeResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected NotifyEpochChangeResponse"));
+                }
                 Some(proto::response::Payload::ValidatorInfoList(validator_info_list)) => {
                     info!("✅ [EXECUTOR-REQ] Received ValidatorInfoList from Go at block {} with {} validators, epoch_timestamp_ms={}, last_global_exec_index={}",
                         block_number, validator_info_list.validators.len(),
@@ -1453,6 +1486,10 @@ impl ExecutorClient {
                 Some(proto::response::Payload::SetSyncStartBlockResponse(_)) |
                 Some(proto::response::Payload::WaitForSyncToBlockResponse(_)) => {
                     return Err(anyhow::anyhow!("Unexpected Transition Handoff response (expected ValidatorInfoList)"));
+                }
+                Some(proto::response::Payload::GetBlocksRangeResponse(_)) |
+                Some(proto::response::Payload::SyncBlocksResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected Block Sync response (expected ValidatorInfoList)"));
                 }
                 None => {
                     return Err(anyhow::anyhow!("Unexpected response type from Go. Response payload: None. Response bytes (hex): {}", hex::encode(&response_buf)));
@@ -1542,6 +1579,9 @@ impl ExecutorClient {
             info!("🔍 [EXECUTOR-REQ] Response payload type: {:?}", response.payload);
 
             match response.payload {
+                Some(proto::response::Payload::NotifyEpochChangeResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected NotifyEpochChangeResponse"));
+                }
                 Some(proto::response::Payload::GetCurrentEpochResponse(get_current_epoch_response)) => {
                     let current_epoch = get_current_epoch_response.epoch;
                     info!("✅ [EXECUTOR-REQ] Received current epoch from Go: {}", current_epoch);
@@ -1738,6 +1778,9 @@ impl ExecutorClient {
             info!("🔍 [EXECUTOR-REQ] Response payload type: {:?}", response.payload);
 
             match response.payload {
+                Some(proto::response::Payload::NotifyEpochChangeResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected NotifyEpochChangeResponse"));
+                }
                 Some(proto::response::Payload::AdvanceEpochResponse(_advance_epoch_response)) => {
                     info!("✅ [EXECUTOR-REQ] Go successfully advanced to epoch {}", new_epoch);
                     return Ok(());
@@ -1829,6 +1872,9 @@ impl ExecutorClient {
                 })?;
 
             match response.payload {
+                Some(proto::response::Payload::NotifyEpochChangeResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected NotifyEpochChangeResponse"));
+                }
                 Some(proto::response::Payload::EpochBoundaryData(data)) => {
                     info!("✅ [EPOCH BOUNDARY] Received unified epoch boundary data: epoch={}, timestamp_ms={}, boundary_block={}, validator_count={}",
                         data.epoch, data.epoch_start_timestamp_ms, data.boundary_block, data.validators.len());
@@ -1925,6 +1971,9 @@ impl ExecutorClient {
                 .map_err(|e| anyhow::anyhow!("Failed to decode response from Go: {}", e))?;
             
             match response.payload {
+                Some(proto::response::Payload::NotifyEpochChangeResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected NotifyEpochChangeResponse"));
+                }
                 Some(proto::response::Payload::LastBlockNumberResponse(res)) => {
                     let last_block_number = res.last_block_number;
                     info!("✅ [EXECUTOR-REQ] Received LastBlockNumberResponse: last_block_number={}", last_block_number);
@@ -2004,6 +2053,9 @@ impl ExecutorClient {
 
             let response = Response::decode(&response_buf[..])?;
             match response.payload {
+                Some(proto::response::Payload::NotifyEpochChangeResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected NotifyEpochChangeResponse"));
+                }
                 Some(proto::response::Payload::SetConsensusStartBlockResponse(res)) => {
                     info!(
                         "✅ [TRANSITION] SetConsensusStartBlock response: success={}, last_sync_block={}, message={}",
@@ -2069,6 +2121,9 @@ impl ExecutorClient {
 
             let response = Response::decode(&response_buf[..])?;
             match response.payload {
+                Some(proto::response::Payload::NotifyEpochChangeResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected NotifyEpochChangeResponse"));
+                }
                 Some(proto::response::Payload::SetSyncStartBlockResponse(res)) => {
                     info!(
                         "✅ [TRANSITION] SetSyncStartBlock response: success={}, sync_start_block={}, message={}",
@@ -2138,6 +2193,9 @@ impl ExecutorClient {
 
             let response = Response::decode(&response_buf[..])?;
             match response.payload {
+                Some(proto::response::Payload::NotifyEpochChangeResponse(_)) => {
+                    return Err(anyhow::anyhow!("Unexpected NotifyEpochChangeResponse"));
+                }
                 Some(proto::response::Payload::WaitForSyncToBlockResponse(res)) => {
                     info!(
                         "✅ [TRANSITION] WaitForSyncToBlock response: reached={}, current_block={}, message={}",
@@ -2279,4 +2337,109 @@ pub fn load_persisted_last_index(storage_path: &Path) -> Option<(u64, u32)> {
     }
 }
 
+// ============================================================================
+// Block Sync Methods
+// ============================================================================
 
+impl ExecutorClient {
+    /// Get a range of blocks from Go Master
+    /// Used by validators to serve blocks to SyncOnly nodes
+    pub async fn get_blocks_range(&self, from_block: u64, to_block: u64) -> Result<Vec<proto::BlockData>> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        info!("📤 [BLOCK SYNC] Requesting blocks {} to {} from Go Master", from_block, to_block);
+
+        let request = proto::Request {
+            payload: Some(proto::request::Payload::GetBlocksRangeRequest(
+                proto::GetBlocksRangeRequest { from_block, to_block },
+            )),
+        };
+
+        let request_bytes = request.encode_to_vec();
+        
+        let mut stream = SocketStream::connect(&self.request_socket_address, 5).await?;
+
+        let len_bytes = (request_bytes.len() as u32).to_le_bytes();
+        stream.write_all(&len_bytes).await?;
+        stream.write_all(&request_bytes).await?;
+        stream.flush().await?;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let response_len = u32::from_le_bytes(len_buf) as usize;
+        
+        let mut response_buf = vec![0u8; response_len];
+        stream.read_exact(&mut response_buf).await?;
+        
+        let response: proto::Response = proto::Response::decode(&*response_buf)?;
+        
+        match response.payload {
+            Some(proto::response::Payload::GetBlocksRangeResponse(resp)) => {
+                if !resp.error.is_empty() {
+                    return Err(anyhow::anyhow!("Go returned error: {}", resp.error));
+                }
+                info!("✅ [BLOCK SYNC] Received {} blocks from Go Master", resp.count);
+                Ok(resp.blocks)
+            }
+            Some(proto::response::Payload::Error(e)) => Err(anyhow::anyhow!("Go Master error: {}", e)),
+            _ => Err(anyhow::anyhow!("Unexpected response type from Go Master")),
+        }
+    }
+
+    /// Sync blocks to local Go Master
+    /// Used by SyncOnly nodes to write blocks received from peers
+    #[allow(dead_code)]  // API reserved for future SyncOnly block sync flow
+    pub async fn sync_blocks(&self, blocks: Vec<proto::BlockData>) -> Result<(u64, u64)> {
+        if !self.is_enabled() {
+            return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        if blocks.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let block_count = blocks.len();
+        let first_block = blocks.first().map(|b| b.block_number).unwrap_or(0);
+        let last_block = blocks.last().map(|b| b.block_number).unwrap_or(0);
+        
+        info!("📤 [BLOCK SYNC] Syncing {} blocks ({} to {}) to Go Master", block_count, first_block, last_block);
+
+        let request = proto::Request {
+            payload: Some(proto::request::Payload::SyncBlocksRequest(
+                proto::SyncBlocksRequest { blocks },
+            )),
+        };
+
+        let request_bytes = request.encode_to_vec();
+        
+        let mut stream = SocketStream::connect(&self.request_socket_address, 5).await?;
+
+        let len_bytes = (request_bytes.len() as u32).to_le_bytes();
+        stream.write_all(&len_bytes).await?;
+        stream.write_all(&request_bytes).await?;
+        stream.flush().await?;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let response_len = u32::from_le_bytes(len_buf) as usize;
+        
+        let mut response_buf = vec![0u8; response_len];
+        stream.read_exact(&mut response_buf).await?;
+        
+        let response: proto::Response = proto::Response::decode(&*response_buf)?;
+        
+        match response.payload {
+            Some(proto::response::Payload::SyncBlocksResponse(resp)) => {
+                if !resp.error.is_empty() {
+                    return Err(anyhow::anyhow!("Go returned error: {}", resp.error));
+                }
+                info!("✅ [BLOCK SYNC] Synced {} blocks (last: {})", resp.synced_count, resp.last_synced_block);
+                Ok((resp.synced_count, resp.last_synced_block))
+            }
+            Some(proto::response::Payload::Error(e)) => Err(anyhow::anyhow!("Go Master error: {}", e)),
+            _ => Err(anyhow::anyhow!("Unexpected response type from Go Master")),
+        }
+    }
+}

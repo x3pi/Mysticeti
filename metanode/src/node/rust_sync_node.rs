@@ -1,0 +1,1212 @@
+// Copyright (c) MetaNode Team
+// SPDX-License-Identifier: Apache-2.0
+
+//! RustSyncNode - Full Rust P2P Block Sync for SyncOnly Mode
+//!
+//! Architecture:
+//! - Rust fetches commits from validator peers via consensus_core NetworkClient
+//! - Rust sends blocks to CommitProcessor for EndOfEpoch detection
+//! - Rust sends blocks to Go via ExecutorClient (Go only executes)
+//!
+//! This replaces Go's network_sync.go for SyncOnly nodes.
+
+use crate::node::executor_client::ExecutorClient;
+use anyhow::Result;
+use consensus_config::{Committee, NetworkKeyPair};
+use consensus_core::{
+    Commit, CommitAPI, CommitRange, CommitRef, CommittedSubDag, Context, GlobalCommitInfo,
+    NetworkClient, SignedBlock, TonicClient, VerifiedBlock,
+};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tracing::{debug, error, info, trace, warn};
+
+use crate::network::peer_rpc::{query_peer_epoch_boundary_data, query_peer_epochs_network};
+
+/// Data stored in the queue for each commit
+#[derive(Clone)]
+struct CommitData {
+    commit: Commit,
+    blocks: Vec<VerifiedBlock>,
+    epoch: u64,
+}
+
+/// BlockQueue - Buffers commits and processes them sequentially
+/// Uses BTreeMap for automatic ordering by global_exec_index
+struct BlockQueue {
+    /// Commits waiting to be processed, keyed by global_exec_index
+    pending: BTreeMap<u64, CommitData>,
+    /// Next expected global_exec_index
+    next_expected: u64,
+    /// Last time we logged about a gap
+    last_gap_log: Option<std::time::Instant>,
+}
+
+impl BlockQueue {
+    /// Create a new BlockQueue starting from a specific next_expected index
+    /// NOTE: start_index IS the next_expected (caller provides go_last_block + 1)
+    fn new(start_index: u64) -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            next_expected: start_index, // Use directly, caller already calculated next
+            last_gap_log: None,
+        }
+    }
+
+    /// Add a commit to the queue (will be deduplicated by index)
+    fn push(&mut self, data: CommitData) {
+        let index = data.commit.global_exec_index();
+        // Only add if not already processed and not already pending
+        if index >= self.next_expected && !self.pending.contains_key(&index) {
+            self.pending.insert(index, data);
+        }
+    }
+
+    /// Drain all commits that can be processed sequentially
+    /// Returns commits in order, stopping at the first gap
+    /// CRITICAL: If there's a large gap (e.g., after epoch transition), auto-adjust next_expected
+    fn drain_ready(&mut self) -> Vec<CommitData> {
+        let mut ready = Vec::new();
+
+        // EPOCH TRANSITION FIX: If the first pending commit is way ahead of next_expected,
+        // this indicates an epoch transition where global_exec_index jumped.
+        // Auto-adjust next_expected to match the first pending commit.
+        if let Some((&first_index, _)) = self.pending.first_key_value() {
+            if first_index > self.next_expected {
+                // STRICT SEQ SYNC: User requested NO SKIPPING/JUMPING
+                // Even if gap is large, we must wait for missing blocks to be fetched.
+                // We just log the gap for visibility.
+                let should_log = match self.last_gap_log {
+                    Some(last) => last.elapsed().as_secs() > 10,
+                    None => true,
+                };
+
+                if should_log {
+                    warn!(
+                        "⏳ [QUEUE] Gap detected: next_expected={} but first_pending={}. \
+                         Waiting for missing blocks (NO SKIP allowed).",
+                        self.next_expected, first_index
+                    );
+                    self.last_gap_log = Some(std::time::Instant::now());
+                }
+            }
+        }
+
+        while let Some((&index, _)) = self.pending.first_key_value() {
+            if index == self.next_expected {
+                // This is the next expected block - take it
+                if let Some(data) = self.pending.remove(&index) {
+                    ready.push(data);
+                    self.next_expected = index + 1;
+                }
+            } else if index < self.next_expected {
+                // Old block, already processed - remove it
+                self.pending.remove(&index);
+            } else {
+                // Gap detected - stop here
+                break;
+            }
+        }
+
+        ready
+    }
+
+    /// Get the next expected index
+    fn next_expected(&self) -> u64 {
+        self.next_expected
+    }
+
+    /// Update next_expected (e.g., when Go reports its progress)
+    fn sync_with_go(&mut self, go_last_block: u64) {
+        // If Go is ahead of us, update our expectation
+        if go_last_block + 1 > self.next_expected {
+            // Remove any pending blocks that Go already processed
+            self.pending.retain(|&idx, _| idx > go_last_block);
+            self.next_expected = go_last_block + 1;
+        }
+    }
+
+    /// Number of pending commits in queue
+    fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// Handle to control the RustSyncNode
+#[allow(dead_code)]
+pub struct RustSyncHandle {
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    pub task_handle: tokio::task::JoinHandle<()>,
+}
+
+impl RustSyncHandle {
+    /// Create a new RustSyncHandle
+    pub fn new(shutdown_tx: oneshot::Sender<()>, task_handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            shutdown_tx: Some(shutdown_tx),
+            task_handle,
+        }
+    }
+
+    /// Stop the RustSyncNode gracefully
+    #[allow(dead_code)]
+    pub async fn stop(mut self) {
+        info!("🛑 [RUST-SYNC] Stopping...");
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        self.task_handle.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.task_handle).await;
+        info!("✅ [RUST-SYNC] Stopped");
+    }
+}
+
+/// Configuration for RustSyncNode
+pub struct RustSyncConfig {
+    pub fetch_interval_secs: u64,
+    pub fetch_batch_size: u32,
+    pub fetch_timeout_secs: u64,
+}
+
+impl Default for RustSyncConfig {
+    fn default() -> Self {
+        Self {
+            fetch_interval_secs: 2,
+            fetch_batch_size: 100,
+            fetch_timeout_secs: 10,
+        }
+    }
+}
+
+/// RustSyncNode - Syncs blocks from peers via P2P and sends to Go
+pub struct RustSyncNode {
+    executor_client: Arc<ExecutorClient>,
+    network_client: Option<Arc<TonicClient>>,
+    epoch_transition_sender: mpsc::UnboundedSender<(u64, u64, u64)>,
+    current_epoch: Arc<AtomicU64>,
+    #[allow(dead_code)]
+    last_synced_commit_index: Arc<AtomicU32>,
+    committee: Option<Committee>,
+    config: RustSyncConfig,
+    /// Queue for buffering and sequential block processing
+    block_queue: Arc<Mutex<BlockQueue>>,
+    /// Base global_exec_index for current epoch (commits in this epoch are indexed from 1)
+    /// epoch_local_commit_index = global_exec_index - epoch_base_index
+    epoch_base_index: Arc<AtomicU64>,
+}
+
+impl RustSyncNode {
+    /// Create a new RustSyncNode
+    /// epoch_base_index: the global_exec_index of the last block in the previous epoch
+    ///                   (boundary block). Commit index 1 in current epoch = epoch_base_index + 1
+    pub fn new(
+        executor_client: Arc<ExecutorClient>,
+        epoch_transition_sender: mpsc::UnboundedSender<(u64, u64, u64)>,
+        initial_epoch: u64,
+        initial_global_exec_index: u32,
+        epoch_base_index: u64,
+    ) -> Self {
+        info!(
+            "📊 [RUST-SYNC] Creating sync node: epoch={}, global_exec_index={}, epoch_base_index={}",
+            initial_epoch, initial_global_exec_index, epoch_base_index
+        );
+        Self {
+            executor_client,
+            network_client: None,
+            epoch_transition_sender,
+            current_epoch: Arc::new(AtomicU64::new(initial_epoch)),
+            last_synced_commit_index: Arc::new(AtomicU32::new(initial_global_exec_index)),
+            committee: None,
+            config: RustSyncConfig::default(),
+            block_queue: Arc::new(Mutex::new(BlockQueue::new(
+                initial_global_exec_index as u64,
+            ))),
+            epoch_base_index: Arc::new(AtomicU64::new(epoch_base_index)),
+        }
+    }
+
+    /// Initialize P2P networking with Context and NetworkKeyPair
+    pub fn with_network(
+        mut self,
+        context: Arc<Context>,
+        network_keypair: NetworkKeyPair,
+        committee: Committee,
+    ) -> Self {
+        let tonic_client = TonicClient::new(context, network_keypair);
+        self.network_client = Some(Arc::new(tonic_client));
+        self.committee = Some(committee);
+        self
+    }
+
+    /// Start the sync node
+    pub fn start(self) -> RustSyncHandle {
+        info!(
+            "🚀 [RUST-SYNC] Starting P2P block sync for epoch {}, commit_index={}",
+            self.current_epoch.load(Ordering::SeqCst),
+            self.last_synced_commit_index.load(Ordering::SeqCst)
+        );
+
+        let has_network = self.network_client.is_some();
+        if has_network {
+            info!("🌐 [RUST-SYNC] P2P networking initialized - will fetch from peers");
+        } else {
+            info!("⚠️ [RUST-SYNC] No P2P network - will only monitor Go progress");
+        }
+
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+        let task_handle = tokio::spawn(async move {
+            self.sync_loop(&mut shutdown_rx).await;
+        });
+
+        RustSyncHandle::new(shutdown_tx, task_handle)
+    }
+
+    /// Main sync loop - fetches commits from peers
+    async fn sync_loop(self, shutdown_rx: &mut oneshot::Receiver<()>) {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(self.config.fetch_interval_secs));
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = self.sync_once().await {
+                        warn!("[RUST-SYNC] Sync error: {}", e);
+                    }
+                }
+                _ = &mut *shutdown_rx => {
+                    info!("[RUST-SYNC] Shutdown signal received");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Single sync iteration using queue-based pattern:
+    /// 1. Sync queue with Go's progress (authoritative)
+    /// 2. Fetch commits from peers → push to queue
+    /// 3. Drain ready commits from queue → send to Go sequentially
+    async fn sync_once(&self) -> Result<()> {
+        // Get current state from Go - this is the AUTHORITATIVE source of truth
+        let go_last_block = self.executor_client.get_last_block_number().await?;
+        let go_epoch = self.executor_client.get_current_epoch().await?;
+
+        let rust_epoch = self.current_epoch.load(Ordering::SeqCst);
+        let epoch_base = self.epoch_base_index.load(Ordering::SeqCst);
+
+        // =====================================================================
+        // EPOCH DATA INTEGRITY CHECK
+        // Detect corrupted epoch boundary data that happens when:
+        // - Node advanced epoch via RPC while Go blocks were not synced
+        // - This causes epoch_base to be stuck at an old value (e.g., 4177)
+        // - But epoch is high (e.g., 7), making sync impossible
+        // =====================================================================
+        if rust_epoch > 0 && epoch_base > 0 && (go_last_block as u64) < epoch_base {
+            // This is a critical error state!
+            // go_last_block should be >= epoch_base for current epoch
+            // If go_last_block < epoch_base (strictly less, NOT equal), it means Go is behind the epoch boundary
+            // NOTE: go_last_block == epoch_base is VALID at epoch transition!
+            warn!(
+                "🚨 [RUST-SYNC] EPOCH DATA INTEGRITY ISSUE DETECTED! \
+                 go_block={} < epoch_base={} but epoch={}. \
+                 This indicates corrupted epoch boundary data (premature epoch advance).",
+                go_last_block, epoch_base, rust_epoch
+            );
+
+            // Try to refetch epoch boundary from Go Master
+            // This might help if Go state was corrected externally
+            if let Ok((_epoch, _timestamp, new_boundary, _validators)) = self
+                .executor_client
+                .get_epoch_boundary_data(rust_epoch)
+                .await
+            {
+                if new_boundary != epoch_base {
+                    info!(
+                        "🔄 [RUST-SYNC] Updating epoch_base_index: {} -> {} (from Go Master)",
+                        epoch_base, new_boundary
+                    );
+                    self.epoch_base_index.store(new_boundary, Ordering::SeqCst);
+                } else {
+                    // Even refetched data is same (corrupted) - try peer discovery!
+                    warn!(
+                        "⚠️ [RUST-SYNC] Go local data still corrupted. Attempting peer discovery for epoch {}...",
+                        rust_epoch
+                    );
+
+                    // Build peer RPC addresses from committee
+                    if let Some(ref committee) = self.committee {
+                        let peer_addresses: Vec<String> = committee
+                            .authorities()
+                            .filter_map(|(_, auth)| {
+                                // Extract host and use peer_rpc_port (8XXX pattern)
+                                // Consensus address format: /dns/host/tcp/port
+                                let addr_str = auth.address.to_string();
+                                if let Some(host) = addr_str.split('/').nth(2) {
+                                    // Use peer RPC port 8000-base pattern
+                                    // Node 0: 8000, Node 1: 8001, etc.
+                                    // Extract node index from port or use pre-configured ports
+                                    Some(format!("{}:8000", host))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        if !peer_addresses.is_empty() {
+                            // Query peers for correct epoch boundary
+                            match query_peer_epochs_network(&peer_addresses).await {
+                                Ok((peer_epoch, peer_block, best_peer)) => {
+                                    info!(
+                                        "🌐 [PEER-DISCOVERY] Best peer: epoch={}, block={}, addr={}",
+                                        peer_epoch, peer_block, best_peer
+                                    );
+
+                                    // If peer has the same epoch, query epoch boundary data
+                                    if peer_epoch == rust_epoch {
+                                        match query_peer_epoch_boundary_data(&best_peer, rust_epoch)
+                                            .await
+                                        {
+                                            Ok(boundary_data) => {
+                                                let peer_boundary = boundary_data.boundary_block;
+                                                if peer_boundary > epoch_base {
+                                                    info!(
+                                                        "✅ [PEER-DISCOVERY] Correcting epoch_base_index: {} -> {} (from peer {})",
+                                                        epoch_base, peer_boundary, best_peer
+                                                    );
+                                                    self.epoch_base_index
+                                                        .store(peer_boundary, Ordering::SeqCst);
+                                                } else {
+                                                    warn!(
+                                                        "⚠️ [PEER-DISCOVERY] Peer boundary {} not better than local {}",
+                                                        peer_boundary, epoch_base
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("⚠️ [PEER-DISCOVERY] Failed to get epoch boundary from peer: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("⚠️ [PEER-DISCOVERY] No peers responded: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    // If still not fixed, log error
+                    let current_base = self.epoch_base_index.load(Ordering::SeqCst);
+                    if go_last_block as u64 <= current_base {
+                        error!(
+                            "❌ [RUST-SYNC] CRITICAL: Epoch boundary data is still corrupted! \
+                             epoch={}, boundary={}, go_block={}. \
+                             MANUAL FIX REQUIRED: Clear epoch data in Go and restart node.",
+                            rust_epoch, current_base, go_last_block
+                        );
+                    }
+                }
+            }
+        }
+
+        // PHASE 1: Sync queue with Go's progress
+        {
+            let mut queue = self.block_queue.lock().await;
+            queue.sync_with_go(go_last_block as u64);
+
+            let pending = queue.pending_count();
+            let next_expected = queue.next_expected();
+
+            // CRITICAL DEBUG: Log at INFO level to understand queue state
+            info!(
+                "[RUST-SYNC] State after sync_with_go: go_block={}, go_epoch={}, queue_next_expected={}, pending_count={}, epoch_base={}",
+                go_last_block,
+                go_epoch,
+                next_expected,
+                pending,
+                self.epoch_base_index.load(Ordering::SeqCst),
+            );
+        }
+
+        // PHASE 2: Fetch commits from peers and push to queue
+        if let Some(ref network_client) = self.network_client {
+            if let Some(ref committee) = self.committee {
+                let fetch_from_index = {
+                    let queue = self.block_queue.lock().await;
+                    queue.next_expected() - 1 // Fetch from the block before what we need
+                };
+
+                info!(
+                    "[RUST-SYNC] PHASE 2: Fetching from index {} (committee has {} authorities)",
+                    fetch_from_index,
+                    committee.size()
+                );
+
+                match self
+                    .fetch_and_queue(network_client, committee, fetch_from_index as u32)
+                    .await
+                {
+                    Ok(pushed) => {
+                        if pushed == 0 {
+                            debug!("[RUST-SYNC] PHASE 2: No commits fetched this iteration");
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[RUST-SYNC] PHASE 2 Fetch error: {}, will retry", e);
+                    }
+                }
+            } else {
+                warn!("[RUST-SYNC] PHASE 2 SKIPPED: committee is None");
+            }
+        } else {
+            warn!("[RUST-SYNC] PHASE 2 SKIPPED: network_client is None");
+        }
+
+        // PHASE 3: Drain ready commits from queue and send to Go
+        let blocks_sent = self.process_queue().await?;
+        if blocks_sent > 0 {
+            info!(
+                "📥 [RUST-SYNC] Sent {} blocks to Go (queue-based)",
+                blocks_sent
+            );
+        }
+
+        // =============================================================================
+        // PHASE 4: Check pending epoch transitions (from deferred AdvanceEpoch)
+        // If sync has caught up to a pending transition's boundary, process it now
+        // =============================================================================
+        self.check_and_process_pending_epoch_transitions(go_last_block)
+            .await;
+
+        // Check epoch transition based on Go's progress
+        if go_epoch > rust_epoch {
+            info!(
+                "🎯 [RUST-SYNC] Epoch advance detected: {} -> {}",
+                rust_epoch, go_epoch
+            );
+
+            if let Ok((epoch, timestamp, boundary_block, _)) =
+                self.executor_client.get_epoch_boundary_data(go_epoch).await
+            {
+                if let Err(e) =
+                    self.epoch_transition_sender
+                        .send((epoch, timestamp, boundary_block))
+                {
+                    warn!("[RUST-SYNC] Failed to send transition: {}", e);
+                } else {
+                    info!(
+                        "✅ [RUST-SYNC] Sent epoch transition: {} -> {} at block {}",
+                        rust_epoch, go_epoch, boundary_block
+                    );
+                    self.current_epoch.store(go_epoch, Ordering::SeqCst);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn fetch_and_queue(
+        &self,
+        network_client: &Arc<TonicClient>,
+        committee: &Committee,
+        from_global_exec_index: u32,
+    ) -> Result<usize> {
+        let timeout = Duration::from_secs(self.config.fetch_timeout_secs);
+        let batch_size = self.config.fetch_batch_size;
+        let current_epoch = self.current_epoch.load(Ordering::SeqCst);
+        let epoch_base = self.epoch_base_index.load(Ordering::SeqCst);
+
+        // 🔍 DIAGNOSTIC: Log all key parameters for debugging cross-epoch sync issues
+        info!(
+            "🔍 [RUST-SYNC-DIAG] fetch_and_queue called: from_global={}, epoch_base={}, current_epoch={}, queue_next_expected={}",
+            from_global_exec_index, epoch_base, current_epoch, from_global_exec_index + 1
+        );
+
+        // CRITICAL FIX: Convert global_exec_index to epoch-local commit_index
+        // In each epoch, commit_index starts from 1, not from global_exec_index
+        // Formula: epoch_local_commit_index = global_exec_index - epoch_base_index
+        //
+        // BOUNDARY CONDITION FIX: Use >= instead of >
+        // When from_global_exec_index == epoch_base (e.g., both are 4177):
+        //   - We need to fetch from commit 1 of current epoch
+        //   - from_local_commit = 4177 - 4177 = 0
+        //   - commit_range = CommitRange(1..=100) ← CORRECT!
+        let from_local_commit = if from_global_exec_index as u64 >= epoch_base {
+            // Normal case: requesting blocks within current epoch
+            (from_global_exec_index as u64 - epoch_base) as u32
+        } else if current_epoch == 1 && epoch_base > 0 {
+            // CROSS-EPOCH FIX: Need blocks from epoch 0 (while in epoch 1)
+            // Epoch 0's base is 0, so commit_index = global_exec_index
+            // Peers will serve this from their LegacyEpochStoreManager.
+            warn!(
+                 "[RUST-SYNC] Fetching pre-epoch blocks for Epoch 1 transition: global={}, epoch_base={}",
+                 from_global_exec_index, epoch_base
+             );
+            from_global_exec_index
+        } else {
+            // ⚠️ CROSS-EPOCH GAP: from_global_exec_index < epoch_base AND epoch > 1
+            // Use the new global range RPC to fetch commits directly by global index!
+            warn!(
+                "🔄 [RUST-SYNC] CROSS-EPOCH GAP: Go block {} < epoch_base {} (epoch {}). \
+                 Using fetch_commits_by_global_range RPC.",
+                from_global_exec_index, epoch_base, current_epoch
+            );
+
+            // Use global range RPC - it handles epoch boundaries transparently
+            return self
+                .fetch_and_queue_by_global_range(
+                    network_client,
+                    committee,
+                    from_global_exec_index as u64,
+                    (from_global_exec_index + batch_size) as u64,
+                )
+                .await;
+        };
+
+        let commit_range =
+            CommitRange::new((from_local_commit + 1)..=(from_local_commit + batch_size));
+
+        info!(
+            "[RUST-SYNC] Fetching: global_exec_index={} -> epoch_local_commit={} (epoch_base={}), range={:?}",
+            from_global_exec_index, from_local_commit, epoch_base, commit_range
+        );
+
+        // Try each validator in turn until we succeed
+        for (authority_idx, _authority) in committee.authorities() {
+            trace!(
+                "[RUST-SYNC] Fetching commits {:?} from peer {}",
+                commit_range,
+                authority_idx
+            );
+
+            match network_client
+                .fetch_commits(authority_idx, commit_range.clone(), timeout)
+                .await
+            {
+                Ok((serialized_commits, _certifier_blocks)) => {
+                    if serialized_commits.is_empty() {
+                        debug!(
+                            "[RUST-SYNC] Peer {} returned empty commits for range {:?}",
+                            authority_idx, commit_range
+                        );
+                        continue;
+                    }
+
+                    // Phase 1: Deserialize commits to get block references
+                    let mut all_block_refs = Vec::new();
+                    let mut temp_commits = Vec::new();
+
+                    for serialized in &serialized_commits {
+                        match bcs::from_bytes::<Commit>(serialized) {
+                            Ok(commit) => {
+                                // Collect all block refs from this commit
+                                for block_ref in commit.blocks() {
+                                    all_block_refs.push(block_ref.clone());
+                                }
+                                temp_commits.push(commit);
+                            }
+                            Err(e) => {
+                                warn!("[RUST-SYNC] Failed to deserialize commit: {}", e);
+                            }
+                        }
+                    }
+
+                    if all_block_refs.is_empty() {
+                        info!(
+                            "📥 [RUST-SYNC] Fetched {} commits with 0 block refs from peer {}",
+                            serialized_commits.len(),
+                            authority_idx
+                        );
+                    } else {
+                        info!(
+                            "📥 [RUST-SYNC] Fetched {} commits with {} block refs from peer {}, fetching actual blocks...",
+                            serialized_commits.len(),
+                            all_block_refs.len(),
+                            authority_idx
+                        );
+                    }
+
+                    // Phase 2: Fetch actual DAG blocks using fetch_blocks API
+                    let mut block_map = std::collections::HashMap::new();
+
+                    if !all_block_refs.is_empty() {
+                        // Deduplicate block refs
+                        all_block_refs.sort();
+                        all_block_refs.dedup();
+
+                        match network_client
+                            .fetch_blocks(
+                                authority_idx,
+                                all_block_refs.clone(),
+                                vec![], // No highest_accepted_rounds for commit sync
+                                false,  // Not breadth first
+                                timeout,
+                            )
+                            .await
+                        {
+                            Ok(serialized_blocks) => {
+                                info!(
+                                    "📦 [RUST-SYNC] Fetched {} actual blocks from peer {}",
+                                    serialized_blocks.len(),
+                                    authority_idx
+                                );
+
+                                for serialized in &serialized_blocks {
+                                    match bcs::from_bytes::<SignedBlock>(serialized) {
+                                        Ok(signed_block) => {
+                                            let verified = VerifiedBlock::new_verified(
+                                                signed_block,
+                                                serialized.clone(),
+                                            );
+                                            block_map.insert(verified.reference(), verified);
+                                        }
+                                        Err(e) => {
+                                            warn!("[RUST-SYNC] Failed to deserialize block: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "⚠️ [RUST-SYNC] Failed to fetch blocks from peer {}: {:?}",
+                                    authority_idx, e
+                                );
+                            }
+                        }
+                    }
+
+                    // Phase 3: Push commits with their blocks to queue
+                    let mut pushed = 0;
+                    {
+                        let mut queue = self.block_queue.lock().await;
+
+                        for commit in temp_commits {
+                            // Collect blocks for this commit
+                            let mut commit_blocks = Vec::new();
+                            for block_ref in commit.blocks() {
+                                if let Some(block) = block_map.get(block_ref) {
+                                    commit_blocks.push(block.clone());
+                                }
+                            }
+
+                            let expected_blocks = commit.blocks().len();
+                            let actual_blocks = commit_blocks.len();
+
+                            if actual_blocks < expected_blocks {
+                                debug!(
+                                    "[RUST-SYNC] Commit {} has {}/{} blocks",
+                                    commit.index(),
+                                    actual_blocks,
+                                    expected_blocks
+                                );
+                            }
+
+                            // Log commit details to debug missing blocks
+                            let global_idx = commit.global_exec_index();
+                            let commit_idx = commit.index();
+                            let next_expected = queue.next_expected();
+                            let will_add = global_idx >= next_expected
+                                && !queue.pending.contains_key(&global_idx);
+
+                            // 🔍 DIAGNOSTIC: Detect gap and trigger global range fallback
+                            let gap = if global_idx > next_expected {
+                                global_idx - next_expected
+                            } else {
+                                0
+                            };
+                            if gap > 10 && pushed == 0 {
+                                // First commit has a huge gap - need to use global range RPC!
+                                warn!(
+                                    "🔄 [RUST-SYNC] GAP DETECTED! commit[{}].global_exec_index={} but queue_next_expected={}. \
+                                     Gap size: {} blocks. Falling back to global range RPC to fetch missing blocks!",
+                                    commit_idx, global_idx, next_expected, gap
+                                );
+                                // Early return - caller will detect 0 pushed and caller (sync_tick)
+                                // will use from_global_exec_index from Go which is correct
+                                // We need to use global range RPC for these missing blocks
+                                drop(queue); // Release lock before calling RPC
+
+                                // Fallback: fetch missing blocks using global range RPC
+                                return self
+                                    .fetch_and_queue_by_global_range(
+                                        network_client,
+                                        committee,
+                                        next_expected,
+                                        global_idx.saturating_sub(1),
+                                    )
+                                    .await;
+                            }
+
+                            if pushed < 5 || (global_idx <= 5) {
+                                info!(
+                                    "📋 [RUST-SYNC] Commit: commit_index={}, global_exec_index={}, blocks={}, will_add={}, queue_next_expected={}{}",
+                                    commit_idx, global_idx, actual_blocks, will_add, next_expected,
+                                    if !will_add { " ⚠️ REJECTED (global_idx < next_expected or already pending)" } else { "" }
+                                );
+                            }
+
+                            // Push to queue - it will deduplicate and sort automatically
+                            queue.push(CommitData {
+                                commit,
+                                blocks: commit_blocks,
+                                epoch: current_epoch,
+                            });
+                            pushed += 1;
+                        }
+                    }
+
+                    info!(
+                        "✅ [RUST-SYNC] Pushed {} commits with {} blocks to queue",
+                        pushed,
+                        block_map.len()
+                    );
+
+                    return Ok(pushed);
+                }
+                Err(e) => {
+                    debug!("[RUST-SYNC] Peer {} fetch failed: {:?}", authority_idx, e);
+                    continue;
+                }
+            }
+        }
+
+        // Fallback: If standard fetch returned 0 commits, it might be due to epoch mismatch
+        // (e.g., we are in Epoch 0, Peer is in Epoch 1, so local commit index lookup fails).
+        // Try fetching by global index range which works across epochs.
+        warn!(
+            "⚠️ [RUST-SYNC] Standard fetch returned 0 commits for global_index={}. \
+             Peer might be on a different epoch. Falling back to global range sync!",
+            from_global_exec_index
+        );
+
+        self.fetch_and_queue_by_global_range(
+            network_client,
+            committee,
+            from_global_exec_index as u64,
+            (from_global_exec_index + batch_size) as u64,
+        )
+        .await
+    }
+
+    /// Fetch commits using global execution index range (cross-epoch safe)
+    /// This bypasses epoch-local coordinate conversion entirely
+    async fn fetch_and_queue_by_global_range(
+        &self,
+        network_client: &Arc<TonicClient>,
+        committee: &Committee,
+        start_global_index: u64,
+        end_global_index: u64,
+    ) -> Result<usize> {
+        let timeout = Duration::from_secs(self.config.fetch_timeout_secs);
+        let current_epoch = self.current_epoch.load(Ordering::SeqCst);
+
+        info!(
+            "🌐 [GLOBAL-SYNC] Fetching commits by global range [{}, {}]",
+            start_global_index, end_global_index
+        );
+
+        // Try each validator in turn until we succeed
+        for (authority_idx, _authority) in committee.authorities() {
+            match network_client
+                .fetch_commits_by_global_range(
+                    authority_idx,
+                    start_global_index,
+                    end_global_index,
+                    timeout,
+                )
+                .await
+            {
+                Ok(global_commits) => {
+                    if global_commits.is_empty() {
+                        debug!(
+                            "[GLOBAL-SYNC] Peer {} returned empty commits for range [{}, {}]",
+                            authority_idx, start_global_index, end_global_index
+                        );
+                        continue;
+                    }
+
+                    info!(
+                        "📥 [GLOBAL-SYNC] Got {} commits from peer {} for global range [{}, {}]",
+                        global_commits.len(),
+                        authority_idx,
+                        start_global_index,
+                        end_global_index
+                    );
+
+                    // Collect block refs from all commits
+                    let mut all_block_refs: Vec<consensus_types::block::BlockRef> = Vec::new();
+                    let mut temp_commits: Vec<(GlobalCommitInfo, Commit)> = Vec::new();
+
+                    for global_info in global_commits {
+                        // Deserialize the commit
+                        match bcs::from_bytes::<Commit>(&global_info.commit_data) {
+                            Ok(commit) => {
+                                // Collect block refs
+                                for block_ref in commit.blocks() {
+                                    all_block_refs.push(block_ref.clone());
+                                }
+                                temp_commits.push((global_info, commit));
+                            }
+                            Err(e) => {
+                                warn!("[GLOBAL-SYNC] Failed to deserialize commit: {}", e);
+                            }
+                        }
+                    }
+
+                    // Fetch actual blocks
+                    let mut block_map = std::collections::HashMap::new();
+                    if !all_block_refs.is_empty() {
+                        all_block_refs.sort();
+                        all_block_refs.dedup();
+
+                        // Convert CommitRef to BlockRef for fetch_blocks
+                        let block_refs_for_fetch: Vec<_> = all_block_refs
+                            .iter()
+                            .filter_map(|cr| {
+                                // CommitRef is actually BlockRef in this context
+                                Some(cr.clone())
+                            })
+                            .collect();
+
+                        match network_client
+                            .fetch_blocks(
+                                authority_idx,
+                                block_refs_for_fetch,
+                                vec![],
+                                false,
+                                timeout,
+                            )
+                            .await
+                        {
+                            Ok(serialized_blocks) => {
+                                for serialized in &serialized_blocks {
+                                    match bcs::from_bytes::<SignedBlock>(serialized) {
+                                        Ok(signed_block) => {
+                                            let verified = VerifiedBlock::new_verified(
+                                                signed_block,
+                                                serialized.clone(),
+                                            );
+                                            block_map.insert(verified.reference(), verified);
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "[GLOBAL-SYNC] Failed to deserialize block: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("[GLOBAL-SYNC] Failed to fetch blocks: {:?}", e);
+                            }
+                        }
+                    }
+
+                    // Push commits with their blocks to queue
+                    let mut pushed = 0;
+                    {
+                        let mut queue = self.block_queue.lock().await;
+
+                        for (global_info, commit) in temp_commits {
+                            let mut commit_blocks = Vec::new();
+                            for block_ref in commit.blocks() {
+                                if let Some(block) = block_map.get(block_ref) {
+                                    commit_blocks.push(block.clone());
+                                }
+                            }
+
+                            let epoch_from_peer = global_info.epoch;
+                            let global_idx = global_info.global_exec_index;
+
+                            info!(
+                                "📋 [GLOBAL-SYNC] Commit: global_exec_index={}, epoch={}, local_commit={}, blocks={}",
+                                global_idx, epoch_from_peer, global_info.local_commit_index, commit_blocks.len()
+                            );
+
+                            queue.push(CommitData {
+                                commit,
+                                blocks: commit_blocks,
+                                epoch: epoch_from_peer,
+                            });
+                            pushed += 1;
+                        }
+                    }
+
+                    info!(
+                        "✅ [GLOBAL-SYNC] Pushed {} commits via global range RPC",
+                        pushed
+                    );
+
+                    return Ok(pushed);
+                }
+                Err(e) => {
+                    debug!("[GLOBAL-SYNC] Peer {} fetch failed: {:?}", authority_idx, e);
+                    continue;
+                }
+            }
+        }
+
+        warn!(
+            "[GLOBAL-SYNC] All peers failed for global range [{}, {}]",
+            start_global_index, end_global_index
+        );
+        Ok(0)
+    }
+
+    /// Process queue - drain ready commits and send to Go sequentially (Phase 3)
+    async fn process_queue(&self) -> Result<u32> {
+        let mut ready_commits = {
+            let mut queue = self.block_queue.lock().await;
+            queue.drain_ready()
+        };
+
+        if ready_commits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut blocks_sent = 0u32;
+        let mut failed_at: Option<usize> = None;
+
+        for (idx, commit_data) in ready_commits.iter().enumerate() {
+            // Construct CommittedSubDag
+            let subdag = CommittedSubDag::new(
+                commit_data.commit.leader(),
+                commit_data.blocks.clone(),
+                commit_data.commit.timestamp_ms(),
+                CommitRef::new(
+                    commit_data.commit.index(),
+                    consensus_core::CommitDigest::MIN,
+                ),
+                commit_data.commit.global_exec_index(),
+            );
+
+            // Send to Go executor - MUST succeed before continuing
+            match self
+                .executor_client
+                .send_committed_subdag(
+                    &subdag,
+                    commit_data.epoch,
+                    commit_data.commit.global_exec_index(),
+                    None, // leader_address - let Go lookup from index
+                )
+                .await
+            {
+                Ok(_) => {
+                    debug!(
+                        "✅ [RUST-SYNC] Sent block {} (commit {}) to Go",
+                        commit_data.commit.global_exec_index(),
+                        commit_data.commit.index()
+                    );
+                    blocks_sent += 1;
+                    // commit_data will be dropped after loop when we truncate
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [RUST-SYNC] Failed to send block {} to Go: {}. Re-queuing {} commits.",
+                        commit_data.commit.global_exec_index(),
+                        e,
+                        ready_commits.len() - idx
+                    );
+                    failed_at = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        // Re-queue all unprocessed commits (from failed_at to end)
+        if let Some(start_idx) = failed_at {
+            let mut queue = self.block_queue.lock().await;
+            // Drain unprocessed commits and re-queue them
+            for commit_data in ready_commits.drain(start_idx..) {
+                queue.push(commit_data);
+            }
+        }
+        // Successfully processed commits are now dropped, freeing memory
+
+        Ok(blocks_sent)
+    }
+
+    /// Check and process pending epoch transitions (from deferred AdvanceEpoch)
+    /// This is called after processing sync queue - if Go has synced up to a pending
+    /// transition's boundary, we can now safely advance the epoch.
+    async fn check_and_process_pending_epoch_transitions(&self, go_last_block: u64) {
+        // Access the global ConsensusNode to check pending transitions
+        use crate::node::get_transition_handler_node;
+
+        if let Some(node) = get_transition_handler_node().await {
+            let mut pending_to_process = Vec::new();
+
+            // Scope the lock to avoid holding it across the advance_epoch call
+            {
+                let node_guard = node.lock().await;
+                let mut pending = node_guard.pending_epoch_transitions.lock().await;
+
+                // Check each pending transition
+                let mut processed_indices = Vec::new();
+                for (idx, trans) in pending.iter().enumerate() {
+                    // =============================================================================
+                    // CRITICAL FIX: Update epoch_base IMMEDIATELY from pending queue!
+                    // This allows sync to fetch commits from the new epoch, even before Go catches up.
+                    // Without this, sync tries to fetch from old epoch which peers have already purged.
+                    // =============================================================================
+                    let current_base = self.epoch_base_index.load(Ordering::SeqCst);
+                    let current_epoch = self.current_epoch.load(Ordering::SeqCst);
+
+                    if trans.epoch > current_epoch || trans.boundary_block > current_base {
+                        info!(
+                            "🔄 [DEFERRED EPOCH] Updating RustSyncNode to epoch {} (base {} -> {}) for fetching",
+                            trans.epoch, current_base, trans.boundary_block
+                        );
+                        self.current_epoch.store(trans.epoch, Ordering::SeqCst);
+                        self.epoch_base_index
+                            .store(trans.boundary_block, Ordering::SeqCst);
+                    }
+
+                    if go_last_block >= trans.boundary_block {
+                        info!(
+                            "✅ [DEFERRED EPOCH] Sync complete! Go block {} >= boundary {}. \
+                             Processing epoch {} transition.",
+                            go_last_block, trans.boundary_block, trans.epoch
+                        );
+                        pending_to_process.push(trans.clone());
+                        processed_indices.push(idx);
+                    } else {
+                        info!(
+                            "⏳ [DEFERRED EPOCH] Still waiting for sync. Go block {} < boundary {} for epoch {}.",
+                            go_last_block, trans.boundary_block, trans.epoch
+                        );
+                    }
+                }
+
+                // Remove processed transitions (in reverse order to preserve indices)
+                for idx in processed_indices.into_iter().rev() {
+                    pending.remove(idx);
+                }
+            }
+
+            // Process transitions outside the lock
+            for trans in pending_to_process {
+                info!(
+                    "📤 [DEFERRED EPOCH] Now calling advance_epoch for epoch {} (boundary: {})",
+                    trans.epoch, trans.boundary_block
+                );
+
+                if let Err(e) = self
+                    .executor_client
+                    .advance_epoch(trans.epoch, trans.timestamp_ms, trans.boundary_block)
+                    .await
+                {
+                    warn!(
+                        "⚠️ [DEFERRED EPOCH] Failed to advance epoch {}: {}. Will retry next sync cycle.",
+                        trans.epoch, e
+                    );
+
+                    // Re-queue if failed
+                    if let Some(node) = get_transition_handler_node().await {
+                        let node_guard = node.lock().await;
+                        let mut pending = node_guard.pending_epoch_transitions.lock().await;
+                        pending.push(trans);
+                    }
+                } else {
+                    info!(
+                        "✅ [DEFERRED EPOCH] Successfully advanced to epoch {} with boundary {}",
+                        trans.epoch, trans.boundary_block
+                    );
+
+                    // Update Rust epoch tracker
+                    self.current_epoch.store(trans.epoch, Ordering::SeqCst);
+                    self.epoch_base_index
+                        .store(trans.boundary_block, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+}
+
+// =======================
+// Helper for creating RustSyncNode from ConsensusNode
+// =======================
+
+/// Start the Rust P2P sync task for SyncOnly nodes
+#[allow(dead_code)]
+pub async fn start_rust_sync_task(
+    executor_client: Arc<ExecutorClient>,
+    epoch_transition_sender: mpsc::UnboundedSender<(u64, u64, u64)>,
+    initial_epoch: u64,
+    initial_commit_index: u32,
+    epoch_base_index: u64,
+) -> Result<RustSyncHandle> {
+    info!("🚀 [RUST-SYNC] Starting Rust P2P sync task");
+
+    let sync_node = RustSyncNode::new(
+        executor_client,
+        epoch_transition_sender,
+        initial_epoch,
+        initial_commit_index,
+        epoch_base_index,
+    );
+
+    Ok(sync_node.start())
+}
+
+/// Start the Rust P2P sync task with full networking support
+pub async fn start_rust_sync_task_with_network(
+    executor_client: Arc<ExecutorClient>,
+    epoch_transition_sender: mpsc::UnboundedSender<(u64, u64, u64)>,
+    initial_epoch: u64,
+    _initial_commit_index: u32, // Deprecated - we now use go_last_block for queue initialization
+    context: Arc<Context>,
+    network_keypair: NetworkKeyPair,
+    committee: Committee,
+) -> Result<RustSyncHandle> {
+    info!("🚀 [RUST-SYNC] Starting Rust P2P sync task with network");
+
+    // CRITICAL FIX: Get Go's last block number to initialize BlockQueue correctly
+    // BlockQueue uses global_exec_index, NOT commit_index, so we need go_last_block + 1
+    let go_last_block = executor_client.get_last_block_number().await.unwrap_or(0);
+    let initial_global_exec_index = go_last_block as u32 + 1;
+
+    // CRITICAL FIX: Get epoch boundary data to calculate epoch_base_index
+    // This is needed to convert global_exec_index to epoch-local commit_index when fetching
+    let epoch_base_index = match executor_client.get_epoch_boundary_data(initial_epoch).await {
+        Ok((_epoch, _timestamp_ms, boundary_block, _validators)) => {
+            // boundary_block is the global_exec_index of the last block in the previous epoch
+            // For epoch 0, boundary_block is 0
+            // For epoch 1, boundary_block is the last block of epoch 0 (e.g., 3633)
+            info!(
+                "📊 [RUST-SYNC] Got epoch_base_index={} from GetEpochBoundaryData for epoch {}",
+                boundary_block, initial_epoch
+            );
+            boundary_block
+        }
+        Err(e) => {
+            // Fallback: assume epoch 0, base = 0
+            warn!(
+                "[RUST-SYNC] Failed to get epoch boundary data for epoch {}: {:?}, using base=0",
+                initial_epoch, e
+            );
+            0
+        }
+    };
+
+    info!(
+        "📊 [RUST-SYNC] Initializing BlockQueue with next_expected={} (go_last_block={}), epoch_base_index={}",
+        initial_global_exec_index, go_last_block, epoch_base_index
+    );
+
+    let sync_node = RustSyncNode::new(
+        executor_client,
+        epoch_transition_sender,
+        initial_epoch,
+        initial_global_exec_index, // Use global_exec_index, not commit_index
+        epoch_base_index,
+    )
+    .with_network(context, network_keypair, committee);
+
+    Ok(sync_node.start())
+}

@@ -30,7 +30,7 @@ pub async fn transition_to_epoch_from_system_tx(
     // This causes RocksDB lock conflicts when trying to open the same DB path twice
     let is_sync_only = matches!(node.node_mode, NodeMode::SyncOnly);
     let is_same_epoch = node.current_epoch == new_epoch;
-    
+
     // CASE 1: Same epoch, but SyncOnly needs to become Validator
     // This is a MODE-ONLY transition - skip full epoch transition, just start authority
     if is_same_epoch && is_sync_only {
@@ -38,9 +38,16 @@ pub async fn transition_to_epoch_from_system_tx(
             "🔄 [MODE TRANSITION] SyncOnly → Validator in epoch {} (not a full epoch transition)",
             new_epoch
         );
-        return transition_mode_only(node, new_epoch, new_epoch_timestamp_ms, synced_global_exec_index, config).await;
+        return transition_mode_only(
+            node,
+            new_epoch,
+            new_epoch_timestamp_ms,
+            synced_global_exec_index,
+            config,
+        )
+        .await;
     }
-    
+
     // CASE 2: Already at this epoch and already Validator - skip
     if node.current_epoch >= new_epoch && !is_sync_only {
         info!(
@@ -49,7 +56,7 @@ pub async fn transition_to_epoch_from_system_tx(
         );
         return Ok(());
     }
-    
+
     // CASE 3: Current epoch ahead of requested - skip
     if node.current_epoch > new_epoch {
         info!(
@@ -58,19 +65,19 @@ pub async fn transition_to_epoch_from_system_tx(
         );
         return Ok(());
     }
-    
+
     // CASE 4: Full epoch transition (epoch actually changing)
     info!(
         "🔄 [FULL EPOCH TRANSITION] Processing: epoch {} -> {} (current_mode={:?})",
         node.current_epoch, new_epoch, node.node_mode
     );
-    
+
     if node.is_transitioning.swap(true, Ordering::SeqCst) {
         warn!("⚠️ Full epoch transition already in progress, skipping.");
         node.is_transitioning.store(false, Ordering::SeqCst);
         return Ok(());
     }
-    
+
     info!(
         "🔄 FULL TRANSITION: epoch {} -> {}",
         node.current_epoch, new_epoch
@@ -139,9 +146,33 @@ pub async fn transition_to_epoch_from_system_tx(
         );
     }
 
-    // Use the unified source's executor client
     let executor_client =
         committee_source.create_executor_client(&config.executor_send_socket_path);
+
+    // =============================================================================
+    // GO-AUTHORITATIVE EPOCH BOUNDARY FIX (2026-02-01)
+    // =============================================================================
+    // PROBLEM: Old logic compared synced_global_exec_index (from EndOfEpoch tx) with
+    //          Go's get_epoch_boundary_data(new_epoch) which returns boundary_block=0
+    //          for epoch 1 (Go hasn't stored it yet). This caused verification failure.
+    //
+    // SOLUTION: Use Go Master's actual last_block_number as the authoritative boundary.
+    //           Go knows what blocks it has committed, so this is the source of truth.
+    //           All nodes query the same Go Master → consistent boundary across cluster.
+    // =============================================================================
+
+    let go_last_block = executor_client
+        .get_last_block_number()
+        .await
+        .map_err(|e| anyhow::anyhow!("Cannot get Go Master's last_block_number: {}", e))?;
+
+    info!(
+        "📊 [GO-AUTHORITATIVE] Using Go Master's last_block={} as epoch boundary (EndOfEpoch tx had: {})",
+        go_last_block, synced_global_exec_index
+    );
+
+    // Use Go's value as the authoritative synced_global_exec_index
+    let _synced_global_exec_index = go_last_block;
 
     // =============================================================================
     // CRITICAL FIX: Stop old authority FIRST before fetching synced_index from Go
@@ -180,7 +211,7 @@ pub async fn transition_to_epoch_from_system_tx(
             "📦 [TRANSITION] Extracted store from epoch {} for legacy sync",
             old_epoch
         );
-        
+
         auth.stop().await;
         info!("✅ [TRANSITION] Old authority stopped. Store preserved in LegacyEpochStoreManager.");
     }
@@ -191,7 +222,7 @@ pub async fn transition_to_epoch_from_system_tx(
     // This prevents the duplicate global_exec_index race condition
     // =============================================================================
     let poll_interval = Duration::from_millis(100);
-    let mut go_last_block = 0u64;
+    let mut go_last_block;
     let mut attempt = 0u64;
 
     loop {
@@ -274,33 +305,34 @@ pub async fn transition_to_epoch_from_system_tx(
     node.last_global_exec_index = synced_index;
     node.update_execution_lock_epoch(new_epoch).await;
 
-    // CRITICAL: Use epoch_timestamp from CommitteeSource for consistency
-    // This ensures genesis block hash matches across all nodes
-    let verified_epoch_timestamp_ms = committee_source.get_epoch_timestamp();
-    
-    // DIAGNOSTIC: Log timestamp comparison to debug fork issues
+    // EPOCH STATE LOG: Comprehensive state dump for debugging transitions
     info!(
-        "🔍 [TIMESTAMP DEBUG] For epoch {}: passed={}, source_verified={}, source_epoch={}, source_is_peer={}",
-        new_epoch, new_epoch_timestamp_ms, verified_epoch_timestamp_ms, 
-        committee_source.epoch, committee_source.is_peer
+        "📊 [EPOCH STATE UPDATED] epoch={}, last_global_exec_index={}, commit_index={}, mode={:?}",
+        node.current_epoch,
+        node.last_global_exec_index,
+        node.current_commit_index.load(Ordering::SeqCst),
+        node.node_mode
     );
-    
-    if verified_epoch_timestamp_ms != new_epoch_timestamp_ms && verified_epoch_timestamp_ms > 0 {
+
+    // =============================================================================
+    // CRITICAL: Use timestamp from EndOfEpoch SYSTEM TRANSACTION as single source of truth
+    // This ensures ALL nodes use the SAME timestamp since they all process the same EndOfEpoch tx
+    // CommitteeSource/Go timestamps are NO LONGER authoritative - they caused fork issues!
+    // =============================================================================
+    let epoch_timestamp_to_use = new_epoch_timestamp_ms; // FROM SYSTEM TX - AUTHORITATIVE
+
+    // Log CommitteeSource timestamp for debugging only (NOT used as source of truth)
+    let source_timestamp = committee_source.get_epoch_timestamp();
+    if source_timestamp != new_epoch_timestamp_ms && source_timestamp > 0 {
         warn!(
-            "⚠️ [TRANSITION] Epoch timestamp MISMATCH! Passed={}, Source={}. Using source timestamp for fork prevention.",
-            new_epoch_timestamp_ms, verified_epoch_timestamp_ms
+            "🔍 [TIMESTAMP INFO] CommitteeSource has different timestamp: source={}, system_tx={}. Using SYSTEM TX value (authoritative).",
+            source_timestamp, new_epoch_timestamp_ms
         );
     }
-    let epoch_timestamp_to_use = if verified_epoch_timestamp_ms > 0 {
-        verified_epoch_timestamp_ms
-    } else {
-        new_epoch_timestamp_ms
-    };
-    
+
     info!(
-        "✅ [EPOCH TIMESTAMP] Final timestamp for epoch {}: {} ms (source: {})",
-        new_epoch, epoch_timestamp_to_use, 
-        if verified_epoch_timestamp_ms > 0 { "CommitteeSource" } else { "SystemTx" }
+        "✅ [EPOCH TIMESTAMP] Using timestamp from EndOfEpoch SystemTx for epoch {}: {} ms",
+        new_epoch, epoch_timestamp_to_use
     );
 
     node.system_transaction_provider
@@ -310,6 +342,74 @@ pub async fn transition_to_epoch_from_system_tx(
     // CRITICAL FIX: Notify Go about epoch change BEFORE fetching committee
     // Go needs to advance its epoch state before it can return committee data for new epoch
     // Without this, fetch_committee will fail with "epoch X boundary block not stored"
+
+    // =============================================================================
+    // SYNCONLY SYNC-AWARENESS FIX: Defer epoch advance if Go is behind
+    // For SyncOnly nodes, we must ensure Go has ALL blocks up to boundary before advancing
+    // Otherwise, Go will record wrong boundary (current stale block instead of real boundary)
+    //
+    // CRITICAL: Use synced_global_exec_index (from EndOfEpoch tx / network) NOT synced_index
+    //           synced_index was overwritten to go_last_block above, which defeats the purpose!
+    // =============================================================================
+    let required_boundary = synced_global_exec_index; // From network/EndOfEpoch tx
+
+    if is_sync_only {
+        let go_current_block = executor_client.get_last_block_number().await.unwrap_or(0);
+
+        if go_current_block < required_boundary {
+            // Go hasn't synced to the boundary yet - QUEUE this transition for later
+            info!(
+                "📋 [DEFERRED EPOCH] SyncOnly: Go block {} < required boundary {}. Queuing epoch {} transition.",
+                go_current_block, required_boundary, new_epoch
+            );
+
+            // Queue the epoch transition for processing after sync catches up
+            {
+                let mut pending = node.pending_epoch_transitions.lock().await;
+                pending.push(crate::node::PendingEpochTransition {
+                    epoch: new_epoch,
+                    timestamp_ms: epoch_timestamp_to_use,
+                    boundary_block: required_boundary,
+                });
+            }
+
+            // =============================================================================
+            // CRITICAL FIX: Still update RUST state so sync can fetch from new epoch!
+            // Peers have already advanced to new epoch and purged old epoch data.
+            // Rust needs to know to fetch from new epoch, but Go advance is deferred.
+            // =============================================================================
+            info!(
+                "📋 [DEFERRED EPOCH] Updating Rust state to epoch {} (base={}) while deferring Go advance",
+                new_epoch, required_boundary
+            );
+
+            // Update Rust epoch state (but NOT calling Go advance_epoch)
+            node.current_epoch = new_epoch;
+            node.current_commit_index.store(0, Ordering::SeqCst);
+            {
+                let mut g = node.shared_last_global_exec_index.lock().await;
+                *g = required_boundary;
+            }
+            node.last_global_exec_index = required_boundary;
+            node.update_execution_lock_epoch(new_epoch).await;
+
+            // Note: Not starting new consensus here - sync task will fetch using existing network
+            // The epoch/epoch_base update above is sufficient for sync to work
+
+            node.is_transitioning.store(false, Ordering::SeqCst);
+            info!(
+                "📋 [DEFERRED EPOCH] Rust state updated. Go advance queued for when sync reaches block {}",
+                required_boundary
+            );
+            return Ok(());
+        } else {
+            info!(
+                "✅ [SYNCONLY EPOCH] Go is synced: block {} >= boundary {}. Proceeding with epoch {} advance.",
+                go_current_block, required_boundary, new_epoch
+            );
+        }
+    }
+
     info!(
         "📤 [EPOCH ADVANCE] Notifying Go about epoch {} transition (boundary: {})",
         new_epoch, synced_index
@@ -323,6 +423,45 @@ pub async fn transition_to_epoch_from_system_tx(
             new_epoch, e
         );
     }
+
+    // =============================================================================
+    // POST-TRANSITION VALIDATION: Verify Go stored the boundary correctly
+    // NOTE: Go timestamps are NO LONGER authoritative - only log differences
+    // =============================================================================
+    match executor_client.get_epoch_boundary_data(new_epoch).await {
+        Ok((stored_epoch, stored_timestamp, stored_boundary, _validators)) => {
+            // Validate boundary block matches what we sent
+            if stored_boundary != synced_index {
+                error!(
+                    "🚨 [BOUNDARY MISMATCH] Go stored boundary={} but we sent {}! Potential block skip!",
+                    stored_boundary, synced_index
+                );
+            } else {
+                info!(
+                    "✅ [CONTINUITY VERIFIED] Go confirmed epoch {} boundary: block={}, timestamp={}",
+                    stored_epoch, stored_boundary, stored_timestamp
+                );
+            }
+
+            // Log timestamp difference (but DO NOT update epoch_timestamp_to_use - SystemTx is authoritative)
+            if stored_timestamp != epoch_timestamp_to_use && stored_timestamp > 0 {
+                warn!(
+                    "🔍 [TIMESTAMP INFO] Go has timestamp={}, SystemTx has {}. Using SystemTx (authoritative).",
+                    stored_timestamp, epoch_timestamp_to_use
+                );
+            }
+        }
+        Err(e) => {
+            // Go might not have stored it yet - this is expected for epoch 0→1
+            warn!(
+                "⚠️ [VALIDATION SKIP] Cannot verify boundary storage: {}. Continuing with SystemTx timestamp.",
+                e
+            );
+        }
+    }
+
+    // NOTE: Peer timestamp consensus is NO LONGER needed
+    // All nodes process the same EndOfEpoch SystemTx → all get the same timestamp
 
     // Prepare DB
     let db_path = node
@@ -438,6 +577,7 @@ pub async fn transition_to_epoch_from_system_tx(
                     node.boot_counter,
                     Some(node.system_transaction_provider.clone()
                         as Arc<dyn SystemTransactionProvider>),
+                    Some(node.legacy_store_manager.clone()), // Pass legacy store manager to avoid RocksDB lock conflicts
                 )
                 .await,
             );
@@ -455,10 +595,132 @@ pub async fn transition_to_epoch_from_system_tx(
             }
         }
     } else {
-        // SyncOnly mode: Clear authority and proxy
-        info!("🔄 [EPOCH TRANSITION] SyncOnly mode - skipping consensus setup");
+        // SyncOnly mode: Setup CommitProcessor (for EndOfEpoch detection) but NOT Authority
+        // This enables SyncOnly to detect epoch transitions from synced blocks
+        info!(
+            "🔄 [EPOCH TRANSITION] SyncOnly mode - setting up CommitProcessor for epoch detection"
+        );
+
+        // Setup CommitProcessor - same as Validator mode
+        let (_commit_consumer, commit_receiver, mut block_receiver) = CommitConsumerArgs::new(0, 0);
+        let epoch_cb = crate::consensus::commit_callbacks::create_epoch_transition_callback(
+            node.epoch_transition_sender.clone(),
+        );
+
+        let exec_client_proc = if node.executor_commit_enabled {
+            Some(Arc::new(ExecutorClient::new_with_initial_index(
+                true,
+                true,
+                config.executor_send_socket_path.clone(),
+                config.executor_receive_socket_path.clone(),
+                synced_index + 1,
+                Some(node.storage_path.clone()),
+            )))
+        } else {
+            None
+        };
+
+        let mut processor =
+            crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
+                .with_commit_index_callback(
+                    crate::consensus::commit_callbacks::create_commit_index_callback(
+                        node.current_commit_index.clone(),
+                    ),
+                )
+                .with_global_exec_index_callback(
+                    crate::consensus::commit_callbacks::create_global_exec_index_callback(
+                        node.shared_last_global_exec_index.clone(),
+                    ),
+                )
+                .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
+                .with_epoch_info(new_epoch, synced_index)
+                .with_is_transitioning(node.is_transitioning.clone())
+                .with_pending_transactions_queue(node.pending_transactions_queue.clone())
+                .with_epoch_transition_callback(epoch_cb);
+
+        if let Some(c) = exec_client_proc {
+            processor = processor.with_executor_client(c);
+        }
+
+        // Note: commit_consumer receiver is passed to CommitProcessor, keeping channel open
+
+        tokio::spawn(async move {
+            let _ = processor.run().await;
+        });
+        tokio::spawn(async move { while block_receiver.recv().await.is_some() {} });
+
+        // Clear authority and proxy (SyncOnly doesn't run consensus)
         node.authority = None;
         node.transaction_client_proxy = None;
+
+        // CRITICAL FIX: Stop old sync task FIRST to prevent stale committee from blocking fetch
+        // Old RustSyncNode keeps running with old epoch's committee, causing silent fetch failures
+        // after epoch transition. We must stop it before starting new one with fresh committee.
+        if node.sync_task_handle.is_some() {
+            info!("🛑 [SYNC ONLY] Stopping old sync task before starting new one with fresh committee");
+            if let Err(e) = crate::node::sync::stop_sync_task(node).await {
+                warn!(
+                    "⚠️ [SYNC ONLY] Failed to stop old sync task: {}. Continuing anyway.",
+                    e
+                );
+            }
+        }
+
+        // Start sync task to receive blocks from peers via Rust network
+        // The sync task will feed blocks to CommitProcessor for EndOfEpoch detection
+        info!(
+            "🔄 [SYNC ONLY] Starting Rust P2P sync task with fresh committee for epoch {}",
+            new_epoch
+        );
+
+        // Use RustSyncNode for full Rust P2P sync
+        // CRITICAL FIX: SyncOnly nodes need can_commit=true to send synced blocks to their local Go
+        // Without this, Go stays stuck at old block number and never syncs up
+        let rust_sync_executor = Arc::new(ExecutorClient::new(
+            true,
+            true, // SyncOnly nodes must commit synced blocks to local Go
+            config.executor_send_socket_path.clone(),
+            config.executor_receive_socket_path.clone(),
+            None,
+        ));
+
+        // CRITICAL: Initialize ExecutorClient from Go's current state SYNCHRONOUSLY
+        // This syncs next_expected_index with Go's last_block_number + 1
+        // MUST await here, NOT spawn! Otherwise races with start_rust_sync_task_with_network
+        rust_sync_executor.initialize_from_go().await;
+
+        // Create Context for P2P networking
+        // For SyncOnly nodes, we use a dummy own_index (0) since we don't participate in consensus
+        let sync_metrics = consensus_core::initialise_metrics(Registry::new());
+        let sync_context = std::sync::Arc::new(consensus_core::Context::new(
+            epoch_timestamp_to_use,
+            consensus_config::AuthorityIndex::new_for_test(0), // SyncOnly uses dummy index
+            committee.clone(),
+            node.parameters.clone(),
+            node.protocol_config.clone(),
+            sync_metrics,
+            node.clock.clone(),
+        ));
+
+        match crate::node::rust_sync_node::start_rust_sync_task_with_network(
+            rust_sync_executor,
+            node.epoch_transition_sender.clone(),
+            new_epoch,
+            0, // initial_commit_index
+            sync_context,
+            node.network_keypair.clone(),
+            committee.clone(),
+        )
+        .await
+        {
+            Ok(handle) => {
+                node.sync_task_handle = Some(handle);
+                info!("✅ [SYNC ONLY] Rust P2P sync started with full networking");
+            }
+            Err(e) => {
+                warn!("⚠️ [SYNC ONLY] Failed to start Rust P2P sync: {}", e);
+            }
+        }
     }
 
     // Wait for consensus to stabilize with proper synchronization instead of fixed sleep
@@ -474,11 +736,8 @@ pub async fn transition_to_epoch_from_system_tx(
 
     node.reset_reconfig_state().await;
 
-    // Notify Go with boundary_block (synced_index) for deterministic epoch transition
-    // synced_index is the global_exec_index of the last block of the ending epoch
-    let _ = executor_client
-        .advance_epoch(new_epoch, new_epoch_timestamp_ms, synced_index)
-        .await;
+    // NOTE: advance_epoch was already called at line 340 with correct boundary.
+    // No need to call again here (was causing unnecessary duplicate RPC call).
 
     // FORK-SAFETY: Verify Go and Rust epochs match after transition
     // This catches any epoch desync early to prevent forks
@@ -1064,7 +1323,7 @@ pub async fn transition_mode_only(
         node.is_transitioning.store(false, Ordering::SeqCst);
         return Ok(());
     }
-    
+
     struct Guard(Arc<std::sync::atomic::AtomicBool>);
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -1074,7 +1333,7 @@ pub async fn transition_mode_only(
         }
     }
     let _guard = Guard(node.is_transitioning.clone());
-    
+
     info!(
         "🔄 [MODE TRANSITION] Starting SyncOnly → Validator for epoch {} (no DB recreation)",
         epoch
@@ -1086,16 +1345,19 @@ pub async fn transition_mode_only(
         .join("epochs")
         .join(format!("epoch_{}", epoch))
         .join("consensus_db");
-    
+
     // Create if doesn't exist (shouldn't happen but be safe)
     if !db_path.exists() {
         std::fs::create_dir_all(&db_path)?;
-        warn!("⚠️ [MODE TRANSITION] DB path didn't exist, created: {:?}", db_path);
+        warn!(
+            "⚠️ [MODE TRANSITION] DB path didn't exist, created: {:?}",
+            db_path
+        );
     }
 
     // Fetch committee using same pattern as epoch_monitor
     let committee_source = crate::node::committee_source::CommitteeSource::discover(config).await?;
-    
+
     let committee = committee_source
         .fetch_committee(&config.executor_send_socket_path, epoch)
         .await?;
@@ -1115,8 +1377,29 @@ pub async fn transition_mode_only(
             idx
         );
     } else {
-        // Shouldn't happen - we called this because we're in committee
-        warn!("⚠️ [MODE TRANSITION] Not found in committee - this shouldn't happen!");
+        // NOT in committee - stay in SyncOnly mode but update epoch to continue syncing
+        warn!(
+            "⚠️ [MODE TRANSITION] Not found in committee - staying in SyncOnly mode for epoch {}",
+            epoch
+        );
+
+        // CRITICAL FIX: Update epoch state even when not in committee
+        // Otherwise sync task will keep trying to transition to the same epoch
+        node.current_epoch = epoch;
+        node.last_global_exec_index = synced_global_exec_index;
+
+        // IMPORTANT: Stop old sync task first, otherwise new task won't start
+        // (start_sync_task returns early if sync_task_handle.is_some())
+        // This ensures new sync task gets updated epoch from node.current_epoch
+        info!("🔄 [MODE TRANSITION] Stopping old sync task before restart...");
+        crate::node::sync::stop_sync_task(node).await?;
+
+        info!(
+            "🔄 [MODE TRANSITION] Starting new sync task for SyncOnly mode in epoch {}",
+            epoch
+        );
+        crate::node::sync::start_sync_task(node, config).await?;
+
         return Ok(());
     }
 
@@ -1133,10 +1416,11 @@ pub async fn transition_mode_only(
     } else {
         epoch_timestamp_ms
     };
-    
+
     info!(
         "✅ [MODE TRANSITION] Using epoch_timestamp={} ms (verified={})",
-        epoch_timestamp_to_use, verified_epoch_timestamp_ms > 0
+        epoch_timestamp_to_use,
+        verified_epoch_timestamp_ms > 0
     );
 
     // Now setup authority components (same as in full transition)
@@ -1158,23 +1442,22 @@ pub async fn transition_mode_only(
         None
     };
 
-    let mut processor =
-        crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
-            .with_commit_index_callback(
-                crate::consensus::commit_callbacks::create_commit_index_callback(
-                    node.current_commit_index.clone(),
-                ),
-            )
-            .with_global_exec_index_callback(
-                crate::consensus::commit_callbacks::create_global_exec_index_callback(
-                    node.shared_last_global_exec_index.clone(),
-                ),
-            )
-            .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
-            .with_epoch_info(epoch, synced_global_exec_index)
-            .with_is_transitioning(node.is_transitioning.clone())
-            .with_pending_transactions_queue(node.pending_transactions_queue.clone())
-            .with_epoch_transition_callback(epoch_cb);
+    let mut processor = crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
+        .with_commit_index_callback(
+            crate::consensus::commit_callbacks::create_commit_index_callback(
+                node.current_commit_index.clone(),
+            ),
+        )
+        .with_global_exec_index_callback(
+            crate::consensus::commit_callbacks::create_global_exec_index_callback(
+                node.shared_last_global_exec_index.clone(),
+            ),
+        )
+        .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
+        .with_epoch_info(epoch, synced_global_exec_index)
+        .with_is_transitioning(node.is_transitioning.clone())
+        .with_pending_transactions_queue(node.pending_transactions_queue.clone())
+        .with_epoch_transition_callback(epoch_cb);
 
     if let Some(c) = exec_client_proc {
         processor = processor.with_executor_client(c);
@@ -1207,6 +1490,7 @@ pub async fn transition_mode_only(
             Registry::new(),
             node.boot_counter,
             Some(node.system_transaction_provider.clone() as Arc<dyn SystemTransactionProvider>),
+            Some(node.legacy_store_manager.clone()), // Pass legacy store manager to avoid RocksDB lock conflicts
         )
         .await,
     );

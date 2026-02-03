@@ -29,6 +29,7 @@ pub(crate) trait BlockStoreAPI {
     /// Gets all uncommitted blocks in a round.
     /// This is used to commit all blocks in the same round as the leader,
     /// ensuring all transactions in the round are committed.
+    #[allow(dead_code)]
     fn get_uncommitted_blocks_at_round(&self, round: Round) -> Vec<VerifiedBlock>;
 }
 
@@ -229,7 +230,7 @@ impl Linearizer {
         // We just use whatever is currently in DagState.
         let gc_round: Round = dag_state.gc_round();
         let leader_block_ref = leader_block.reference();
-        let leader_round = leader_block.round();
+        let _leader_round = leader_block.round();
         let mut buffer = vec![leader_block];
         let mut to_commit = Vec::new();
 

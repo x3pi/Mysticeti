@@ -180,7 +180,6 @@ impl InitializedNode {
             if let Some(client) = node_guard.executor_client.clone() {
                 Some(crate::node::catchup::CatchupManager::new(
                     client,
-                    self.node_config.peer_go_master_sockets.clone(),
                     self.node_config.executor_receive_socket_path.clone(),
                     self.node_config.peer_rpc_addresses.clone(),
                 ))

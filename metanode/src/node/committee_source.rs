@@ -66,9 +66,9 @@ impl CommitteeSource {
             warn!("🚨 [TIMESTAMP DEBUG] Local returned ZERO timestamp! This will cause genesis issues.");
         }
 
-        // If no peer sockets configured, use local
-        if config.peer_go_master_sockets.is_empty() {
-            info!("ℹ️ [COMMITTEE SOURCE] No peer sockets configured, using local Go Master");
+        // If no TCP peer addresses configured, use local
+        if config.peer_rpc_addresses.is_empty() {
+            info!("ℹ️ [COMMITTEE SOURCE] No peer RPC addresses configured, using local Go Master");
             return Ok(Self {
                 socket_path: config.executor_receive_socket_path.clone(),
                 epoch: local_epoch,
@@ -78,58 +78,46 @@ impl CommitteeSource {
             });
         }
 
-        // Query peers to find the best source
+        // Query TCP peers to find the best source
         let mut best_epoch = local_epoch;
         let mut best_block = local_block;
         let mut best_timestamp = local_timestamp;
-        let mut best_socket = config.executor_receive_socket_path.clone();
+        let best_socket = config.executor_receive_socket_path.clone();
         let mut is_peer = false;
 
-        for peer_socket in &config.peer_go_master_sockets {
-            if peer_socket == &config.executor_receive_socket_path {
-                continue; // Skip self
-            }
-
-            let peer_client = ExecutorClient::new(
-                true,
-                false,
-                String::new(), // Send socket not needed for read
-                peer_socket.clone(),
-                None,
-            );
-
-            match peer_client.get_current_epoch().await {
-                Ok(peer_epoch) => {
-                    let peer_block = peer_client.get_last_block_number().await.unwrap_or(0);
-                    let peer_timestamp = peer_client.get_epoch_start_timestamp().await.unwrap_or(0);
-
+        // Use TCP RPC to query peer nodes over network
+        for peer_address in &config.peer_rpc_addresses {
+            match crate::network::peer_rpc::query_peer_info(peer_address).await {
+                Ok(peer_info) => {
                     debug!(
-                        "📊 [COMMITTEE SOURCE] Peer {}: epoch={}, block={}, timestamp={}",
-                        peer_socket, peer_epoch, peer_block, peer_timestamp
+                        "📊 [COMMITTEE SOURCE] TCP Peer {}: epoch={}, block={}, timestamp={}",
+                        peer_address, peer_info.epoch, peer_info.last_block, peer_info.timestamp_ms
                     );
 
                     // Use peer if:
                     // 1. Higher epoch (network has advanced)
                     // 2. Same epoch but higher block (more up-to-date)
-                    if peer_epoch > best_epoch
-                        || (peer_epoch == best_epoch && peer_block > best_block)
+                    if peer_info.epoch > best_epoch
+                        || (peer_info.epoch == best_epoch && peer_info.last_block > best_block)
                     {
-                        best_epoch = peer_epoch;
-                        best_block = peer_block;
-                        best_timestamp = peer_timestamp;
-                        best_socket = peer_socket.clone();
+                        best_epoch = peer_info.epoch;
+                        best_block = peer_info.last_block;
+                        best_timestamp = peer_info.timestamp_ms;
+                        // For TCP peers, we still use local socket for actual data read
+                        // The peer info just tells us who is ahead
+                        // best_socket stays as local since we can't RPC read blocks over TCP (yet)
                         is_peer = true;
 
                         info!(
-                            "✅ [COMMITTEE SOURCE] New best source: {} (epoch={}, block={})",
-                            peer_socket, peer_epoch, peer_block
+                            "✅ [COMMITTEE SOURCE] Found ahead peer: {} (epoch={}, block={}). Using local Go Master for data.",
+                            peer_address, peer_info.epoch, peer_info.last_block
                         );
                     }
                 }
                 Err(e) => {
                     warn!(
-                        "⚠️ [COMMITTEE SOURCE] Failed to query peer {}: {}",
-                        peer_socket, e
+                        "⚠️ [COMMITTEE SOURCE] Failed to query TCP peer {}: {}",
+                        peer_address, e
                     );
                 }
             }

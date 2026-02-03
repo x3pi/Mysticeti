@@ -26,6 +26,7 @@ use crate::{
     dag_state::DagState,
     leader_schedule::LeaderSchedule,
     leader_timeout::{LeaderTimeoutTask, LeaderTimeoutTaskHandle},
+    legacy_store::LegacyEpochStoreManager,
     metrics::initialise_metrics,
     network::{tonic_network::TonicManager, NetworkManager},
     proposed_block_handler::ProposedBlockHandler,
@@ -68,6 +69,8 @@ impl ConsensusAuthority {
         // will initiate the process of amnesia recovery if that's enabled in the parameters.
         boot_counter: u64,
         system_transaction_provider: Option<Arc<dyn SystemTransactionProvider>>,
+        // Legacy store manager from ConsensusNode, to avoid re-opening locked RocksDB files
+        legacy_store_manager: Option<Arc<LegacyEpochStoreManager>>,
     ) -> Self {
         match network_type {
             NetworkType::Tonic => {
@@ -86,6 +89,7 @@ impl ConsensusAuthority {
                     registry,
                     boot_counter,
                     system_transaction_provider,
+                    legacy_store_manager,
                 )
                 .await;
                 Self::WithTonic(authority)
@@ -173,6 +177,9 @@ where
         registry: Registry,
         boot_counter: u64,
         system_transaction_provider: Option<Arc<dyn SystemTransactionProvider>>,
+        // Legacy store manager passed from ConsensusNode to avoid RocksDB lock conflicts
+        // during epoch transitions. If None, no legacy stores will be available.
+        existing_legacy_store_manager: Option<Arc<LegacyEpochStoreManager>>,
     ) -> Self {
         assert!(
             committee.is_valid_index(own_index),
@@ -374,6 +381,22 @@ where
         )
         .start();
 
+        // Use existing LegacyEpochStoreManager if passed, otherwise None.
+        // CRITICAL: Do NOT create new LegacyEpochStoreManager here during epoch transitions!
+        // The old epoch's RocksDB may still be locked by the same process.
+        // Instead, the LegacyEpochStoreManager is managed by ConsensusNode and stores are
+        // added during epoch transitions after the old authority is stopped.
+        let legacy_store_manager = if let Some(mgr) = existing_legacy_store_manager {
+            info!(
+                "✅ [AUTHORITY START] Using existing LegacyEpochStoreManager with {} epochs",
+                mgr.store_count()
+            );
+            Some(mgr)
+        } else {
+            info!("ℹ️ [AUTHORITY START] No existing LegacyEpochStoreManager provided");
+            None
+        };
+
         let network_service = Arc::new(AuthorityService::new(
             context.clone(),
             block_verifier,
@@ -385,8 +408,8 @@ where
             transaction_certifier,
             dag_state.clone(),
             store.clone(),
-            None, // epoch_change_processor
-            None, // legacy_store_manager - set later in transition if needed
+            None,                 // epoch_change_processor
+            legacy_store_manager, // Pass initialized manager
         ));
 
         let subscriber = {
@@ -529,6 +552,7 @@ mod tests {
             registry,
             0,
             None,
+            None, // legacy_store_manager
         )
         .await;
 
@@ -908,6 +932,7 @@ mod tests {
             registry,
             boot_counter,
             None,
+            None, // legacy_store_manager
         )
         .await;
 

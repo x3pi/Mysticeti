@@ -13,38 +13,38 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use consensus_config::{AuthorityIndex, NetworkKeyPair, NetworkPublicKey};
 use consensus_types::block::{BlockRef, Round};
-use futures::{Stream, StreamExt as _, stream};
-use mysten_network::{
-    Multiaddr,
-    callback::{CallbackLayer, MakeCallbackHandler, ResponseHandler},
-    multiaddr::Protocol,
-};
-use parking_lot::RwLock;
+use futures::{stream, Stream, StreamExt as _};
 use meta_http::ServerHandle;
 use meta_tls::AllowPublicKeys;
-use tokio_stream::{Iter, iter};
-use tonic::{Request, Response, Streaming, codec::CompressionEncoding};
+use mysten_network::{
+    callback::{CallbackLayer, MakeCallbackHandler, ResponseHandler},
+    multiaddr::Protocol,
+    Multiaddr,
+};
+use parking_lot::RwLock;
+use tokio_stream::{iter, Iter};
+use tonic::{codec::CompressionEncoding, Request, Response, Streaming};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer};
 use tracing::{debug, info, trace, warn};
 
 use super::{
-    BlockStream, ExtendedSerializedBlock, NetworkClient, NetworkManager, NetworkService,
     metrics_layer::{MetricsCallbackMaker, MetricsResponseCallback, SizedRequest, SizedResponse},
     tonic_gen::{
         consensus_service_client::ConsensusServiceClient,
         consensus_service_server::ConsensusService,
     },
+    BlockStream, ExtendedSerializedBlock, NetworkClient, NetworkManager, NetworkService,
 };
 use crate::{
-    CommitIndex,
     commit::CommitRange,
     context::Context,
+    epoch_change::{EpochChangeProposal, EpochChangeVote},
     error::{ConsensusError, ConsensusResult},
     network::{
         tonic_gen::consensus_service_server::ConsensusServiceServer,
         tonic_tls::certificate_server_name,
     },
-    epoch_change::{EpochChangeProposal, EpochChangeVote},
+    CommitIndex,
 };
 
 // Maximum bytes size in a single fetch_blocks()response.
@@ -57,14 +57,14 @@ const MAX_TOTAL_FETCHED_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_GRPC_SERVER_TIMEOUT: Duration = Duration::from_secs(300);
 
 // Implements Tonic RPC client for Consensus.
-pub(crate) struct TonicClient {
+pub struct TonicClient {
     context: Arc<Context>,
     network_keypair: NetworkKeyPair,
     channel_pool: Arc<ChannelPool>,
 }
 
 impl TonicClient {
-    pub(crate) fn new(context: Arc<Context>, network_keypair: NetworkKeyPair) -> Self {
+    pub fn new(context: Arc<Context>, network_keypair: NetworkKeyPair) -> Self {
         Self {
             context: context.clone(),
             network_keypair,
@@ -226,6 +226,30 @@ impl NetworkClient for TonicClient {
         Ok((response.commits, response.certifier_blocks))
     }
 
+    async fn fetch_commits_by_global_range(
+        &self,
+        peer: AuthorityIndex,
+        start_global_index: u64,
+        end_global_index: u64,
+        timeout: Duration,
+    ) -> ConsensusResult<Vec<GlobalCommitInfo>> {
+        let mut client = self.get_client(peer, timeout).await?;
+        let mut request = Request::new(FetchCommitsByGlobalRangeRequest {
+            start_global_index,
+            end_global_index,
+        });
+        request.set_timeout(timeout);
+        let response = client
+            .fetch_commits_by_global_range(request)
+            .await
+            .map_err(|e| {
+                ConsensusError::NetworkRequest(format!(
+                    "fetch_commits_by_global_range failed: {e:?}"
+                ))
+            })?;
+        Ok(response.into_inner().commits)
+    }
+
     async fn fetch_latest_blocks(
         &self,
         peer: AuthorityIndex,
@@ -323,7 +347,9 @@ impl NetworkClient for TonicClient {
         client
             .send_epoch_change_proposal(request)
             .await
-            .map_err(|e| ConsensusError::NetworkRequest(format!("send_epoch_change_proposal failed: {e:?}")))?;
+            .map_err(|e| {
+                ConsensusError::NetworkRequest(format!("send_epoch_change_proposal failed: {e:?}"))
+            })?;
         Ok(())
     }
 
@@ -334,17 +360,15 @@ impl NetworkClient for TonicClient {
         timeout: Duration,
     ) -> ConsensusResult<()> {
         let mut client = self.get_client(peer, timeout).await?;
-        let vote_bytes = bcs::to_bytes(vote).map_err(|e| {
-            ConsensusError::NetworkRequest(format!("serialize vote failed: {e:?}"))
-        })?;
+        let vote_bytes = bcs::to_bytes(vote)
+            .map_err(|e| ConsensusError::NetworkRequest(format!("serialize vote failed: {e:?}")))?;
         let mut request = Request::new(SendEpochChangeVoteRequest {
             vote: vote_bytes.into(),
         });
         request.set_timeout(timeout);
-        client
-            .send_epoch_change_vote(request)
-            .await
-            .map_err(|e| ConsensusError::NetworkRequest(format!("send_epoch_change_vote failed: {e:?}")))?;
+        client.send_epoch_change_vote(request).await.map_err(|e| {
+            ConsensusError::NetworkRequest(format!("send_epoch_change_vote failed: {e:?}"))
+        })?;
         Ok(())
     }
 
@@ -636,6 +660,38 @@ impl<S: NetworkService> ConsensusService for TonicServiceProxy<S> {
         }))
     }
 
+    async fn fetch_commits_by_global_range(
+        &self,
+        request: Request<FetchCommitsByGlobalRangeRequest>,
+    ) -> Result<Response<FetchCommitsByGlobalRangeResponse>, tonic::Status> {
+        let peer_index = request
+            .extensions()
+            .get::<PeerInfo>()
+            .map(|p| p.authority_index)
+            .unwrap_or_else(|| {
+                trace!("⚠️ [PEERINFO] PeerInfo missing, using dummy index 0");
+                AuthorityIndex::new_for_test(0)
+            });
+        let request = request.into_inner();
+        let commits = self
+            .service
+            .handle_fetch_commits_by_global_range(
+                peer_index,
+                request.start_global_index,
+                request.end_global_index,
+            )
+            .await
+            .map_err(|e| tonic::Status::internal(format!("{e:?}")))?;
+
+        // Collect all blocks from commits
+        let blocks: Vec<Bytes> = commits.iter().flat_map(|c| c.block_refs.clone()).collect();
+
+        Ok(Response::new(FetchCommitsByGlobalRangeResponse {
+            commits,
+            blocks,
+        }))
+    }
+
     type FetchLatestBlocksStream =
         Iter<std::vec::IntoIter<Result<FetchLatestBlocksResponse, tonic::Status>>>;
 
@@ -719,8 +775,9 @@ impl<S: NetworkService> ConsensusService for TonicServiceProxy<S> {
                 AuthorityIndex::new_for_test(0)
             });
         let proposal_bytes = request.into_inner().proposal;
-        let proposal: EpochChangeProposal = bcs::from_bytes(&proposal_bytes)
-            .map_err(|e| tonic::Status::invalid_argument(format!("deserialize proposal failed: {e:?}")))?;
+        let proposal: EpochChangeProposal = bcs::from_bytes(&proposal_bytes).map_err(|e| {
+            tonic::Status::invalid_argument(format!("deserialize proposal failed: {e:?}"))
+        })?;
         self.service
             .handle_send_epoch_change_proposal(peer_index, proposal)
             .await
@@ -741,8 +798,9 @@ impl<S: NetworkService> ConsensusService for TonicServiceProxy<S> {
                 AuthorityIndex::new_for_test(0)
             });
         let vote_bytes = request.into_inner().vote;
-        let vote: EpochChangeVote = bcs::from_bytes(&vote_bytes)
-            .map_err(|e| tonic::Status::invalid_argument(format!("deserialize vote failed: {e:?}")))?;
+        let vote: EpochChangeVote = bcs::from_bytes(&vote_bytes).map_err(|e| {
+            tonic::Status::invalid_argument(format!("deserialize vote failed: {e:?}"))
+        })?;
         self.service
             .handle_send_epoch_change_vote(peer_index, vote)
             .await
@@ -873,7 +931,8 @@ impl<S: NetworkService> NetworkManager<S> for TonicManager {
         // Check if TLS should be disabled (for local development)
         let _disable_tls = true; // Hardcode for testing
 
-        let tls_server_config = if true { // Hardcode disable TLS for testing
+        let tls_server_config = if true {
+            // Hardcode disable TLS for testing
             None
         } else {
             Some(meta_tls::create_rustls_server_config_with_client_verifier(
@@ -986,7 +1045,6 @@ impl Drop for TonicManager {
         }
     }
 }
-
 
 /// Attempts to convert a multiaddr of the form `/[ip4,ip6,dns]/{}/[udp,tcp]/{port}` into
 /// a host:port string.
@@ -1198,6 +1256,52 @@ pub(crate) struct FetchCommitsResponse {
     // Serialized SignedBlock that certify the last commit from above.
     #[prost(bytes = "bytes", repeated, tag = "2")]
     certifier_blocks: Vec<Bytes>,
+}
+
+/// Request to fetch commits by global execution index range.
+/// This is epoch-agnostic - server will search across all epochs.
+#[derive(Clone, prost::Message)]
+pub(crate) struct FetchCommitsByGlobalRangeRequest {
+    /// Start global execution index (inclusive)
+    #[prost(uint64, tag = "1")]
+    start_global_index: u64,
+    /// End global execution index (inclusive)
+    #[prost(uint64, tag = "2")]
+    end_global_index: u64,
+}
+
+/// Response containing commits with their global execution indices and epoch info.
+#[derive(Clone, prost::Message)]
+pub(crate) struct FetchCommitsByGlobalRangeResponse {
+    /// Serialized commits with global index metadata
+    #[prost(message, repeated, tag = "1")]
+    pub commits: Vec<GlobalCommitInfo>,
+    /// Serialized SignedBlocks for the commits
+    #[prost(bytes = "bytes", repeated, tag = "2")]
+    pub blocks: Vec<Bytes>,
+}
+
+/// Commit info with global execution index
+#[derive(Clone, prost::Message)]
+pub struct GlobalCommitInfo {
+    /// The epoch this commit belongs to
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    /// Global execution index (unique across all epochs)
+    #[prost(uint64, tag = "2")]
+    pub global_exec_index: u64,
+    /// Epoch-local commit index
+    #[prost(uint32, tag = "3")]
+    pub local_commit_index: u32,
+    /// Epoch boundary block (first block of this epoch minus 1)
+    #[prost(uint64, tag = "4")]
+    pub epoch_boundary_block: u64,
+    /// Serialized commit data
+    #[prost(bytes = "bytes", tag = "5")]
+    pub commit_data: Bytes,
+    /// Block references in this commit
+    #[prost(bytes = "bytes", repeated, tag = "6")]
+    pub block_refs: Vec<Bytes>,
 }
 
 #[derive(Clone, prost::Message)]

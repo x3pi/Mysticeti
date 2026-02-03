@@ -104,7 +104,7 @@ pub async fn perform_block_recovery_check(
 
         // Send to executor
         executor_client
-            .send_committed_subdag(&subdag, current_epoch, global_exec_index)
+            .send_committed_subdag(&subdag, current_epoch, global_exec_index, None)
             .await?;
 
         // Advance expected index

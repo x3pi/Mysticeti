@@ -29,7 +29,7 @@ mod leader_timeout;
 mod legacy_store;
 mod linearizer;
 mod metrics;
-mod network;
+pub mod network; // Made public for SyncOnlyNode
 mod proposed_block_handler;
 mod reconfiguration;
 mod round_prober;
@@ -65,12 +65,13 @@ pub use epoch_change_provider::EpochChangeProcessor;
 pub use reconfiguration::{ReconfigCertStatus, ReconfigState};
 
 /// Exported API for testing and tools.
-pub use block::{TestBlock, Transaction, VerifiedBlock};
+pub use block::{SignedBlock, TestBlock, Transaction, VerifiedBlock};
 pub use commit::{
-    load_committed_subdag_from_store, CommitAPI, CommitDigest, CommitIndex, CommitRange, CommitRef,
-    CommittedSubDag,
+    load_committed_subdag_from_store, Commit, CommitAPI, CommitDigest, CommitIndex, CommitRange,
+    CommitRef, CommittedSubDag, TrustedCommit,
 };
 pub use commit_consumer::{CommitConsumerArgs, CommitConsumerMonitor};
+pub use commit_vote_monitor::CommitVoteMonitor;
 pub use context::Clock;
 pub use metrics::Metrics;
 pub use system_transaction::{SystemTransaction, SystemTransactionKind};
@@ -91,6 +92,11 @@ pub use linearizer::Linearizer;
 pub use storage::mem_store::MemStore;
 pub use test_dag_builder::DagBuilder;
 pub use transaction_certifier::TransactionCertifier;
+
+// Exported API for SyncOnly P2P
+pub use metrics::initialise_metrics;
+pub use network::tonic_network::{GlobalCommitInfo, TonicClient};
+pub use network::{BlockStream, ExtendedSerializedBlock, NetworkClient};
 
 // Exported API for simtests.
 #[cfg(msim)]
