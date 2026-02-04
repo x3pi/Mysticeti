@@ -305,8 +305,9 @@ impl RustSyncNode {
             let catching_up = {
                 let queue = self.block_queue.lock().await;
                 let pending = queue.pending_count();
-                // Turbo mode: if we have pending commits OR queue is empty (might need to fetch)
-                pending > 0 || queue.next_expected() > 1
+                // Turbo mode ONLY if we have pending commits waiting to be drained
+                // Previously had `queue.next_expected() > 1` which was always true!
+                pending > 0
             };
 
             // Check if peer epoch is ahead (triggers turbo mode)
@@ -359,6 +360,42 @@ impl RustSyncNode {
         let go_last_block = self.executor_client.get_last_block_number().await?;
         let go_epoch = self.executor_client.get_current_epoch().await?;
 
+        let rust_epoch = self.current_epoch.load(Ordering::SeqCst);
+        let epoch_base = self.epoch_base_index.load(Ordering::SeqCst);
+
+        // =====================================================================
+        // AUTO-EPOCH-SYNC: Detect when Go is ahead and auto-update internal state
+        // This prevents sync from getting stuck when epoch_monitor advances Go
+        // but RustSyncNode's internal state was never updated.
+        // =====================================================================
+        if go_epoch > rust_epoch {
+            info!(
+                "🔄 [EPOCH-AUTO-SYNC] Go epoch {} > Rust epoch {}. Updating internal state...",
+                go_epoch, rust_epoch
+            );
+
+            // Fetch new epoch boundary data from Go
+            match self.executor_client.get_epoch_boundary_data(go_epoch).await {
+                Ok((_epoch, _ts, new_epoch_base, _validators)) => {
+                    let old_epoch_base = self.epoch_base_index.load(Ordering::SeqCst);
+                    info!(
+                        "📊 [EPOCH-AUTO-SYNC] Updated: epoch {} → {}, epoch_base {} → {}",
+                        rust_epoch, go_epoch, old_epoch_base, new_epoch_base
+                    );
+                    self.current_epoch.store(go_epoch, Ordering::SeqCst);
+                    self.epoch_base_index
+                        .store(new_epoch_base, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [EPOCH-AUTO-SYNC] Failed to get epoch {} boundary from Go: {}. Will retry next sync cycle.",
+                        go_epoch, e
+                    );
+                }
+            }
+        }
+
+        // Re-read epoch values after potential update
         let rust_epoch = self.current_epoch.load(Ordering::SeqCst);
         let epoch_base = self.epoch_base_index.load(Ordering::SeqCst);
 

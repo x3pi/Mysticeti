@@ -115,12 +115,28 @@ pub async fn transition_to_epoch_from_system_tx(
     );
 
     // Wait for processor to reach the target commit index (ensure sequential block processing)
-    let timeout_secs = if config.epoch_transition_optimization == "fast" {
+    // AUTO-DETECT: SyncOnly nodes can skip this wait since Go already has blocks from Rust P2P sync
+    // Validator nodes MUST wait to ensure all blocks are committed before stopping authority
+    let is_sync_only = matches!(node.node_mode, crate::node::NodeMode::SyncOnly);
+
+    let timeout_secs = if is_sync_only {
+        // SyncOnly: skip wait entirely - Go already has blocks from P2P sync
+        0
+    } else if config.epoch_transition_optimization == "fast" {
+        // Validator fast mode: 5s wait
         5
     } else {
+        // Validator balanced/default: 10s wait
         10
     };
-    let _ = wait_for_commit_processor_completion(node, target_commit_index, timeout_secs).await;
+
+    if timeout_secs > 0 {
+        let _ = wait_for_commit_processor_completion(node, target_commit_index, timeout_secs).await;
+    } else {
+        info!(
+            "⚡ [TRANSITION] SyncOnly mode detected: skipping commit_processor wait (Go already synced via P2P)"
+        );
+    }
 
     // Check executor read is enabled
     if !config.executor_read_enabled {
