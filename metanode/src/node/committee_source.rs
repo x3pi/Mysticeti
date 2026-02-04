@@ -33,6 +33,8 @@ pub struct CommitteeSource {
     pub last_block: u64,
     /// Whether this source is from a peer (not local)
     pub is_peer: bool,
+    /// Peer RPC addresses for fallback when local is behind
+    pub peer_rpc_addresses: Vec<String>,
 }
 
 impl CommitteeSource {
@@ -75,6 +77,7 @@ impl CommitteeSource {
                 epoch_timestamp_ms: local_timestamp,
                 last_block: local_block,
                 is_peer: false,
+                peer_rpc_addresses: Vec::new(),
             });
         }
 
@@ -139,6 +142,7 @@ impl CommitteeSource {
             epoch_timestamp_ms: best_timestamp,
             last_block: best_block,
             is_peer,
+            peer_rpc_addresses: config.peer_rpc_addresses.clone(),
         })
     }
 
@@ -161,20 +165,26 @@ impl CommitteeSource {
     /// This is critical because during epoch transition, the Go Master may still report
     /// the old epoch while we need the new epoch's committee.
     ///
-    /// CRITICAL: Retries INDEFINITELY until success since epoch transition MUST succeed
-    /// for the network to progress. Without correct committee, consensus cannot continue.
+    /// CRITICAL FIX: Single Source of Truth for Committee
+    ///
+    /// To prevent forks, this function ONLY uses LOCAL Go as the data source.
+    /// It will wait INDEFINITELY until local Go has synced to the boundary block
+    /// and can provide validators for the target epoch.
+    ///
+    /// The sync process (rust_sync_node) must complete BEFORE this returns.
+    /// This ensures all nodes derive committee from the same verified blockchain state.
     pub async fn fetch_committee(&self, send_socket: &str, target_epoch: u64) -> Result<Committee> {
         let client = self.create_executor_client(send_socket);
 
         info!(
-            "📋 [COMMITTEE SOURCE] Fetching committee for target_epoch {} from {} (will retry until success)",
-            target_epoch, self.socket_path
+            "📋 [COMMITTEE SOURCE] Fetching committee for target_epoch {} from LOCAL Go ONLY (single source)",
+            target_epoch
         );
 
-        // Retry configuration - NO LIMIT, will retry until success
+        // Retry configuration - wait indefinitely for sync to complete
         const INITIAL_DELAY_MS: u64 = 500;
         const MAX_DELAY_MS: u64 = 5000;
-        const LOG_INTERVAL: u32 = 10; // Log detailed info every N attempts
+        const LOG_INTERVAL: u32 = 10;
 
         let mut attempt = 0u32;
         let mut delay_ms = INITIAL_DELAY_MS;
@@ -183,67 +193,58 @@ impl CommitteeSource {
             attempt += 1;
             let should_log = attempt == 1 || attempt % LOG_INTERVAL == 0;
 
-            // FIX: Use get_epoch_boundary_data() with TARGET EPOCH for consistent validator snapshot
+            // SINGLE SOURCE: Only use local Go Master
             match client.get_epoch_boundary_data(target_epoch).await {
                 Ok((epoch, timestamp_ms, boundary_block, validators)) => {
-                    // Verify we got the expected epoch
-                    if epoch != target_epoch {
-                        if should_log {
-                            warn!(
-                                "⚠️ [COMMITTEE SOURCE] Epoch mismatch! Expected={}, Got={}. Waiting for Go to advance... (attempt {})",
-                                target_epoch, epoch, attempt
-                            );
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                        delay_ms = std::cmp::min(delay_ms * 2, MAX_DELAY_MS);
-                        continue; // Keep retrying until correct epoch
-                    }
+                    if epoch == target_epoch {
+                        info!(
+                            "✅ [COMMITTEE SOURCE] Got epoch boundary data from LOCAL Go: epoch={}, timestamp_ms={}, boundary_block={}, validator_count={} (attempt {})",
+                            epoch, timestamp_ms, boundary_block, validators.len(), attempt
+                        );
 
-                    info!(
-                        "✅ [COMMITTEE SOURCE] Got epoch boundary data: epoch={}, timestamp_ms={}, boundary_block={}, validator_count={} (attempt {})",
-                        epoch, timestamp_ms, boundary_block, validators.len(), attempt
-                    );
-
-                    // Build committee from boundary validators using TARGET EPOCH
-                    // CRITICAL: Also retry if build_committee fails to ensure epoch transition succeeds
-                    match crate::node::committee::build_committee_from_validator_info_list(
-                        &validators,
-                        target_epoch,
-                    )
-                    .await
-                    {
-                        Ok(committee) => {
-                            info!(
-                                "✅ [COMMITTEE SOURCE] Successfully built committee with {} authorities",
-                                committee.size()
-                            );
-                            return Ok(committee);
-                        }
-                        Err(e) => {
-                            if should_log {
-                                warn!(
-                                    "⚠️ [COMMITTEE SOURCE] build_committee failed: {} (attempt {}). Will retry...",
-                                    e, attempt
+                        // Build committee from validators
+                        match crate::node::committee::build_committee_from_validator_info_list(
+                            &validators,
+                            target_epoch,
+                        )
+                        .await
+                        {
+                            Ok(committee) => {
+                                info!(
+                                    "✅ [COMMITTEE SOURCE] Successfully built committee with {} authorities from LOCAL source",
+                                    committee.size()
                                 );
+                                return Ok(committee);
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                            delay_ms = std::cmp::min(delay_ms * 2, MAX_DELAY_MS);
-                            continue; // Keep retrying - epoch transition MUST succeed
+                            Err(e) => {
+                                if should_log {
+                                    warn!(
+                                        "⚠️ [COMMITTEE SOURCE] build_committee failed: {} (attempt {}). Waiting for sync...",
+                                        e, attempt
+                                    );
+                                }
+                            }
                         }
+                    } else if should_log {
+                        info!(
+                            "⏳ [COMMITTEE SOURCE] Local Go at epoch {}, waiting for epoch {} (attempt {}). Sync in progress...",
+                            epoch, target_epoch, attempt
+                        );
                     }
                 }
                 Err(e) => {
                     if should_log {
-                        warn!(
-                            "⚠️ [COMMITTEE SOURCE] get_epoch_boundary_data failed: {} (attempt {}). Will keep retrying...",
+                        info!(
+                            "⏳ [COMMITTEE SOURCE] Local Go not ready: {} (attempt {}). Waiting for sync to complete...",
                             e, attempt
                         );
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                    delay_ms = std::cmp::min(delay_ms * 2, MAX_DELAY_MS);
-                    continue; // Keep retrying - epoch transition MUST succeed
                 }
             }
+
+            // Wait and retry - sync must complete before proceeding
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            delay_ms = std::cmp::min(delay_ms * 2, MAX_DELAY_MS);
         }
     }
 

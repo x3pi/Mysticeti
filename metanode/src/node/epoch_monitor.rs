@@ -13,7 +13,6 @@
 //! 4. **Unified Logic**: Same code path for SyncOnly and Validator nodes
 
 use crate::config::NodeConfig;
-use crate::node::executor_client::proto;
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,22 +50,6 @@ pub fn start_unified_epoch_monitor(
         "🔄 [EPOCH MONITOR] Starting unified epoch monitor for node-{} (poll_interval={}s)",
         node_id, poll_interval_secs
     );
-
-    // Load own protocol key for committee membership check
-    let own_protocol_key_base64 = match config.load_protocol_keypair() {
-        Ok(keypair) => {
-            use base64::{engine::general_purpose::STANDARD, Engine as _};
-            STANDARD.encode(keypair.public().to_bytes())
-        }
-        Err(e) => {
-            warn!(
-                "⚠️ [EPOCH MONITOR] Failed to load protocol keypair: {}. Falling back to hostname matching.",
-                e
-            );
-            String::new()
-        }
-    };
-    let hostname = format!("node-{}", node_id);
 
     let handle = tokio::spawn(async move {
         loop {
@@ -132,119 +115,39 @@ pub fn start_unified_epoch_monitor(
                 rust_epoch, network_epoch, epoch_gap
             );
 
-            // 4. Get epoch boundary data (FORK-SAFE!)
-            // First try local Go, then fallback to peer TCP RPC
-            // This is critical for late-joiners: local Go may not have boundary data
-            // because it hasn't witnessed the epoch transition yet.
-
-            // Try local Go first
+            // 4. Get epoch boundary data from LOCAL Go ONLY (Single Source of Truth)
+            // Wait for LOCAL Go to have the data - DO NOT use peer fallback here
+            // This ensures all nodes get committee from same source (their own synced Go layer)
             let local_executor_client = client_arc.clone();
-            let boundary_data_result = local_executor_client
+            let boundary_data = match local_executor_client
                 .get_epoch_boundary_data(network_epoch)
-                .await;
-
-            let (new_epoch, epoch_timestamp_ms, boundary_block, validators) =
-                match boundary_data_result {
-                    Ok(data) => {
-                        info!(
-                        "📊 [EPOCH MONITOR] Got boundary data from LOCAL: epoch={}, timestamp={}ms, boundary_block={}, validators={}",
-                        data.0, data.1, data.2, data.3.len()
+                .await
+            {
+                Ok((epoch, timestamp_ms, boundary_block, _validators)) => {
+                    info!(
+                        "📊 [EPOCH MONITOR] Got boundary data from LOCAL Go: epoch={}, timestamp={}ms, boundary_block={}",
+                        epoch, timestamp_ms, boundary_block
                     );
-                        data
-                    }
-                    Err(e) => {
-                        // Local failed - try to fetch from peer via TCP RPC
-                        warn!(
-                        "⚠️ [EPOCH MONITOR] Local Go failed for epoch {}: {}. Trying peers via TCP RPC...",
+                    (epoch, timestamp_ms, boundary_block)
+                }
+                Err(e) => {
+                    // LOCAL Go not ready - wait and retry
+                    // DO NOT fallback to peer - let sync complete first
+                    info!(
+                        "⏳ [EPOCH MONITOR] Local Go not ready for epoch {}: {}. Waiting for sync...",
                         network_epoch, e
                     );
-
-                        let peer_rpc = &config_clone.peer_rpc_addresses;
-                        if peer_rpc.is_empty() {
-                            warn!("⚠️ [EPOCH MONITOR] No peers configured. Cannot fetch epoch boundary data. Will retry.");
-                            continue;
-                        }
-
-                        // Try each peer until one succeeds
-                        let mut peer_data = None;
-                        for peer_addr in peer_rpc.iter() {
-                            match crate::network::peer_rpc::query_peer_epoch_boundary_data(
-                                peer_addr,
-                                network_epoch,
-                            )
-                            .await
-                            {
-                                Ok(response) => {
-                                    info!(
-                                    "✅ [EPOCH MONITOR] Got boundary data from PEER {}: epoch={}, timestamp={}ms, boundary_block={}, validators={}",
-                                    peer_addr, response.epoch, response.timestamp_ms, response.boundary_block, response.validators.len()
-                                );
-
-                                    // Convert ValidatorInfoSimple back to ValidatorInfo
-                                    let validators: Vec<proto::ValidatorInfo> = response
-                                        .validators
-                                        .iter()
-                                        .map(|v| {
-                                            proto::ValidatorInfo {
-                                                name: v.name.clone(),
-                                                address: v.address.clone(),
-                                                stake: v.stake.to_string(),
-                                                protocol_key: v.protocol_key.clone(),
-                                                network_key: v.network_key.clone(),
-                                                authority_key: String::new(), // Not used in transition
-                                                description: String::new(),
-                                                website: String::new(),
-                                                image: String::new(),
-                                                commission_rate: 0,
-                                                min_self_delegation: String::new(),
-                                                accumulated_rewards_per_share: String::new(),
-                                            }
-                                        })
-                                        .collect();
-
-                                    peer_data = Some((
-                                        response.epoch,
-                                        response.timestamp_ms,
-                                        response.boundary_block,
-                                        validators,
-                                    ));
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!("⚠️ [EPOCH MONITOR] Peer {} failed: {}. Trying next peer...", peer_addr, e);
-                                }
-                            }
-                        }
-
-                        match peer_data {
-                            Some(data) => data,
-                            None => {
-                                warn!("⚠️ [EPOCH MONITOR] All peers failed to provide epoch {} boundary data. Will retry.", network_epoch);
-                                continue;
-                            }
-                        }
-                    }
-                };
-
-            // 5. Check committee membership for target epoch
-            let is_in_committee = if !own_protocol_key_base64.is_empty() {
-                validators
-                    .iter()
-                    .any(|v| v.protocol_key == own_protocol_key_base64)
-            } else {
-                validators.iter().any(|v| v.name == hostname)
+                    continue; // Retry in next poll cycle
+                }
             };
 
-            // 6. Log transition intent
-            let target_mode = if is_in_committee {
-                crate::node::NodeMode::Validator
-            } else {
-                crate::node::NodeMode::SyncOnly
-            };
+            let (new_epoch, epoch_timestamp_ms, boundary_block) = boundary_data;
 
+            // 5. DO NOT check membership here - let transition.rs determine mode
+            // This ensures single source of truth from LOCAL Go committee
             info!(
-                "🔄 [EPOCH MONITOR] Transitioning: epoch {} → {} | mode {:?} → {:?} | boundary_block={}",
-                rust_epoch, new_epoch, current_mode, target_mode, boundary_block
+                "🔄 [EPOCH MONITOR] Triggering transition: epoch {} → {} | boundary_block={} | mode will be determined by transition.rs",
+                rust_epoch, new_epoch, boundary_block
             );
 
             // 7. Execute transition
@@ -265,8 +168,8 @@ pub fn start_unified_epoch_monitor(
                 {
                     Ok(()) => {
                         info!(
-                            "✅ [EPOCH MONITOR] Successfully transitioned to epoch {} as {:?}",
-                            new_epoch, target_mode
+                            "✅ [EPOCH MONITOR] Successfully triggered transition to epoch {}",
+                            new_epoch
                         );
                     }
                     Err(e) => {

@@ -77,6 +77,7 @@ pub struct ValidatorInfoSimple {
     pub stake: u64,
     pub protocol_key: String,
     pub network_key: String,
+    pub authority_key: String,
 }
 
 /// Response for /get_epoch_boundary_data endpoint
@@ -307,6 +308,7 @@ impl PeerRpcServer {
                         stake: v.stake.parse::<u64>().unwrap_or(0),
                         protocol_key: v.protocol_key.clone(),
                         network_key: v.network_key.clone(),
+                        authority_key: v.authority_key.clone(),
                     })
                     .collect();
 

@@ -19,7 +19,7 @@ use consensus_core::{
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, trace, warn};
@@ -217,7 +217,7 @@ pub struct RustSyncNode {
     current_epoch: Arc<AtomicU64>,
     #[allow(dead_code)]
     last_synced_commit_index: Arc<AtomicU32>,
-    committee: Option<Committee>,
+    committee: Arc<RwLock<Option<Committee>>>,
     config: RustSyncConfig,
     /// Queue for buffering and sequential block processing
     block_queue: Arc<Mutex<BlockQueue>>,
@@ -247,7 +247,7 @@ impl RustSyncNode {
             epoch_transition_sender,
             current_epoch: Arc::new(AtomicU64::new(initial_epoch)),
             last_synced_commit_index: Arc::new(AtomicU32::new(initial_global_exec_index)),
-            committee: None,
+            committee: Arc::new(RwLock::new(None)),
             config: RustSyncConfig::default(),
             block_queue: Arc::new(Mutex::new(BlockQueue::new(
                 initial_global_exec_index as u64,
@@ -265,7 +265,7 @@ impl RustSyncNode {
     ) -> Self {
         let tonic_client = TonicClient::new(context, network_keypair);
         self.network_client = Some(Arc::new(tonic_client));
-        self.committee = Some(committee);
+        *self.committee.write().unwrap() = Some(committee);
         self
     }
 
@@ -376,8 +376,43 @@ impl RustSyncNode {
 
             // Fetch new epoch boundary data from Go
             match self.executor_client.get_epoch_boundary_data(go_epoch).await {
-                Ok((_epoch, _ts, new_epoch_base, _validators)) => {
+                Ok((_epoch, _ts, new_epoch_base, validators)) => {
                     let old_epoch_base = self.epoch_base_index.load(Ordering::SeqCst);
+
+                    // CRITICAL: Always rebuild committee on epoch change!
+                    // Validators may change (added, removed, or replaced) between epochs.
+                    // Even if validator COUNT is the same, the actual validators may differ.
+                    // The committee MUST match the validators at the epoch boundary block.
+                    if !validators.is_empty() {
+                        let old_committee_size = {
+                            let committee_guard = self.committee.read().unwrap();
+                            committee_guard.as_ref().map(|c| c.size()).unwrap_or(0)
+                        };
+
+                        info!(
+                            "🔄 [EPOCH-AUTO-SYNC] Epoch changed: {} → {}. Rebuilding committee (old={}, new={} validators)...",
+                            rust_epoch, go_epoch, old_committee_size, validators.len()
+                        );
+
+                        match crate::node::committee::build_committee_from_validator_list(
+                            validators, go_epoch,
+                        ) {
+                            Ok(new_committee) => {
+                                info!(
+                                    "✅ [EPOCH-AUTO-SYNC] Committee rebuilt with {} authorities for epoch {}",
+                                    new_committee.size(), go_epoch
+                                );
+                                *self.committee.write().unwrap() = Some(new_committee);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "⚠️ [EPOCH-AUTO-SYNC] Failed to rebuild committee: {}. Keeping old committee.",
+                                    e
+                                );
+                            }
+                        }
+                    }
+
                     info!(
                         "📊 [EPOCH-AUTO-SYNC] Updated: epoch {} → {}, epoch_base {} → {}",
                         rust_epoch, go_epoch, old_epoch_base, new_epoch_base
@@ -438,64 +473,67 @@ impl RustSyncNode {
                         rust_epoch
                     );
 
-                    // Build peer RPC addresses from committee
-                    if let Some(ref committee) = self.committee {
-                        let peer_addresses: Vec<String> = committee
-                            .authorities()
-                            .filter_map(|(_, auth)| {
-                                // Extract host and use peer_rpc_port (8XXX pattern)
-                                // Consensus address format: /dns/host/tcp/port
-                                let addr_str = auth.address.to_string();
-                                if let Some(host) = addr_str.split('/').nth(2) {
-                                    // Use peer RPC port 8000-base pattern
-                                    // Node 0: 8000, Node 1: 8001, etc.
-                                    // Extract node index from port or use pre-configured ports
-                                    Some(format!("{}:8000", host))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
+                    // Build peer RPC addresses from committee - extract before await!
+                    let peer_addresses: Vec<String> = {
+                        let committee_guard = self.committee.read().unwrap();
+                        if let Some(ref committee) = *committee_guard {
+                            committee
+                                .authorities()
+                                .filter_map(|(_, auth)| {
+                                    // Extract host and use peer_rpc_port (8XXX pattern)
+                                    // Consensus address format: /dns/host/tcp/port
+                                    let addr_str = auth.address.to_string();
+                                    if let Some(host) = addr_str.split('/').nth(2) {
+                                        // Use peer RPC port 8000-base pattern
+                                        Some(format!("{}:8000", host))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    }; // guard dropped here before await
 
-                        if !peer_addresses.is_empty() {
-                            // Query peers for correct epoch boundary
-                            match query_peer_epochs_network(&peer_addresses).await {
-                                Ok((peer_epoch, peer_block, best_peer)) => {
-                                    info!(
-                                        "🌐 [PEER-DISCOVERY] Best peer: epoch={}, block={}, addr={}",
-                                        peer_epoch, peer_block, best_peer
-                                    );
+                    if !peer_addresses.is_empty() {
+                        // Query peers for correct epoch boundary
+                        match query_peer_epochs_network(&peer_addresses).await {
+                            Ok((peer_epoch, peer_block, best_peer)) => {
+                                info!(
+                                    "🌐 [PEER-DISCOVERY] Best peer: epoch={}, block={}, addr={}",
+                                    peer_epoch, peer_block, best_peer
+                                );
 
-                                    // If peer has the same epoch, query epoch boundary data
-                                    if peer_epoch == rust_epoch {
-                                        match query_peer_epoch_boundary_data(&best_peer, rust_epoch)
-                                            .await
-                                        {
-                                            Ok(boundary_data) => {
-                                                let peer_boundary = boundary_data.boundary_block;
-                                                if peer_boundary > epoch_base {
-                                                    info!(
-                                                        "✅ [PEER-DISCOVERY] Correcting epoch_base_index: {} -> {} (from peer {})",
-                                                        epoch_base, peer_boundary, best_peer
-                                                    );
-                                                    self.epoch_base_index
-                                                        .store(peer_boundary, Ordering::SeqCst);
-                                                } else {
-                                                    warn!(
-                                                        "⚠️ [PEER-DISCOVERY] Peer boundary {} not better than local {}",
-                                                        peer_boundary, epoch_base
-                                                    );
-                                                }
+                                // If peer has the same epoch, query epoch boundary data
+                                if peer_epoch == rust_epoch {
+                                    match query_peer_epoch_boundary_data(&best_peer, rust_epoch)
+                                        .await
+                                    {
+                                        Ok(boundary_data) => {
+                                            let peer_boundary = boundary_data.boundary_block;
+                                            if peer_boundary > epoch_base {
+                                                info!(
+                                                    "✅ [PEER-DISCOVERY] Correcting epoch_base_index: {} -> {} (from peer {})",
+                                                    epoch_base, peer_boundary, best_peer
+                                                );
+                                                self.epoch_base_index
+                                                    .store(peer_boundary, Ordering::SeqCst);
+                                            } else {
+                                                warn!(
+                                                    "⚠️ [PEER-DISCOVERY] Peer boundary {} not better than local {}",
+                                                    peer_boundary, epoch_base
+                                                );
                                             }
-                                            Err(e) => {
-                                                warn!("⚠️ [PEER-DISCOVERY] Failed to get epoch boundary from peer: {}", e);
-                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("⚠️ [PEER-DISCOVERY] Failed to get epoch boundary from peer: {}", e);
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    warn!("⚠️ [PEER-DISCOVERY] No peers responded: {}", e);
-                                }
+                            }
+                            Err(e) => {
+                                warn!("⚠️ [PEER-DISCOVERY] No peers responded: {}", e);
                             }
                         }
                     }
@@ -535,7 +573,13 @@ impl RustSyncNode {
 
         // PHASE 2: Fetch commits from peers and push to queue
         if let Some(ref network_client) = self.network_client {
-            if let Some(ref committee) = self.committee {
+            // Clone committee before await to drop guard immediately
+            let committee_opt: Option<Committee> = {
+                let guard = self.committee.read().unwrap();
+                guard.clone()
+            }; // guard dropped here
+
+            if let Some(ref committee) = committee_opt {
                 let fetch_from_index = {
                     let queue = self.block_queue.lock().await;
                     queue.next_expected() - 1 // Fetch from the block before what we need
@@ -1479,7 +1523,8 @@ impl RustSyncNode {
 
     /// Get peer Go addresses from committee (if available) or config
     pub fn get_peer_go_addresses(&self) -> Vec<String> {
-        if let Some(ref committee) = self.committee {
+        let committee_guard = self.committee.read().unwrap();
+        if let Some(ref committee) = *committee_guard {
             committee
                 .authorities()
                 .filter_map(|(_, auth)| {
