@@ -1367,6 +1367,43 @@ impl RustSyncNode {
                     self.current_epoch.store(trans.epoch, Ordering::SeqCst);
                     self.epoch_base_index
                         .store(trans.boundary_block, Ordering::SeqCst);
+
+                    // =============================================================================
+                    // CRITICAL FIX: Trigger full epoch transition to check committee and promote
+                    // to Validator if node was registered in this epoch.
+                    //
+                    // Without this, a node that was:
+                    // 1. Removed from validators in epoch 4
+                    // 2. Re-registered in epoch 7
+                    // 3. Should become Validator in epoch 8
+                    // Will stay in SyncOnly mode because deferred epoch only calls advance_epoch
+                    // but doesn't check committee membership for mode transition.
+                    //
+                    // By sending to epoch_transition_sender, we trigger transition.rs which:
+                    // - Fetches committee for the new epoch
+                    // - Checks if our protocol_key is in the committee
+                    // - Promotes SyncOnly -> Validator if we're in the committee
+                    // =============================================================================
+                    info!(
+                        "🔄 [DEFERRED EPOCH] Triggering full transition to check committee and potentially promote to Validator"
+                    );
+
+                    // Send epoch transition signal - same as what EndOfEpoch SystemTx triggers
+                    if let Err(e) = self.epoch_transition_sender.send((
+                        trans.epoch,
+                        trans.timestamp_ms,
+                        trans.boundary_block,
+                    )) {
+                        warn!(
+                            "⚠️ [DEFERRED EPOCH] Failed to send epoch transition signal: {}",
+                            e
+                        );
+                    } else {
+                        info!(
+                            "✅ [DEFERRED EPOCH] Sent epoch transition signal for epoch {} to trigger mode check",
+                            trans.epoch
+                        );
+                    }
                 }
             }
         }

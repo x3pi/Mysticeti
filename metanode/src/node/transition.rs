@@ -1425,18 +1425,37 @@ pub async fn transition_mode_only(
     // Note: shared_last_global_exec_index is Arc<Mutex<u64>>, updated via commit_processor
     node.current_commit_index.store(0, Ordering::SeqCst);
 
-    // Use verified timestamp from CommitteeSource or fallback to passed value
-    let verified_epoch_timestamp_ms = committee_source.epoch_timestamp_ms;
-    let epoch_timestamp_to_use = if verified_epoch_timestamp_ms > 0 {
-        verified_epoch_timestamp_ms
-    } else {
-        epoch_timestamp_ms
-    };
+    // =============================================================================
+    // CRITICAL FIX: ALWAYS use the passed-in epoch_timestamp_ms (from EndOfEpoch SystemTx)
+    //
+    // Why this matters:
+    // - EndOfEpoch SystemTx contains the exact timestamp_ms when epoch ended
+    // - ALL validators see this exact same timestamp in the transaction
+    // - Genesis blocks use timestamp → different timestamp = different genesis hash = FORK!
+    //
+    // Why CommitteeSource.epoch_timestamp_ms is WRONG for late-joining nodes:
+    // - Late-joining SyncOnly nodes query Go for CommitteeSource
+    // - Go may have a different (rounded or stale) epoch_start_timestamp
+    // - Node 4 got 1770197184122ms (from Go query) while network had 1770197180831ms (from EndOfEpoch tx)
+    // - This 3.3s difference caused different genesis hashes → FORK!
+    //
+    // SOLUTION: Always trust epoch_timestamp_ms parameter - it came from signal which
+    // was triggered by EndOfEpoch SystemTx processing or peer epoch boundary query.
+    // =============================================================================
+    let epoch_timestamp_to_use = epoch_timestamp_ms;
+
+    // Log for debugging if CommitteeSource has different timestamp
+    let committee_source_timestamp = committee_source.epoch_timestamp_ms;
+    if committee_source_timestamp > 0 && committee_source_timestamp != epoch_timestamp_ms {
+        warn!(
+            "⚠️ [MODE TRANSITION] CommitteeSource timestamp {} differs from authoritative timestamp {}. Using authoritative.",
+            committee_source_timestamp, epoch_timestamp_ms
+        );
+    }
 
     info!(
-        "✅ [MODE TRANSITION] Using epoch_timestamp={} ms (verified={})",
-        epoch_timestamp_to_use,
-        verified_epoch_timestamp_ms > 0
+        "✅ [MODE TRANSITION] Using AUTHORITATIVE epoch_timestamp={} ms (from EndOfEpoch signal)",
+        epoch_timestamp_to_use
     );
 
     // Now setup authority components (same as in full transition)
