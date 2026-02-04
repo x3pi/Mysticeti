@@ -1468,11 +1468,21 @@ pub async fn transition_mode_only(
     });
     tokio::spawn(async move { while block_receiver.recv().await.is_some() {} });
 
+    // =======================================================================
+    // CENTRALIZED CLEANUP: Ensure sync task is fully stopped before Authority
+    // check_and_update_node_mode should have stopped it, but verify just in case
+    // =======================================================================
+    if node.sync_task_handle.is_some() {
+        warn!("⚠️ [MODE TRANSITION] Sync task still running - stopping explicitly before Authority start");
+        crate::node::sync::stop_sync_task(node).await?;
+    }
+
     // Start Authority
     let mut params = node.parameters.clone();
     params.db_path = db_path;
     node.boot_counter += 1;
 
+    info!("🚀 [MODE TRANSITION] Starting ConsensusAuthority for Validator mode");
     node.authority = Some(
         ConsensusAuthority::start(
             NetworkType::Tonic,

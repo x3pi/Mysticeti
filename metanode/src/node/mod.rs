@@ -36,6 +36,7 @@ pub mod epoch_monitor;
 pub mod executor_client;
 pub mod notification_listener;
 pub mod notification_server;
+pub mod peer_go_client;
 pub mod queue;
 pub mod recovery;
 pub mod rust_sync_node;
@@ -955,7 +956,28 @@ impl ConsensusNode {
             );
             match (&self.node_mode, &new_mode) {
                 (NodeMode::SyncOnly, NodeMode::Validator) => {
-                    // TRANSITION HANDOFF: Notify Go that consensus will start
+                    // =======================================================================
+                    // CENTRALIZED ORDERING FIX: SyncOnly → Validator
+                    // ORDER: 1. Stop sync 2. Update mode 3. Notify Go
+                    // This prevents race conditions where sync continues after consensus starts
+                    // =======================================================================
+
+                    // STEP 1: Stop sync task FIRST (before mode change or Go notification)
+                    info!("🛑 [TRANSITION] STEP 1: Stopping sync task before becoming Validator");
+                    let _ = self.stop_sync_task().await;
+
+                    // STEP 2: Update mode atomically
+                    self.node_mode = new_mode.clone();
+
+                    // MODE TRANSITION STATE LOG
+                    info!(
+                        "📊 [MODE TRANSITION] SyncOnly → Validator: epoch={}, last_global_exec_index={}, commit_index={}",
+                        self.current_epoch,
+                        self.last_global_exec_index,
+                        self.current_commit_index.load(std::sync::atomic::Ordering::SeqCst)
+                    );
+
+                    // STEP 3: Notify Go AFTER sync is fully stopped
                     // Consensus will produce blocks starting from last_global_exec_index + 1
                     let consensus_start_block = self.last_global_exec_index + 1;
                     if let Some(ref executor_client) = self.executor_client {
@@ -993,18 +1015,6 @@ impl ConsensusNode {
                         }
                     }
 
-                    // First update mode so tasks see correct state
-                    self.node_mode = new_mode.clone();
-
-                    // MODE TRANSITION STATE LOG
-                    info!(
-                        "📊 [MODE TRANSITION] SyncOnly → Validator: epoch={}, last_global_exec_index={}, commit_index={}",
-                        self.current_epoch,
-                        self.last_global_exec_index,
-                        self.current_commit_index.load(std::sync::atomic::Ordering::SeqCst)
-                    );
-
-                    let _ = self.stop_sync_task().await;
                     // CRITICAL FIX 2026-02-01: Restart epoch monitor after becoming Validator
                     // The epoch monitor is designed to run continuously for ALL node modes.
                     // Previously, we only take() the handle without restarting, which left
@@ -1019,8 +1029,31 @@ impl ConsensusNode {
                     }
                 }
                 (NodeMode::Validator, NodeMode::SyncOnly) => {
-                    // TRANSITION HANDOFF: Notify Go that consensus is ending
-                    // Sync should start from last_global_exec_index + 1
+                    // =======================================================================
+                    // CENTRALIZED ORDERING FIX: Validator → SyncOnly
+                    // ORDER: 1. Stop authority 2. Update mode 3. Notify Go 4. Start sync
+                    // This prevents race conditions where consensus continues after sync starts
+                    // =======================================================================
+
+                    // STEP 1: Stop authority FIRST (before mode change or Go notification)
+                    info!("🛑 [TRANSITION] STEP 1: Stopping consensus authority before becoming SyncOnly");
+                    if let Some(auth) = self.authority.take() {
+                        auth.stop().await;
+                        info!("✅ [TRANSITION] Authority stopped successfully");
+                    }
+
+                    // STEP 2: Update mode atomically
+                    self.node_mode = new_mode.clone();
+
+                    // MODE TRANSITION STATE LOG
+                    info!(
+                        "📊 [MODE TRANSITION] Validator → SyncOnly: epoch={}, last_global_exec_index={}, commit_index={}",
+                        self.current_epoch,
+                        self.last_global_exec_index,
+                        self.current_commit_index.load(std::sync::atomic::Ordering::SeqCst)
+                    );
+
+                    // STEP 3: Notify Go AFTER authority is fully stopped
                     let last_consensus_block = self.last_global_exec_index;
                     if let Some(ref executor_client) = self.executor_client {
                         match executor_client
@@ -1046,25 +1079,7 @@ impl ConsensusNode {
                         }
                     }
 
-                    // First update mode so tasks see correct state
-                    self.node_mode = new_mode.clone();
-
-                    // MODE TRANSITION STATE LOG
-                    info!(
-                        "📊 [MODE TRANSITION] Validator → SyncOnly: epoch={}, last_global_exec_index={}, commit_index={}",
-                        self.current_epoch,
-                        self.last_global_exec_index,
-                        self.current_commit_index.load(std::sync::atomic::Ordering::SeqCst)
-                    );
-                    // CRITICAL FIX: Stop consensus authority before starting sync task
-                    // Without this, old consensus components continue running alongside sync task,
-                    // causing resource leaks and potential conflicts.
-                    if let Some(auth) = self.authority.take() {
-                        info!(
-                            "🛑 [NODE MODE] Stopping consensus authority for demotion to SyncOnly"
-                        );
-                        auth.stop().await;
-                    }
+                    // STEP 4: Start sync task (now safe - authority is stopped)
                     let _ = self.start_sync_task(config).await;
                     // Start unified epoch monitor for demotion recovery
                     if let Ok(Some(handle)) =

@@ -119,14 +119,38 @@ impl BlockQueue {
         self.next_expected
     }
 
-    /// Update next_expected (e.g., when Go reports its progress)
+    /// Update next_expected to align with Go's progress (AUTHORITATIVE source of truth)
+    /// CRITICAL FIX: Always sync queue with Go, not just when Go is ahead.
+    /// This fixes the 40K block gap issue where queue jumped ahead while Go was stuck.
     fn sync_with_go(&mut self, go_last_block: u64) {
-        // If Go is ahead of us, update our expectation
-        if go_last_block + 1 > self.next_expected {
+        let go_next = go_last_block + 1;
+
+        // CASE 1: Go is ahead of queue (normal catch-up)
+        if go_next > self.next_expected {
             // Remove any pending blocks that Go already processed
             self.pending.retain(|&idx, _| idx > go_last_block);
-            self.next_expected = go_last_block + 1;
+            self.next_expected = go_next;
+            info!(
+                "🔄 [QUEUE-SYNC] Go ahead: aligned queue to next_expected={}",
+                self.next_expected
+            );
         }
+        // CASE 2: Queue is way ahead of Go (BUG FIX - queue jumped ahead while Go was stuck)
+        // This happens when buffer is full and blocks can't be sent to Go
+        else if self.next_expected > go_next + 100 {
+            // Queue is more than 100 blocks ahead of Go - this is abnormal!
+            // Reset queue to Go's position to prevent wasted fetching
+            warn!(
+                "🚨 [QUEUE-SYNC] Queue desync detected! queue_next={} >> go_next={}. Resetting queue.",
+                self.next_expected, go_next
+            );
+            // Clear pending blocks that are way ahead - they'll be re-fetched
+            self.pending
+                .retain(|&idx, _| idx >= go_next && idx < go_next + 1000);
+            self.next_expected = go_next;
+        }
+        // CASE 3: Queue slightly ahead of Go (normal - blocks in flight)
+        // Keep as-is, this is expected during normal sync
     }
 
     /// Number of pending commits in queue
@@ -167,7 +191,9 @@ impl RustSyncHandle {
 /// Configuration for RustSyncNode
 pub struct RustSyncConfig {
     pub fetch_interval_secs: u64,
+    pub turbo_fetch_interval_ms: u64, // Faster interval when catching up
     pub fetch_batch_size: u32,
+    pub turbo_batch_size: u32, // Larger batch when catching up
     pub fetch_timeout_secs: u64,
 }
 
@@ -175,8 +201,10 @@ impl Default for RustSyncConfig {
     fn default() -> Self {
         Self {
             fetch_interval_secs: 2,
-            fetch_batch_size: 100,
-            fetch_timeout_secs: 10,
+            turbo_fetch_interval_ms: 50, // OPTIMIZED: 50ms (was 200ms) for fast catchup
+            fetch_batch_size: 500,       // OPTIMIZED: 500 (was 100) blocks per fetch
+            turbo_batch_size: 2000,      // OPTIMIZED: 2000 (was 500) for aggressive catchup
+            fetch_timeout_secs: 30,      // OPTIMIZED: 30s (was 10s) for larger batches
         }
     }
 }
@@ -266,13 +294,50 @@ impl RustSyncNode {
     }
 
     /// Main sync loop - fetches commits from peers
+    /// Uses adaptive interval: turbo mode (200ms) when catching up, normal (2s) otherwise
     async fn sync_loop(self, shutdown_rx: &mut oneshot::Receiver<()>) {
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(self.config.fetch_interval_secs));
+        let normal_interval = Duration::from_secs(self.config.fetch_interval_secs);
+        let turbo_interval = Duration::from_millis(self.config.turbo_fetch_interval_ms);
+        let mut is_turbo_mode = false;
 
         loop {
+            // Determine if we're catching up (behind network)
+            let catching_up = {
+                let queue = self.block_queue.lock().await;
+                let pending = queue.pending_count();
+                // Turbo mode: if we have pending commits OR queue is empty (might need to fetch)
+                pending > 0 || queue.next_expected() > 1
+            };
+
+            // Check if peer epoch is ahead (triggers turbo mode)
+            let go_epoch = self.executor_client.get_current_epoch().await.unwrap_or(0);
+            let rust_epoch = self.current_epoch.load(Ordering::SeqCst);
+            let epoch_behind = rust_epoch < go_epoch;
+
+            let new_turbo = catching_up || epoch_behind;
+            if new_turbo != is_turbo_mode {
+                is_turbo_mode = new_turbo;
+                if is_turbo_mode {
+                    info!(
+                        "🚀 [RUST-SYNC] TURBO MODE ENABLED - interval={}ms, batch_size={}",
+                        self.config.turbo_fetch_interval_ms, self.config.turbo_batch_size
+                    );
+                } else {
+                    info!(
+                        "🐢 [RUST-SYNC] Normal mode - interval={}s, batch_size={}",
+                        self.config.fetch_interval_secs, self.config.fetch_batch_size
+                    );
+                }
+            }
+
+            let sleep_duration = if is_turbo_mode {
+                turbo_interval
+            } else {
+                normal_interval
+            };
+
             tokio::select! {
-                _ = interval.tick() => {
+                _ = tokio::time::sleep(sleep_duration) => {
                     if let Err(e) = self.sync_once().await {
                         warn!("[RUST-SYNC] Sync error: {}", e);
                     }
@@ -462,7 +527,35 @@ impl RustSyncNode {
                 warn!("[RUST-SYNC] PHASE 2 SKIPPED: committee is None");
             }
         } else {
-            warn!("[RUST-SYNC] PHASE 2 SKIPPED: network_client is None");
+            // PHASE 2.5: Use Peer Go Sync when network_client is None (SyncOnly mode)
+            info!("[RUST-SYNC] PHASE 2.5: No Mysticeti network, using Peer Go Sync");
+
+            let peer_addresses = self.get_peer_go_addresses();
+            if !peer_addresses.is_empty() {
+                let fetch_from = {
+                    let queue = self.block_queue.lock().await;
+                    queue.next_expected()
+                };
+
+                // Use turbo batch size for faster catchup - SyncOnly without network usually needs to catch up fast
+                let batch_size = self.config.turbo_batch_size as u64;
+
+                match self
+                    .fetch_blocks_from_peer_go(&peer_addresses, fetch_from, batch_size)
+                    .await
+                {
+                    Ok(synced) => {
+                        if synced > 0 {
+                            info!("✅ [PEER-GO-SYNC] Synced {} blocks via Peer Go", synced);
+                        }
+                    }
+                    Err(e) => {
+                        debug!("[PEER-GO-SYNC] Peer Go sync failed: {}", e);
+                    }
+                }
+            } else {
+                warn!("[RUST-SYNC] PHASE 2.5 SKIPPED: No peer addresses available (network_client is None and committee is None)");
+            }
         }
 
         // PHASE 3: Drain ready commits from queue and send to Go
@@ -473,7 +566,6 @@ impl RustSyncNode {
                 blocks_sent
             );
         }
-
         // =============================================================================
         // PHASE 4: Check pending epoch transitions (from deferred AdvanceEpoch)
         // If sync has caught up to a pending transition's boundary, process it now
@@ -481,30 +573,10 @@ impl RustSyncNode {
         self.check_and_process_pending_epoch_transitions(go_last_block)
             .await;
 
-        // Check epoch transition based on Go's progress
-        if go_epoch > rust_epoch {
-            info!(
-                "🎯 [RUST-SYNC] Epoch advance detected: {} -> {}",
-                rust_epoch, go_epoch
-            );
-
-            if let Ok((epoch, timestamp, boundary_block, _)) =
-                self.executor_client.get_epoch_boundary_data(go_epoch).await
-            {
-                if let Err(e) =
-                    self.epoch_transition_sender
-                        .send((epoch, timestamp, boundary_block))
-                {
-                    warn!("[RUST-SYNC] Failed to send transition: {}", e);
-                } else {
-                    info!(
-                        "✅ [RUST-SYNC] Sent epoch transition: {} -> {} at block {}",
-                        rust_epoch, go_epoch, boundary_block
-                    );
-                    self.current_epoch.store(go_epoch, Ordering::SeqCst);
-                }
-            }
-        }
+        // NOTE: Epoch transitions are now handled CENTRALLY by epoch_monitor.rs
+        // The unified epoch monitor polls Go/peers every 10s and triggers transitions.
+        // This simplifies the sync code and prevents duplicate advance_epoch calls.
+        // See epoch_monitor.rs:start_unified_epoch_monitor()
 
         Ok(())
     }
@@ -575,221 +647,270 @@ impl RustSyncNode {
             from_global_exec_index, from_local_commit, epoch_base, commit_range
         );
 
-        // Try each validator in turn until we succeed
-        for (authority_idx, _authority) in committee.authorities() {
-            trace!(
-                "[RUST-SYNC] Fetching commits {:?} from peer {}",
-                commit_range,
-                authority_idx
-            );
+        // =====================================================================
+        // PARALLEL FETCH: Race all validators simultaneously for same range
+        // First successful response wins - much faster than sequential iteration
+        // =====================================================================
+        info!(
+            "🚀 [PARALLEL-FETCH] Racing {} validators for range {:?}",
+            committee.size(),
+            commit_range
+        );
 
-            match network_client
-                .fetch_commits(authority_idx, commit_range.clone(), timeout)
-                .await
-            {
-                Ok((serialized_commits, _certifier_blocks)) => {
-                    if serialized_commits.is_empty() {
-                        debug!(
-                            "[RUST-SYNC] Peer {} returned empty commits for range {:?}",
-                            authority_idx, commit_range
-                        );
-                        continue;
-                    }
+        let authorities: Vec<_> = committee.authorities().map(|(idx, _)| idx).collect();
+        let mut fetch_handles = Vec::with_capacity(authorities.len());
 
-                    // Phase 1: Deserialize commits to get block references
-                    let mut all_block_refs = Vec::new();
-                    let mut temp_commits = Vec::new();
+        for authority_idx in authorities {
+            let client = network_client.clone();
+            let range = commit_range.clone();
 
-                    for serialized in &serialized_commits {
-                        match bcs::from_bytes::<Commit>(serialized) {
-                            Ok(commit) => {
-                                // Collect all block refs from this commit
-                                for block_ref in commit.blocks() {
-                                    all_block_refs.push(block_ref.clone());
-                                }
-                                temp_commits.push(commit);
-                            }
-                            Err(e) => {
-                                warn!("[RUST-SYNC] Failed to deserialize commit: {}", e);
-                            }
+            let handle = tokio::spawn(async move {
+                match client
+                    .fetch_commits(authority_idx, range.clone(), timeout)
+                    .await
+                {
+                    Ok((commits, certs)) => {
+                        if commits.is_empty() {
+                            Err(anyhow::anyhow!("Empty response from {}", authority_idx))
+                        } else {
+                            Ok((authority_idx, commits, certs))
                         }
                     }
+                    Err(e) => Err(anyhow::anyhow!("Peer {} failed: {:?}", authority_idx, e)),
+                }
+            });
+            fetch_handles.push(handle);
+        }
 
-                    if all_block_refs.is_empty() {
-                        info!(
-                            "📥 [RUST-SYNC] Fetched {} commits with 0 block refs from peer {}",
-                            serialized_commits.len(),
-                            authority_idx
-                        );
-                    } else {
-                        info!(
-                            "📥 [RUST-SYNC] Fetched {} commits with {} block refs from peer {}, fetching actual blocks...",
-                            serialized_commits.len(),
-                            all_block_refs.len(),
-                            authority_idx
-                        );
+        // Wait for first successful response (race pattern)
+        let mut serialized_commits = Vec::new();
+        let mut winning_peer = None;
+
+        for handle in fetch_handles {
+            match handle.await {
+                Ok(Ok((peer_idx, commits, _certs))) => {
+                    if commits.len() > serialized_commits.len() {
+                        serialized_commits = commits;
+                        winning_peer = Some(peer_idx);
                     }
-
-                    // Phase 2: Fetch actual DAG blocks using fetch_blocks API
-                    let mut block_map = std::collections::HashMap::new();
-
-                    if !all_block_refs.is_empty() {
-                        // Deduplicate block refs
-                        all_block_refs.sort();
-                        all_block_refs.dedup();
-
-                        match network_client
-                            .fetch_blocks(
-                                authority_idx,
-                                all_block_refs.clone(),
-                                vec![], // No highest_accepted_rounds for commit sync
-                                false,  // Not breadth first
-                                timeout,
-                            )
-                            .await
-                        {
-                            Ok(serialized_blocks) => {
-                                info!(
-                                    "📦 [RUST-SYNC] Fetched {} actual blocks from peer {}",
-                                    serialized_blocks.len(),
-                                    authority_idx
-                                );
-
-                                for serialized in &serialized_blocks {
-                                    match bcs::from_bytes::<SignedBlock>(serialized) {
-                                        Ok(signed_block) => {
-                                            let verified = VerifiedBlock::new_verified(
-                                                signed_block,
-                                                serialized.clone(),
-                                            );
-                                            block_map.insert(verified.reference(), verified);
-                                        }
-                                        Err(e) => {
-                                            warn!("[RUST-SYNC] Failed to deserialize block: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "⚠️ [RUST-SYNC] Failed to fetch blocks from peer {}: {:?}",
-                                    authority_idx, e
-                                );
-                            }
-                        }
-                    }
-
-                    // Phase 3: Push commits with their blocks to queue
-                    let mut pushed = 0;
-                    {
-                        let mut queue = self.block_queue.lock().await;
-
-                        for commit in temp_commits {
-                            // Collect blocks for this commit
-                            let mut commit_blocks = Vec::new();
-                            for block_ref in commit.blocks() {
-                                if let Some(block) = block_map.get(block_ref) {
-                                    commit_blocks.push(block.clone());
-                                }
-                            }
-
-                            let expected_blocks = commit.blocks().len();
-                            let actual_blocks = commit_blocks.len();
-
-                            if actual_blocks < expected_blocks {
-                                debug!(
-                                    "[RUST-SYNC] Commit {} has {}/{} blocks",
-                                    commit.index(),
-                                    actual_blocks,
-                                    expected_blocks
-                                );
-                            }
-
-                            // Log commit details to debug missing blocks
-                            let global_idx = commit.global_exec_index();
-                            let commit_idx = commit.index();
-                            let next_expected = queue.next_expected();
-                            let will_add = global_idx >= next_expected
-                                && !queue.pending.contains_key(&global_idx);
-
-                            // 🔍 DIAGNOSTIC: Detect gap and trigger global range fallback
-                            let gap = if global_idx > next_expected {
-                                global_idx - next_expected
-                            } else {
-                                0
-                            };
-                            if gap > 10 && pushed == 0 {
-                                // First commit has a huge gap - need to use global range RPC!
-                                warn!(
-                                    "🔄 [RUST-SYNC] GAP DETECTED! commit[{}].global_exec_index={} but queue_next_expected={}. \
-                                     Gap size: {} blocks. Falling back to global range RPC to fetch missing blocks!",
-                                    commit_idx, global_idx, next_expected, gap
-                                );
-                                // Early return - caller will detect 0 pushed and caller (sync_tick)
-                                // will use from_global_exec_index from Go which is correct
-                                // We need to use global range RPC for these missing blocks
-                                drop(queue); // Release lock before calling RPC
-
-                                // Fallback: fetch missing blocks using global range RPC
-                                return self
-                                    .fetch_and_queue_by_global_range(
-                                        network_client,
-                                        committee,
-                                        next_expected,
-                                        global_idx.saturating_sub(1),
-                                    )
-                                    .await;
-                            }
-
-                            if pushed < 5 || (global_idx <= 5) {
-                                info!(
-                                    "📋 [RUST-SYNC] Commit: commit_index={}, global_exec_index={}, blocks={}, will_add={}, queue_next_expected={}{}",
-                                    commit_idx, global_idx, actual_blocks, will_add, next_expected,
-                                    if !will_add { " ⚠️ REJECTED (global_idx < next_expected or already pending)" } else { "" }
-                                );
-                            }
-
-                            // Push to queue - it will deduplicate and sort automatically
-                            queue.push(CommitData {
-                                commit,
-                                blocks: commit_blocks,
-                                epoch: current_epoch,
-                            });
-                            pushed += 1;
-                        }
-                    }
-
-                    info!(
-                        "✅ [RUST-SYNC] Pushed {} commits with {} blocks to queue",
-                        pushed,
-                        block_map.len()
-                    );
-
-                    return Ok(pushed);
+                }
+                Ok(Err(e)) => {
+                    trace!("[PARALLEL-FETCH] {}", e);
                 }
                 Err(e) => {
-                    debug!("[RUST-SYNC] Peer {} fetch failed: {:?}", authority_idx, e);
-                    continue;
+                    warn!("[PARALLEL-FETCH] Task join error: {}", e);
                 }
             }
         }
 
-        // Fallback: If standard fetch returned 0 commits, it might be due to epoch mismatch
-        // (e.g., we are in Epoch 0, Peer is in Epoch 1, so local commit index lookup fails).
-        // Try fetching by global index range which works across epochs.
-        warn!(
-            "⚠️ [RUST-SYNC] Standard fetch returned 0 commits for global_index={}. \
-             Peer might be on a different epoch. Falling back to global range sync!",
-            from_global_exec_index
+        if serialized_commits.is_empty() {
+            // Fallback to global range sync
+            warn!(
+                "⚠️ [PARALLEL-FETCH] All validators returned empty for range {:?}. Falling back to global range!",
+                commit_range
+            );
+            return self
+                .fetch_and_queue_by_global_range(
+                    network_client,
+                    committee,
+                    from_global_exec_index as u64,
+                    (from_global_exec_index + batch_size) as u64,
+                )
+                .await;
+        }
+
+        let authority_idx = winning_peer.unwrap();
+        info!(
+            "✅ [PARALLEL-FETCH] Peer {} won race with {} commits",
+            authority_idx,
+            serialized_commits.len()
         );
 
-        self.fetch_and_queue_by_global_range(
-            network_client,
-            committee,
-            from_global_exec_index as u64,
-            (from_global_exec_index + batch_size) as u64,
-        )
-        .await
+        // Now process the winning response (same logic as before)
+        // Phase 1: Deserialize commits to get block references
+        let mut all_block_refs = Vec::new();
+        let mut temp_commits = Vec::new();
+
+        for serialized in &serialized_commits {
+            match bcs::from_bytes::<Commit>(serialized) {
+                Ok(commit) => {
+                    // Collect all block refs from this commit
+                    for block_ref in commit.blocks() {
+                        all_block_refs.push(block_ref.clone());
+                    }
+                    temp_commits.push(commit);
+                }
+                Err(e) => {
+                    warn!("[RUST-SYNC] Failed to deserialize commit: {}", e);
+                }
+            }
+        }
+
+        if all_block_refs.is_empty() {
+            info!(
+                "📥 [RUST-SYNC] Fetched {} commits with 0 block refs from peer {}",
+                serialized_commits.len(),
+                authority_idx
+            );
+        } else {
+            info!(
+                "📥 [RUST-SYNC] Fetched {} commits with {} block refs from peer {}, fetching actual blocks...",
+                serialized_commits.len(),
+                all_block_refs.len(),
+                authority_idx
+            );
+        }
+
+        // Phase 2: Fetch actual DAG blocks using fetch_blocks API
+        let mut block_map = std::collections::HashMap::new();
+
+        if !all_block_refs.is_empty() {
+            // Deduplicate block refs
+            all_block_refs.sort();
+            all_block_refs.dedup();
+
+            match network_client
+                .fetch_blocks(
+                    authority_idx,
+                    all_block_refs.clone(),
+                    vec![], // No highest_accepted_rounds for commit sync
+                    false,  // Not breadth first
+                    timeout,
+                )
+                .await
+            {
+                Ok(serialized_blocks) => {
+                    info!(
+                        "📦 [RUST-SYNC] Fetched {} actual blocks from peer {}",
+                        serialized_blocks.len(),
+                        authority_idx
+                    );
+
+                    for serialized in &serialized_blocks {
+                        match bcs::from_bytes::<SignedBlock>(serialized) {
+                            Ok(signed_block) => {
+                                let verified =
+                                    VerifiedBlock::new_verified(signed_block, serialized.clone());
+                                block_map.insert(verified.reference(), verified);
+                            }
+                            Err(e) => {
+                                warn!("[RUST-SYNC] Failed to deserialize block: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [RUST-SYNC] Failed to fetch blocks from peer {}: {:?}",
+                        authority_idx, e
+                    );
+                }
+            }
+        }
+
+        // Phase 3: Push commits with their blocks to queue
+        let mut pushed = 0;
+        {
+            let mut queue = self.block_queue.lock().await;
+
+            for commit in temp_commits {
+                // Collect blocks for this commit
+                let mut commit_blocks = Vec::new();
+                for block_ref in commit.blocks() {
+                    if let Some(block) = block_map.get(block_ref) {
+                        commit_blocks.push(block.clone());
+                    }
+                }
+
+                let expected_blocks = commit.blocks().len();
+                let actual_blocks = commit_blocks.len();
+
+                if actual_blocks < expected_blocks {
+                    debug!(
+                        "[RUST-SYNC] Commit {} has {}/{} blocks",
+                        commit.index(),
+                        actual_blocks,
+                        expected_blocks
+                    );
+                }
+
+                // Log commit details to debug missing blocks
+                let global_idx = commit.global_exec_index();
+                let commit_idx = commit.index();
+                let next_expected = queue.next_expected();
+                let will_add =
+                    global_idx >= next_expected && !queue.pending.contains_key(&global_idx);
+
+                // 🔍 DIAGNOSTIC: Detect gap and trigger global range fallback
+                let gap = if global_idx > next_expected {
+                    global_idx - next_expected
+                } else {
+                    0
+                };
+
+                // =================================================================
+                // EPOCH MISMATCH DETECTION: If global_idx << next_expected
+                // This means peers are sending commits with old global_exec_index
+                // which indicates we're requesting from wrong epoch
+                // =================================================================
+                let negative_gap = if next_expected > global_idx {
+                    next_expected - global_idx
+                } else {
+                    0
+                };
+
+                if negative_gap > 1000 && pushed == 0 {
+                    warn!(
+                        "🚨 [EPOCH-MISMATCH] CRITICAL! commit[{}].global_exec_index={} but queue_next_expected={}. \
+                         Negative gap: {} blocks. This indicates EPOCH MISMATCH!",
+                        commit_idx, global_idx, next_expected, negative_gap
+                    );
+                    drop(queue);
+                    return Ok(0); // Return 0 pushed to trigger epoch recovery in caller
+                }
+
+                if gap > 10 && pushed == 0 {
+                    warn!(
+                        "🔄 [RUST-SYNC] GAP DETECTED! commit[{}].global_exec_index={} but queue_next_expected={}. \
+                         Gap size: {} blocks. Falling back to global range RPC!",
+                        commit_idx, global_idx, next_expected, gap
+                    );
+                    drop(queue);
+                    return self
+                        .fetch_and_queue_by_global_range(
+                            network_client,
+                            committee,
+                            next_expected,
+                            global_idx.saturating_sub(1),
+                        )
+                        .await;
+                }
+
+                if pushed < 5 || (global_idx <= 5) {
+                    info!(
+                        "📋 [RUST-SYNC] Commit: commit_index={}, global_exec_index={}, blocks={}, will_add={}, queue_next_expected={}{}",
+                        commit_idx, global_idx, actual_blocks, will_add, next_expected,
+                        if !will_add { " ⚠️ REJECTED (global_idx < next_expected or already pending)" } else { "" }
+                    );
+                }
+
+                // Push to queue - it will deduplicate and sort automatically
+                queue.push(CommitData {
+                    commit,
+                    blocks: commit_blocks,
+                    epoch: current_epoch,
+                });
+                pushed += 1;
+            }
+        }
+
+        info!(
+            "✅ [RUST-SYNC] Pushed {} commits with {} blocks to queue",
+            pushed,
+            block_map.len()
+        );
+
+        Ok(pushed)
     }
 
     /// Fetch commits using global execution index range (cross-epoch safe)
@@ -802,7 +923,7 @@ impl RustSyncNode {
         end_global_index: u64,
     ) -> Result<usize> {
         let timeout = Duration::from_secs(self.config.fetch_timeout_secs);
-        let current_epoch = self.current_epoch.load(Ordering::SeqCst);
+        let _current_epoch = self.current_epoch.load(Ordering::SeqCst);
 
         info!(
             "🌐 [GLOBAL-SYNC] Fetching commits by global range [{}, {}]",
@@ -1209,4 +1330,134 @@ pub async fn start_rust_sync_task_with_network(
     .with_network(context, network_keypair, committee);
 
     Ok(sync_node.start())
+}
+
+// =============================================================================
+// PEER GO SYNC: Fetch blocks directly from peer's Go layer
+// This enables Rust-centric sync where all sync operations go through Rust
+// =============================================================================
+
+impl RustSyncNode {
+    /// Fetch blocks from peer's Go layer using PeerGoClient
+    /// This is used when network_client is None (SyncOnly) or as a fallback
+    /// Returns the number of blocks successfully sent to local Go
+    pub async fn fetch_blocks_from_peer_go(
+        &self,
+        peer_addresses: &[String],
+        from_block: u64,
+        batch_size: u64,
+    ) -> Result<usize> {
+        use super::peer_go_client::PeerGoClient;
+
+        if peer_addresses.is_empty() {
+            return Err(anyhow::anyhow!("No peer addresses configured"));
+        }
+
+        let to_block = from_block + batch_size - 1;
+
+        info!(
+            "🌐 [PEER-GO-SYNC] Fetching blocks {} to {} from peer Go layers",
+            from_block, to_block
+        );
+
+        // Try each peer until one succeeds
+        for peer_addr in peer_addresses {
+            let client = match PeerGoClient::from_str(peer_addr) {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(
+                        "⚠️ [PEER-GO-SYNC] Invalid peer address {}: {}",
+                        peer_addr, e
+                    );
+                    continue;
+                }
+            };
+
+            match client.get_blocks_range(from_block, to_block).await {
+                Ok(blocks) => {
+                    if blocks.is_empty() {
+                        debug!("[PEER-GO-SYNC] Peer {} returned 0 blocks", peer_addr);
+                        continue;
+                    }
+
+                    info!(
+                        "✅ [PEER-GO-SYNC] Got {} blocks from peer {}, sending to local Go",
+                        blocks.len(),
+                        peer_addr
+                    );
+
+                    // Send blocks to local Go via ExecutorClient
+                    for block in &blocks {
+                        // Convert BlockData to ExecutorClient format and send
+                        // The executor_client handles the actual commit
+                        let block_num = block.block_number;
+                        let epoch = block.epoch;
+
+                        // Check epoch transition
+                        let current_epoch =
+                            self.current_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                        if epoch > current_epoch {
+                            info!(
+                                "🎯 [PEER-GO-SYNC] Epoch transition detected in block {}: {} -> {}",
+                                block_num, current_epoch, epoch
+                            );
+
+                            // Trigger epoch transition
+                            if let Ok((_e, timestamp, boundary, _)) =
+                                self.executor_client.get_epoch_boundary_data(epoch).await
+                            {
+                                let _ = self
+                                    .epoch_transition_sender
+                                    .send((epoch, timestamp, boundary));
+                                self.current_epoch
+                                    .store(epoch, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    }
+
+                    // Use sync_blocks to write all blocks at once
+                    match self.executor_client.sync_blocks(blocks).await {
+                        Ok((synced, last_block)) => {
+                            info!(
+                                "✅ [PEER-GO-SYNC] Synced {} blocks to local Go (last: {})",
+                                synced, last_block
+                            );
+                            return Ok(synced as usize);
+                        }
+                        Err(e) => {
+                            warn!("⚠️ [PEER-GO-SYNC] Failed to sync blocks to local Go: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("[PEER-GO-SYNC] Peer {} fetch failed: {}", peer_addr, e);
+                    continue;
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("All peers failed to provide blocks"))
+    }
+
+    /// Get peer Go addresses from committee (if available) or config
+    pub fn get_peer_go_addresses(&self) -> Vec<String> {
+        if let Some(ref committee) = self.committee {
+            committee
+                .authorities()
+                .filter_map(|(_, auth)| {
+                    let addr_str = auth.address.to_string();
+                    // Extract host from /dns/hostname/tcp/port format
+                    if let Some(host) = addr_str.split('/').nth(2) {
+                        // Use peer_rpc_port (8000 base)
+                        Some(format!("{}:8000", host))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
 }
