@@ -28,6 +28,7 @@ pub struct PeerGoClient {
     timeout_secs: u64,
 }
 
+#[allow(dead_code)]
 impl PeerGoClient {
     /// Create a new PeerGoClient
     pub fn new(peer_addr: SocketAddr) -> Self {

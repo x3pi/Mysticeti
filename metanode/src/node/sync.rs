@@ -146,7 +146,7 @@ impl SyncOnlyNode {
 // =======================
 
 /// Start the sync task for SyncOnly nodes (using RustSyncNode for P2P sync)
-pub async fn start_sync_task(node: &mut ConsensusNode, config: &NodeConfig) -> Result<()> {
+pub async fn start_sync_task(node: &mut ConsensusNode, _config: &NodeConfig) -> Result<()> {
     if !matches!(node.node_mode, NodeMode::SyncOnly) || node.sync_task_handle.is_some() {
         return Ok(());
     }

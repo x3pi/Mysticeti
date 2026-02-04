@@ -1374,9 +1374,26 @@ pub async fn transition_mode_only(
     // Fetch committee using same pattern as epoch_monitor
     let committee_source = crate::node::committee_source::CommitteeSource::discover(config).await?;
 
-    let committee = committee_source
-        .fetch_committee(&config.executor_send_socket_path, epoch)
+    // =============================================================================
+    // UNIFIED TIMESTAMP APPROACH (FORK-SAFE)
+    // =============================================================================
+    // Use fetch_committee_with_timestamp to get BOTH committee AND timestamp from Go.
+    // Go derives timestamp deterministically:
+    // - Epoch 0: Genesis timestamp from genesis.json
+    // - Epoch N: boundaryBlock.Header().TimeStamp() * 1000
+    //
+    // This REPLACES the epoch_timestamp_ms parameter - we IGNORE what was passed in
+    // and use Go's authoritative value instead. This ensures ALL nodes use the same
+    // timestamp even if EndOfEpoch SystemTx had different precision.
+    // =============================================================================
+    let (committee, go_authoritative_timestamp) = committee_source
+        .fetch_committee_with_timestamp(&config.executor_send_socket_path, epoch)
         .await?;
+
+    info!(
+        "✅ [MODE TRANSITION] Got UNIFIED committee+timestamp from Go: epoch={}, timestamp={} ms",
+        epoch, go_authoritative_timestamp
+    );
 
     // Update node mode (this also handles Go handoff)
     node.check_and_update_node_mode(&committee, config).await?;
@@ -1426,35 +1443,24 @@ pub async fn transition_mode_only(
     node.current_commit_index.store(0, Ordering::SeqCst);
 
     // =============================================================================
-    // CRITICAL FIX: ALWAYS use the passed-in epoch_timestamp_ms (from EndOfEpoch SystemTx)
-    //
-    // Why this matters:
-    // - EndOfEpoch SystemTx contains the exact timestamp_ms when epoch ended
-    // - ALL validators see this exact same timestamp in the transaction
-    // - Genesis blocks use timestamp → different timestamp = different genesis hash = FORK!
-    //
-    // Why CommitteeSource.epoch_timestamp_ms is WRONG for late-joining nodes:
-    // - Late-joining SyncOnly nodes query Go for CommitteeSource
-    // - Go may have a different (rounded or stale) epoch_start_timestamp
-    // - Node 4 got 1770197184122ms (from Go query) while network had 1770197180831ms (from EndOfEpoch tx)
-    // - This 3.3s difference caused different genesis hashes → FORK!
-    //
-    // SOLUTION: Always trust epoch_timestamp_ms parameter - it came from signal which
-    // was triggered by EndOfEpoch SystemTx processing or peer epoch boundary query.
+    // UNIFIED TIMESTAMP (FORK-SAFE) - 2026-02-04
     // =============================================================================
-    let epoch_timestamp_to_use = epoch_timestamp_ms;
-
-    // Log for debugging if CommitteeSource has different timestamp
-    let committee_source_timestamp = committee_source.epoch_timestamp_ms;
-    if committee_source_timestamp > 0 && committee_source_timestamp != epoch_timestamp_ms {
-        warn!(
-            "⚠️ [MODE TRANSITION] CommitteeSource timestamp {} differs from authoritative timestamp {}. Using authoritative.",
-            committee_source_timestamp, epoch_timestamp_ms
-        );
-    }
+    // We now use go_authoritative_timestamp from fetch_committee_with_timestamp().
+    // This timestamp comes from Go's get_epoch_boundary_data():
+    // - Epoch 0: Genesis timestamp from genesis.json
+    // - Epoch N: boundaryBlock.Header().TimeStamp() * 1000
+    //
+    // This IGNORES the epoch_timestamp_ms parameter (from EndOfEpoch SystemTx).
+    // The parameter may have millisecond precision that differs from block header.
+    // By using Go's derivation, ALL nodes get IDENTICAL timestamp = NO FORK!
+    //
+    // Note: epoch_timestamp_ms is prefixed with _ to suppress unused warning
+    // =============================================================================
+    let epoch_timestamp_to_use = go_authoritative_timestamp;
+    let _ = epoch_timestamp_ms; // Suppress unused variable warning
 
     info!(
-        "✅ [MODE TRANSITION] Using AUTHORITATIVE epoch_timestamp={} ms (from EndOfEpoch signal)",
+        "✅ [MODE TRANSITION] Using UNIFIED timestamp={} ms from Go boundary block (ignoring EndOfEpoch tx timestamp)",
         epoch_timestamp_to_use
     );
 

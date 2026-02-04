@@ -361,7 +361,7 @@ impl RustSyncNode {
         let go_epoch = self.executor_client.get_current_epoch().await?;
 
         let rust_epoch = self.current_epoch.load(Ordering::SeqCst);
-        let epoch_base = self.epoch_base_index.load(Ordering::SeqCst);
+        let _epoch_base = self.epoch_base_index.load(Ordering::SeqCst);
 
         // =====================================================================
         // AUTO-EPOCH-SYNC: Detect when Go is ahead and auto-update internal state

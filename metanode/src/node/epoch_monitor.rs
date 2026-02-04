@@ -93,7 +93,7 @@ pub fn start_unified_epoch_monitor(
             };
 
             // 3. Get current Rust epoch from node
-            let (rust_epoch, current_mode) =
+            let (rust_epoch, _current_mode) =
                 if let Some(node_arc) = crate::node::get_transition_handler_node().await {
                     let node_guard = node_arc.lock().await;
                     (node_guard.current_epoch, node_guard.node_mode.clone())

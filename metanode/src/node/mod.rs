@@ -1231,6 +1231,7 @@ fn detect_local_epoch(storage_path: &std::path::Path) -> u64 {
 
 /// Load previous epoch RocksDB stores into LegacyEpochStoreManager
 /// This enables nodes to serve historical commits when starting directly in a later epoch
+#[allow(dead_code)]
 fn load_legacy_epoch_stores(
     legacy_manager: &std::sync::Arc<consensus_core::LegacyEpochStoreManager>,
     storage_path: &std::path::Path,

@@ -695,7 +695,7 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
             // Attempt to get votes for the last commit anyway, just to provide them?
             // But we can't filter by quorum.
             if let Some(c) = commits.last() {
-                let index = c.index();
+                let _index = c.index();
                 // We don't have the Legacy Store object here easily to read votes...
                 // Wait, we DO have it inside the loop, but now we are outside.
                 // BUT `self.store` is Current Store.

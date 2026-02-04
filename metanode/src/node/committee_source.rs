@@ -34,6 +34,7 @@ pub struct CommitteeSource {
     /// Whether this source is from a peer (not local)
     pub is_peer: bool,
     /// Peer RPC addresses for fallback when local is behind
+    #[allow(dead_code)]
     pub peer_rpc_addresses: Vec<String>,
 }
 
@@ -243,6 +244,90 @@ impl CommitteeSource {
             }
 
             // Wait and retry - sync must complete before proceeding
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            delay_ms = std::cmp::min(delay_ms * 2, MAX_DELAY_MS);
+        }
+    }
+
+    /// Fetch committee AND timestamp from Go (UNIFIED SOURCE)
+    ///
+    /// CRITICAL: This returns the timestamp from Go's get_epoch_boundary_data response.
+    /// Go derives this timestamp deterministically:
+    /// - Epoch 0: Genesis timestamp from genesis.json
+    /// - Epoch N: boundaryBlock.Header().TimeStamp() * 1000
+    ///
+    /// Using this timestamp ensures ALL nodes have identical genesis blocks = NO FORK!
+    pub async fn fetch_committee_with_timestamp(
+        &self,
+        send_socket: &str,
+        target_epoch: u64,
+    ) -> Result<(Committee, u64)> {
+        let client = self.create_executor_client(send_socket);
+
+        info!(
+            "📋 [COMMITTEE SOURCE] Fetching committee+timestamp for epoch {} from LOCAL Go (unified source)",
+            target_epoch
+        );
+
+        const INITIAL_DELAY_MS: u64 = 500;
+        const MAX_DELAY_MS: u64 = 5000;
+        const LOG_INTERVAL: u32 = 10;
+
+        let mut attempt = 0u32;
+        let mut delay_ms = INITIAL_DELAY_MS;
+
+        loop {
+            attempt += 1;
+            let should_log = attempt == 1 || attempt % LOG_INTERVAL == 0;
+
+            match client.get_epoch_boundary_data(target_epoch).await {
+                Ok((epoch, timestamp_ms, boundary_block, validators)) => {
+                    if epoch == target_epoch {
+                        info!(
+                            "✅ [UNIFIED TIMESTAMP] Got from Go: epoch={}, timestamp_ms={}, boundary_block={} (attempt {})",
+                            epoch, timestamp_ms, boundary_block, attempt
+                        );
+
+                        // Build committee from validators
+                        match crate::node::committee::build_committee_from_validator_info_list(
+                            &validators,
+                            target_epoch,
+                        )
+                        .await
+                        {
+                            Ok(committee) => {
+                                info!(
+                                    "✅ [UNIFIED TIMESTAMP] Committee size={}, AUTHORITATIVE timestamp={} ms",
+                                    committee.size(), timestamp_ms
+                                );
+                                return Ok((committee, timestamp_ms));
+                            }
+                            Err(e) => {
+                                if should_log {
+                                    warn!(
+                                        "⚠️ [UNIFIED TIMESTAMP] build_committee failed: {} (attempt {})",
+                                        e, attempt
+                                    );
+                                }
+                            }
+                        }
+                    } else if should_log {
+                        info!(
+                            "⏳ [UNIFIED TIMESTAMP] Local Go at epoch {}, waiting for epoch {} (attempt {})",
+                            epoch, target_epoch, attempt
+                        );
+                    }
+                }
+                Err(e) => {
+                    if should_log {
+                        info!(
+                            "⏳ [UNIFIED TIMESTAMP] Local Go not ready: {} (attempt {})",
+                            e, attempt
+                        );
+                    }
+                }
+            }
+
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
             delay_ms = std::cmp::min(delay_ms * 2, MAX_DELAY_MS);
         }
