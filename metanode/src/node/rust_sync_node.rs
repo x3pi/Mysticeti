@@ -428,6 +428,49 @@ impl RustSyncNode {
                     );
                 }
             }
+        } else if go_epoch == rust_epoch {
+            // =====================================================================
+            // COMMITTEE REFRESH: Check if committee is stale even with same epoch
+            // This handles the case where transition.rs updated epoch state but
+            // didn't update RustSyncNode's committee (e.g., SyncOnly transition)
+            // =====================================================================
+            let current_committee_size = {
+                let committee_guard = self.committee.read().unwrap();
+                committee_guard.as_ref().map(|c| c.size()).unwrap_or(0)
+            };
+
+            // Check if we need to refresh committee (e.g., new validator joined)
+            match self.executor_client.get_epoch_boundary_data(go_epoch).await {
+                Ok((_epoch, _ts, _boundary, validators)) => {
+                    if !validators.is_empty() && validators.len() != current_committee_size {
+                        info!(
+                            "🔄 [COMMITTEE-REFRESH] Committee size mismatch! Current={}, Go has={}. Rebuilding for epoch {}...",
+                            current_committee_size, validators.len(), go_epoch
+                        );
+
+                        match crate::node::committee::build_committee_from_validator_list(
+                            validators, go_epoch,
+                        ) {
+                            Ok(new_committee) => {
+                                info!(
+                                    "✅ [COMMITTEE-REFRESH] Committee rebuilt with {} authorities for epoch {}",
+                                    new_committee.size(), go_epoch
+                                );
+                                *self.committee.write().unwrap() = Some(new_committee);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "⚠️ [COMMITTEE-REFRESH] Failed to rebuild committee: {}. Keeping old committee.",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Ignore errors - this is just a refresh check
+                }
+            }
         }
 
         // Re-read epoch values after potential update

@@ -115,29 +115,89 @@ pub fn start_unified_epoch_monitor(
                 rust_epoch, network_epoch, epoch_gap
             );
 
-            // 4. Get epoch boundary data from LOCAL Go ONLY (Single Source of Truth)
-            // Wait for LOCAL Go to have the data - DO NOT use peer fallback here
-            // This ensures all nodes get committee from same source (their own synced Go layer)
+            // 4. Get epoch boundary data - CRITICAL FIX for timestamp consistency
+            // PROBLEM: When LOCAL Go syncs epoch from blocks, it uses block.TimeStamp()*1000
+            //          which is rounded to seconds. Validators use exact ms from EndOfEpoch tx.
+            //          This causes 906ms discrepancy -> different genesis hashes -> fork!
+            // SOLUTION: If LOCAL Go is behind (late-joining node), query PEER for authoritative timestamp
+            //           Peers (validators) have the exact timestamp from EndOfEpoch system tx.
+
             let local_executor_client = client_arc.clone();
-            let boundary_data = match local_executor_client
-                .get_epoch_boundary_data(network_epoch)
-                .await
-            {
-                Ok((epoch, timestamp_ms, boundary_block, _validators)) => {
-                    info!(
-                        "📊 [EPOCH MONITOR] Got boundary data from LOCAL Go: epoch={}, timestamp={}ms, boundary_block={}",
-                        epoch, timestamp_ms, boundary_block
-                    );
-                    (epoch, timestamp_ms, boundary_block)
+            let peer_rpc = config_clone.peer_rpc_addresses.clone();
+
+            let boundary_data = if local_go_epoch < network_epoch && !peer_rpc.is_empty() {
+                // LOCAL Go is behind - query PEER for authoritative timestamp
+                info!(
+                    "🌐 [EPOCH MONITOR] LOCAL Go epoch {} < network epoch {}. Querying PEER for authoritative timestamp...",
+                    local_go_epoch, network_epoch
+                );
+
+                // Try to get from first responsive peer
+                let mut peer_boundary_data: Option<(u64, u64, u64)> = None;
+                for peer_addr in &peer_rpc {
+                    match crate::network::peer_rpc::query_peer_epoch_boundary_data(
+                        peer_addr,
+                        network_epoch,
+                    )
+                    .await
+                    {
+                        Ok(data) => {
+                            info!(
+                                "✅ [EPOCH MONITOR] Got AUTHORITATIVE boundary data from PEER {}: epoch={}, timestamp={}ms, boundary={}",
+                                peer_addr, data.epoch, data.timestamp_ms, data.boundary_block
+                            );
+                            peer_boundary_data =
+                                Some((data.epoch, data.timestamp_ms, data.boundary_block));
+                            break;
+                        }
+                        Err(e) => {
+                            debug!(
+                                "⚠️ [EPOCH MONITOR] Peer {} failed for epoch {}: {}",
+                                peer_addr, network_epoch, e
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    // LOCAL Go not ready - wait and retry
-                    // DO NOT fallback to peer - let sync complete first
-                    info!(
-                        "⏳ [EPOCH MONITOR] Local Go not ready for epoch {}: {}. Waiting for sync...",
-                        network_epoch, e
-                    );
-                    continue; // Retry in next poll cycle
+
+                if let Some(data) = peer_boundary_data {
+                    data
+                } else {
+                    // Fallback to LOCAL Go if all peers fail
+                    warn!("⚠️ [EPOCH MONITOR] All peers failed, falling back to LOCAL Go (timestamp may be rounded!)");
+                    match local_executor_client
+                        .get_epoch_boundary_data(network_epoch)
+                        .await
+                    {
+                        Ok((epoch, timestamp_ms, boundary_block, _validators)) => {
+                            (epoch, timestamp_ms, boundary_block)
+                        }
+                        Err(e) => {
+                            info!("⏳ [EPOCH MONITOR] Local Go not ready: {}. Waiting...", e);
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                // LOCAL Go is in sync - use it as source (it has authoritative timestamp from AdvanceEpoch RPC)
+                match local_executor_client
+                    .get_epoch_boundary_data(network_epoch)
+                    .await
+                {
+                    Ok((epoch, timestamp_ms, boundary_block, _validators)) => {
+                        info!(
+                            "📊 [EPOCH MONITOR] Got boundary data from LOCAL Go: epoch={}, timestamp={}ms, boundary_block={}",
+                            epoch, timestamp_ms, boundary_block
+                        );
+                        (epoch, timestamp_ms, boundary_block)
+                    }
+                    Err(e) => {
+                        // LOCAL Go not ready - wait and retry
+                        info!(
+                            "⏳ [EPOCH MONITOR] Local Go not ready for epoch {}: {}. Waiting for sync...",
+                            network_epoch, e
+                        );
+                        continue; // Retry in next poll cycle
+                    }
                 }
             };
 
