@@ -27,8 +27,6 @@ pub struct CommitteeSource {
     pub socket_path: String,
     /// Epoch from the best source
     pub epoch: u64,
-    /// Fixed epoch start timestamp (CRITICAL for genesis hash)
-    pub epoch_timestamp_ms: u64,
     /// Last committed block from best source
     pub last_block: u64,
     /// Whether this source is from a peer (not local)
@@ -57,17 +55,11 @@ impl CommitteeSource {
 
         let local_epoch = local_client.get_current_epoch().await.unwrap_or(0);
         let local_block = local_client.get_last_block_number().await.unwrap_or(0);
-        let local_timestamp = local_client.get_epoch_start_timestamp().await.unwrap_or(0);
 
         info!(
-            "📊 [COMMITTEE SOURCE] Local Go Master: epoch={}, block={}, timestamp={}",
-            local_epoch, local_block, local_timestamp
+            "📊 [COMMITTEE SOURCE] Local Go Master: epoch={}, block={}",
+            local_epoch, local_block
         );
-
-        // DIAGNOSTIC: Detect potential timestamp reuse problem
-        if local_timestamp == 0 {
-            warn!("🚨 [TIMESTAMP DEBUG] Local returned ZERO timestamp! This will cause genesis issues.");
-        }
 
         // If no TCP peer addresses configured, use local
         if config.peer_rpc_addresses.is_empty() {
@@ -75,7 +67,6 @@ impl CommitteeSource {
             return Ok(Self {
                 socket_path: config.executor_receive_socket_path.clone(),
                 epoch: local_epoch,
-                epoch_timestamp_ms: local_timestamp,
                 last_block: local_block,
                 is_peer: false,
                 peer_rpc_addresses: Vec::new(),
@@ -85,7 +76,6 @@ impl CommitteeSource {
         // Query TCP peers to find the best source
         let mut best_epoch = local_epoch;
         let mut best_block = local_block;
-        let mut best_timestamp = local_timestamp;
         let best_socket = config.executor_receive_socket_path.clone();
         let mut is_peer = false;
 
@@ -106,7 +96,6 @@ impl CommitteeSource {
                     {
                         best_epoch = peer_info.epoch;
                         best_block = peer_info.last_block;
-                        best_timestamp = peer_info.timestamp_ms;
                         // For TCP peers, we still use local socket for actual data read
                         // The peer info just tells us who is ahead
                         // best_socket stays as local since we can't RPC read blocks over TCP (yet)
@@ -127,20 +116,14 @@ impl CommitteeSource {
             }
         }
 
-        // Validate timestamp is non-zero
-        if best_timestamp == 0 {
-            warn!("⚠️ [COMMITTEE SOURCE] Best source has zero timestamp, this may cause issues");
-        }
-
         info!(
-            "✅ [COMMITTEE SOURCE] Selected source: {} (epoch={}, block={}, timestamp={}, is_peer={})",
-            best_socket, best_epoch, best_block, best_timestamp, is_peer
+            "✅ [COMMITTEE SOURCE] Selected source: {} (epoch={}, block={}, is_peer={})",
+            best_socket, best_epoch, best_block, is_peer
         );
 
         Ok(Self {
             socket_path: best_socket.clone(),
             epoch: best_epoch,
-            epoch_timestamp_ms: best_timestamp,
             last_block: best_block,
             is_peer,
             peer_rpc_addresses: config.peer_rpc_addresses.clone(),
@@ -346,12 +329,6 @@ impl CommitteeSource {
         } else {
             true
         }
-    }
-
-    /// Get the epoch timestamp (CRITICAL for genesis hash consistency)
-    /// This is a fixed value set when epoch started, not a dynamic timestamp
-    pub fn get_epoch_timestamp(&self) -> u64 {
-        self.epoch_timestamp_ms
     }
 }
 

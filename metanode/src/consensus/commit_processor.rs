@@ -290,15 +290,12 @@ impl CommitProcessor {
                         if let Some((_block_ref, system_tx)) =
                             subdag.extract_end_of_epoch_transaction()
                         {
-                            if let Some((
-                                new_epoch,
-                                new_epoch_timestamp_ms,
-                                _commit_index_from_tx,
-                            )) = system_tx.as_end_of_epoch()
-                            {
+                            // SIMPLIFIED: as_end_of_epoch now returns (new_epoch, boundary_block)
+                            // Timestamp is derived from block header at boundary_block (by Go/Rust later)
+                            if let Some((new_epoch, boundary_block)) = system_tx.as_end_of_epoch() {
                                 info!(
-                                    "🎯 [SYSTEM TX] EndOfEpoch transaction detected in commit {}: epoch {} -> {}, total_txs_in_commit={}",
-                                    commit_index, current_epoch, new_epoch, total_txs_in_commit
+                                    "🎯 [SYSTEM TX] EndOfEpoch transaction detected in commit {}: epoch {} -> {}, boundary_block={}, total_txs_in_commit={}",
+                                    commit_index, current_epoch, new_epoch, boundary_block, total_txs_in_commit
                                 );
 
                                 if let Some(ref callback) = epoch_transition_callback {
@@ -307,13 +304,13 @@ impl CommitProcessor {
                                         commit_index, new_epoch, global_exec_index
                                     );
 
+                                    // CHANGED: Pass boundary_block instead of timestamp_ms
+                                    // Timestamp will be derived from boundary_block's block header
                                     if let Err(e) = callback(
                                         new_epoch,
-                                        new_epoch_timestamp_ms,
-                                        global_exec_index,
-                                    )
-                                    // FIXED: Use global_exec_index (u64) as sync point
-                                    {
+                                        boundary_block, // boundary_block (was timestamp_ms)
+                                        global_exec_index, // actual global_exec_index from commit
+                                    ) {
                                         warn!("❌ Failed to trigger epoch transition from system transaction: {}", e);
                                     }
                                 }

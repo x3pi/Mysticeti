@@ -21,13 +21,13 @@ pub struct EpochValidatorInfo {
 pub enum SystemTransactionKind {
     /// End of epoch transaction - triggers epoch transition
     /// This replaces the Proposal/Vote/Quorum mechanism
+    /// SIMPLIFIED: Timestamp is NOT stored here - derive from boundary_block's block header
     EndOfEpoch {
         /// New epoch number
         new_epoch: Epoch,
-        /// New epoch start timestamp in milliseconds
-        new_epoch_timestamp_ms: u64,
-        /// Commit index when this transaction was created (for fork-safety)
-        commit_index: u32,
+        /// Boundary block (last block of previous epoch) - used to derive timestamp
+        /// All nodes query block header at this index to get deterministic timestamp
+        boundary_block: u64,
     },
     /// Epoch boundary data - included in genesis block of each new epoch
     /// Allows late-joining nodes to recover boundary data by syncing blocks
@@ -52,12 +52,12 @@ pub struct SystemTransaction {
 
 impl SystemTransaction {
     /// Create a new EndOfEpoch system transaction
-    pub fn end_of_epoch(new_epoch: Epoch, new_epoch_timestamp_ms: u64, commit_index: u32) -> Self {
+    /// Timestamp is NOT stored - derive from boundary_block's block header when needed
+    pub fn end_of_epoch(new_epoch: Epoch, boundary_block: u64) -> Self {
         Self {
             kind: SystemTransactionKind::EndOfEpoch {
                 new_epoch,
-                new_epoch_timestamp_ms,
-                commit_index,
+                boundary_block,
             },
         }
     }
@@ -100,13 +100,13 @@ impl SystemTransaction {
     }
 
     /// Extract EndOfEpoch data if this is an EndOfEpoch transaction
-    pub fn as_end_of_epoch(&self) -> Option<(Epoch, u64, u32)> {
+    /// Returns (new_epoch, boundary_block)
+    pub fn as_end_of_epoch(&self) -> Option<(Epoch, u64)> {
         match &self.kind {
             SystemTransactionKind::EndOfEpoch {
                 new_epoch,
-                new_epoch_timestamp_ms,
-                commit_index,
-            } => Some((*new_epoch, *new_epoch_timestamp_ms, *commit_index)),
+                boundary_block,
+            } => Some((*new_epoch, *boundary_block)),
             _ => None,
         }
     }
@@ -135,12 +135,11 @@ impl fmt::Display for SystemTransaction {
         match &self.kind {
             SystemTransactionKind::EndOfEpoch {
                 new_epoch,
-                new_epoch_timestamp_ms,
-                commit_index,
+                boundary_block,
             } => write!(
                 f,
-                "EndOfEpoch(new_epoch={}, timestamp_ms={}, commit_index={})",
-                new_epoch, new_epoch_timestamp_ms, commit_index
+                "EndOfEpoch(new_epoch={}, boundary_block={})",
+                new_epoch, boundary_block
             ),
             SystemTransactionKind::EpochBoundary {
                 epoch,

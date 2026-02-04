@@ -21,7 +21,7 @@ use tracing::{error, info, trace, warn}; // Added TransactionSubmitter trait
 pub async fn transition_to_epoch_from_system_tx(
     node: &mut ConsensusNode,
     new_epoch: u64,
-    new_epoch_timestamp_ms: u64,
+    boundary_block_from_tx: u64, // CHANGED: This is now boundary_block from EndOfEpoch tx, not timestamp
     synced_global_exec_index: u64, // CHANGED: Use global_exec_index (u64) instead of commit_index (u32)
     config: &NodeConfig,
 ) -> Result<()> {
@@ -41,7 +41,7 @@ pub async fn transition_to_epoch_from_system_tx(
         return transition_mode_only(
             node,
             new_epoch,
-            new_epoch_timestamp_ms,
+            boundary_block_from_tx, // Pass boundary_block instead of timestamp
             synced_global_exec_index,
             config,
         )
@@ -331,25 +331,30 @@ pub async fn transition_to_epoch_from_system_tx(
     );
 
     // =============================================================================
-    // CRITICAL: Use timestamp from EndOfEpoch SYSTEM TRANSACTION as single source of truth
-    // This ensures ALL nodes use the SAME timestamp since they all process the same EndOfEpoch tx
-    // CommitteeSource/Go timestamps are NO LONGER authoritative - they caused fork issues!
+    // SIMPLIFIED: Timestamp is NOT in EndOfEpoch anymore!
+    // We only have boundary_block_from_tx. Timestamp will be fetched from Go AFTER
+    // Go advances epoch (Go derives it from boundary block header).
+    // Use provisional value here; will be updated after get_epoch_boundary_data.
     // =============================================================================
-    let epoch_timestamp_to_use = new_epoch_timestamp_ms; // FROM SYSTEM TX - AUTHORITATIVE
-
-    // Log CommitteeSource timestamp for debugging only (NOT used as source of truth)
-    let source_timestamp = committee_source.get_epoch_timestamp();
-    if source_timestamp != new_epoch_timestamp_ms && source_timestamp > 0 {
-        warn!(
-            "🔍 [TIMESTAMP INFO] CommitteeSource has different timestamp: source={}, system_tx={}. Using SYSTEM TX value (authoritative).",
-            source_timestamp, new_epoch_timestamp_ms
+    let epoch_timestamp_provisional: u64 = if boundary_block_from_tx > 0 {
+        // Provisional: Use current time as placeholder until we get real timestamp from Go
+        info!(
+            "📝 [EPOCH TIMESTAMP] Will derive timestamp from boundary block {} after Go advance",
+            boundary_block_from_tx
         );
-    }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    } else {
+        // Epoch 0 - use genesis timestamp (handled separately)
+        info!("ℹ️ [EPOCH TIMESTAMP] Epoch 0 uses genesis timestamp from config");
+        0
+    };
 
-    info!(
-        "✅ [EPOCH TIMESTAMP] Using timestamp from EndOfEpoch SystemTx for epoch {}: {} ms",
-        new_epoch, epoch_timestamp_to_use
-    );
+    // NOTE: epoch_timestamp_provisional is temporary - will be replaced after Go advance
+    // with definitive timestamp from get_epoch_boundary_data
+    let epoch_timestamp_to_use = epoch_timestamp_provisional;
 
     node.system_transaction_provider
         .update_epoch(new_epoch, epoch_timestamp_to_use)
@@ -360,8 +365,9 @@ pub async fn transition_to_epoch_from_system_tx(
     // Without this, fetch_committee will fail with "epoch X boundary block not stored"
 
     // =============================================================================
-    // SYNCONLY SYNC-AWARENESS FIX: Defer epoch advance if Go is behind
-    // For SyncOnly nodes, we must ensure Go has ALL blocks up to boundary before advancing
+    // UNIVERSAL SYNC-AWARENESS FIX: Defer epoch advance if Go is behind
+    // ALL nodes must ensure Go has ALL blocks up to boundary before advancing
+    // This applies to BOTH SyncOnly AND SyncOnly→Validator transitions!
     // Otherwise, Go will record wrong boundary (current stale block instead of real boundary)
     //
     // CRITICAL: Use synced_global_exec_index (from EndOfEpoch tx / network) NOT synced_index
@@ -369,69 +375,76 @@ pub async fn transition_to_epoch_from_system_tx(
     // =============================================================================
     let required_boundary = synced_global_exec_index; // From network/EndOfEpoch tx
 
-    if is_sync_only {
-        let go_current_block = executor_client.get_last_block_number().await.unwrap_or(0);
+    // Check if Go has synced to the required boundary (applies to ALL nodes, not just SyncOnly)
+    let go_current_block = executor_client.get_last_block_number().await.unwrap_or(0);
 
-        if go_current_block < required_boundary {
-            // Go hasn't synced to the boundary yet - QUEUE this transition for later
-            info!(
-                "📋 [DEFERRED EPOCH] SyncOnly: Go block {} < required boundary {}. Queuing epoch {} transition.",
-                go_current_block, required_boundary, new_epoch
-            );
+    if go_current_block < required_boundary {
+        // Go hasn't synced to the boundary yet - QUEUE this transition for later
+        info!(
+            "📋 [DEFERRED EPOCH] Go block {} < required boundary {}. Queuing epoch {} transition.",
+            go_current_block, required_boundary, new_epoch
+        );
 
-            // Queue the epoch transition for processing after sync catches up
-            {
-                let mut pending = node.pending_epoch_transitions.lock().await;
-                pending.push(crate::node::PendingEpochTransition {
-                    epoch: new_epoch,
-                    timestamp_ms: epoch_timestamp_to_use,
-                    boundary_block: required_boundary,
-                });
-            }
-
-            // =============================================================================
-            // CRITICAL FIX: Still update RUST state so sync can fetch from new epoch!
-            // Peers have already advanced to new epoch and purged old epoch data.
-            // Rust needs to know to fetch from new epoch, but Go advance is deferred.
-            // =============================================================================
-            info!(
-                "📋 [DEFERRED EPOCH] Updating Rust state to epoch {} (base={}) while deferring Go advance",
-                new_epoch, required_boundary
-            );
-
-            // Update Rust epoch state (but NOT calling Go advance_epoch)
-            node.current_epoch = new_epoch;
-            node.current_commit_index.store(0, Ordering::SeqCst);
-            {
-                let mut g = node.shared_last_global_exec_index.lock().await;
-                *g = required_boundary;
-            }
-            node.last_global_exec_index = required_boundary;
-            node.update_execution_lock_epoch(new_epoch).await;
-
-            // Note: Not starting new consensus here - sync task will fetch using existing network
-            // The epoch/epoch_base update above is sufficient for sync to work
-
-            node.is_transitioning.store(false, Ordering::SeqCst);
-            info!(
-                "📋 [DEFERRED EPOCH] Rust state updated. Go advance queued for when sync reaches block {}",
-                required_boundary
-            );
-            return Ok(());
-        } else {
-            info!(
-                "✅ [SYNCONLY EPOCH] Go is synced: block {} >= boundary {}. Proceeding with epoch {} advance.",
-                go_current_block, required_boundary, new_epoch
-            );
+        // Queue the epoch transition for processing after sync catches up
+        {
+            let mut pending = node.pending_epoch_transitions.lock().await;
+            pending.push(crate::node::PendingEpochTransition {
+                epoch: new_epoch,
+                timestamp_ms: epoch_timestamp_to_use,
+                boundary_block: required_boundary,
+            });
         }
+
+        // =============================================================================
+        // CRITICAL: Update SYNC-RELATED state so sync can fetch from new epoch
+        // BUT do NOT update node.current_epoch!
+        //
+        // Why not update current_epoch?
+        // - If we set current_epoch = new_epoch now, when the real transition runs later
+        //   it will check "node.current_epoch >= new_epoch" and SKIP the transition!
+        // - This causes consensus to NEVER start!
+        //
+        // We only update:
+        // - last_global_exec_index (for sync to use correct epoch_base)
+        // - shared_last_global_exec_index (same)
+        //
+        // The REAL transition (triggered by epoch_transition_sender after sync completes)
+        // will update current_epoch and start consensus properly.
+        // =============================================================================
+        info!(
+            "📋 [DEFERRED EPOCH] Updating sync state ONLY (NOT current_epoch) for epoch {} (base={})",
+            new_epoch, required_boundary
+        );
+
+        // Update sync-related state ONLY (NOT current_epoch!)
+        // node.current_epoch = new_epoch;  // DO NOT DO THIS!
+        node.current_commit_index.store(0, Ordering::SeqCst);
+        {
+            let mut g = node.shared_last_global_exec_index.lock().await;
+            *g = required_boundary;
+        }
+        node.last_global_exec_index = required_boundary;
+        // node.update_execution_lock_epoch(new_epoch).await;  // Skip - don't lock for deferred epoch
+
+        node.is_transitioning.store(false, Ordering::SeqCst);
+        info!(
+            "📋 [DEFERRED EPOCH] Sync state updated. Full transition queued for when Go reaches block {}",
+            required_boundary
+        );
+        return Ok(());
     }
 
     info!(
+        "✅ [EPOCH SYNC] Go is synced: block {} >= boundary {}. Proceeding with epoch {} advance.",
+        go_current_block, required_boundary, new_epoch
+    );
+
+    info!(
         "📤 [EPOCH ADVANCE] Notifying Go about epoch {} transition (boundary: {})",
-        new_epoch, synced_index
+        new_epoch, required_boundary
     );
     if let Err(e) = executor_client
-        .advance_epoch(new_epoch, epoch_timestamp_to_use, synced_index)
+        .advance_epoch(new_epoch, epoch_timestamp_to_use, required_boundary)
         .await
     {
         warn!(
@@ -441,16 +454,18 @@ pub async fn transition_to_epoch_from_system_tx(
     }
 
     // =============================================================================
-    // POST-TRANSITION VALIDATION: Verify Go stored the boundary correctly
-    // NOTE: Go timestamps are NO LONGER authoritative - only log differences
+    // POST-TRANSITION: GET TIMESTAMP FROM GO (Block Header Derived)
+    // UNIFIED TIMESTAMP: All nodes must use Go's timestamp from boundary block header
+    // This ensures deterministic, identical timestamps across all nodes
     // =============================================================================
+    let mut epoch_timestamp_to_use = epoch_timestamp_to_use; // Make mutable to allow update
     match executor_client.get_epoch_boundary_data(new_epoch).await {
         Ok((stored_epoch, stored_timestamp, stored_boundary, _validators)) => {
             // Validate boundary block matches what we sent
-            if stored_boundary != synced_index {
+            if stored_boundary != required_boundary {
                 error!(
                     "🚨 [BOUNDARY MISMATCH] Go stored boundary={} but we sent {}! Potential block skip!",
-                    stored_boundary, synced_index
+                    stored_boundary, required_boundary
                 );
             } else {
                 info!(
@@ -459,18 +474,31 @@ pub async fn transition_to_epoch_from_system_tx(
                 );
             }
 
-            // Log timestamp difference (but DO NOT update epoch_timestamp_to_use - SystemTx is authoritative)
-            if stored_timestamp != epoch_timestamp_to_use && stored_timestamp > 0 {
-                warn!(
-                    "🔍 [TIMESTAMP INFO] Go has timestamp={}, SystemTx has {}. Using SystemTx (authoritative).",
-                    stored_timestamp, epoch_timestamp_to_use
+            // UNIFIED TIMESTAMP: Use Go's timestamp (derived from block header)
+            // This replaces SystemTx timestamp to ensure all nodes use the SAME value
+            if stored_timestamp > 0 {
+                if stored_timestamp != epoch_timestamp_to_use {
+                    info!(
+                        "🔄 [UNIFIED TIMESTAMP] Updating timestamp: SystemTx={} → Go(block header)={}",
+                        epoch_timestamp_to_use, stored_timestamp
+                    );
+                    epoch_timestamp_to_use = stored_timestamp;
+
+                    // Also update system_transaction_provider with unified timestamp
+                    node.system_transaction_provider
+                        .update_epoch(new_epoch, epoch_timestamp_to_use)
+                        .await;
+                }
+                info!(
+                    "✅ [UNIFIED TIMESTAMP] Using Go's block-header-derived timestamp for epoch {}: {} ms",
+                    new_epoch, epoch_timestamp_to_use
                 );
             }
         }
         Err(e) => {
             // Go might not have stored it yet - this is expected for epoch 0→1
             warn!(
-                "⚠️ [VALIDATION SKIP] Cannot verify boundary storage: {}. Continuing with SystemTx timestamp.",
+                "⚠️ [VALIDATION SKIP] Cannot verify boundary storage: {}. Using SystemTx timestamp as fallback.",
                 e
             );
         }
@@ -780,25 +808,25 @@ pub async fn transition_to_epoch_from_system_tx(
     let go_epoch_timestamp_ms = match sync_epoch_timestamp_from_go(
         &executor_client,
         new_epoch,
-        new_epoch_timestamp_ms,
+        epoch_timestamp_to_use, // Use provisional timestamp
     )
     .await
     {
         Ok(timestamp) => {
-            if timestamp != new_epoch_timestamp_ms {
+            if timestamp != epoch_timestamp_to_use {
                 warn!(
                     "⚠️ [EPOCH TIMESTAMP SYNC] Timestamp mismatch after transition: \
-                     Local calculated: {}ms, Go reported: {}ms, diff: {}ms. \
+                     Local provisional: {}ms, Go reported: {}ms, diff: {}ms. \
                      Using Go's timestamp to prevent fork.",
-                    new_epoch_timestamp_ms,
+                    epoch_timestamp_to_use,
                     timestamp,
-                    (timestamp as i64 - new_epoch_timestamp_ms as i64).abs()
+                    (timestamp as i64 - epoch_timestamp_to_use as i64).abs()
                 );
                 timestamp
             } else {
                 info!(
                     "✅ [EPOCH TIMESTAMP SYNC] Timestamp consistent between local and Go: {}ms",
-                    new_epoch_timestamp_ms
+                    epoch_timestamp_to_use
                 );
                 timestamp
             }
@@ -807,11 +835,11 @@ pub async fn transition_to_epoch_from_system_tx(
             // Check if this is a "not implemented" error (endpoint missing)
             if e.to_string().contains("not found") || e.to_string().contains("Unexpected response")
             {
-                info!("ℹ️ [EPOCH TIMESTAMP SYNC] Go endpoint not implemented yet, using local calculation: {}ms", new_epoch_timestamp_ms);
+                info!("ℹ️ [EPOCH TIMESTAMP SYNC] Go endpoint not implemented yet, using local calculation: {}ms", epoch_timestamp_to_use);
             } else {
                 warn!("⚠️ [EPOCH TIMESTAMP SYNC] Failed to sync timestamp from Go: {}. Using local calculation.", e);
             }
-            new_epoch_timestamp_ms
+            epoch_timestamp_to_use
         }
     };
 
@@ -1329,7 +1357,7 @@ async fn trigger_lvm_snapshot(bin_path: &std::path::Path, epoch_id: u64) {
 pub async fn transition_mode_only(
     node: &mut ConsensusNode,
     epoch: u64,
-    epoch_timestamp_ms: u64,
+    _boundary_block_unused: u64, // INTENTIONALLY UNUSED: Timestamp is fetched from Go
     synced_global_exec_index: u64,
     config: &NodeConfig,
 ) -> Result<()> {
@@ -1450,14 +1478,13 @@ pub async fn transition_mode_only(
     // - Epoch 0: Genesis timestamp from genesis.json
     // - Epoch N: boundaryBlock.Header().TimeStamp() * 1000
     //
-    // This IGNORES the epoch_timestamp_ms parameter (from EndOfEpoch SystemTx).
-    // The parameter may have millisecond precision that differs from block header.
+    // This IGNORES the boundary_block parameter (from EndOfEpoch SystemTx).
+    // Timestamp is fetched directly from Go's get_epoch_boundary_data.
     // By using Go's derivation, ALL nodes get IDENTICAL timestamp = NO FORK!
     //
-    // Note: epoch_timestamp_ms is prefixed with _ to suppress unused warning
+    // Note: _boundary_block_unused parameter is prefixed with _ to suppress unused warning
     // =============================================================================
     let epoch_timestamp_to_use = go_authoritative_timestamp;
-    let _ = epoch_timestamp_ms; // Suppress unused variable warning
 
     info!(
         "✅ [MODE TRANSITION] Using UNIFIED timestamp={} ms from Go boundary block (ignoring EndOfEpoch tx timestamp)",

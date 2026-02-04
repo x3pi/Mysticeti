@@ -1172,14 +1172,14 @@ impl ConsensusNode {
     pub async fn transition_to_epoch_from_system_tx(
         &mut self,
         new_epoch: u64,
-        new_epoch_timestamp_ms: u64,
+        boundary_block_from_tx: u64, // CHANGED: Now boundary_block from EndOfEpoch tx, not timestamp
         synced_global_exec_index: u64, // CHANGED: Use global_exec_index (u64) instead of commit_index (u32)
         config: &NodeConfig,
     ) -> Result<()> {
         transition::transition_to_epoch_from_system_tx(
             self,
             new_epoch,
-            new_epoch_timestamp_ms,
+            boundary_block_from_tx,
             synced_global_exec_index,
             config,
         )
