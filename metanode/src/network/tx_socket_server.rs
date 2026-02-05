@@ -46,6 +46,12 @@ impl TxSocketServer {
         }
     }
 
+    /// Set dynamic peer discovery addresses (takes precedence over static config)
+    pub fn with_peer_discovery(mut self, addresses: Arc<RwLock<Vec<String>>>) -> Self {
+        self.peer_discovery_addresses = Some(addresses);
+        self
+    }
+
     /// Start the UDS server
     pub async fn start(self) -> Result<()> {
         // Remove old socket file if exists

@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::config::NodeConfig;
+use crate::network::peer_discovery::PeerDiscoveryService;
 use crate::network::peer_rpc::PeerRpcServer;
 use crate::network::rpc::RpcServer;
 use crate::network::tx_socket_server::TxSocketServer;
@@ -112,13 +113,48 @@ impl InitializedNode {
                 let node_guard = node.lock().await;
                 node_guard.is_transitioning.clone()
             };
-            let uds_server = TxSocketServer::with_node(
+
+            // Start PeerDiscoveryService if enabled
+            let peer_discovery_addresses = if node_config.enable_peer_discovery {
+                if let Some(ref go_rpc_url) = node_config.go_rpc_url {
+                    let peer_port = node_config.peer_rpc_port.unwrap_or(6090);
+                    let refresh_interval =
+                        std::time::Duration::from_secs(node_config.peer_discovery_refresh_secs);
+                    let service = Arc::new(
+                        PeerDiscoveryService::new(go_rpc_url.clone(), peer_port)
+                            .with_refresh_interval(refresh_interval),
+                    );
+                    let addresses_handle = service.get_addresses_handle();
+
+                    // Start background refresh task
+                    let _discovery_handle = service.start();
+                    info!(
+                        "🔍 [PEER DISCOVERY] Service started (refresh every {}s)",
+                        node_config.peer_discovery_refresh_secs
+                    );
+
+                    Some(addresses_handle)
+                } else {
+                    warn!("⚠️ [PEER DISCOVERY] Enabled but go_rpc_url is not set, skipping");
+                    None
+                }
+            } else {
+                None
+            };
+
+            let mut uds_server = TxSocketServer::with_node(
                 socket_path.clone(),
                 tx_client_uds,
                 node_for_uds,
                 is_transitioning_for_uds,
                 node_config.peer_rpc_addresses.clone(),
             );
+
+            // Inject dynamic peer addresses if discovery is enabled
+            if let Some(addrs) = peer_discovery_addresses {
+                uds_server = uds_server.with_peer_discovery(addrs);
+            }
+
             uds_server_handle = Some(tokio::spawn(async move {
                 if let Err(e) = uds_server.start().await {
                     error!("UDS server error: {}", e);

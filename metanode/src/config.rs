@@ -162,6 +162,17 @@ pub struct NodeConfig {
     /// Format: ["192.168.1.100:19000", "192.168.1.101:19000"]
     #[serde(default)]
     pub peer_rpc_addresses: Vec<String>,
+    /// Enable dynamic peer discovery from Validator smart contract (default: false)
+    /// When enabled, peer_rpc_addresses will be automatically discovered from chain state
+    #[serde(default)]
+    pub enable_peer_discovery: bool,
+    /// Go RPC URL for peer discovery (e.g., "http://127.0.0.1:8545")
+    /// Required when enable_peer_discovery is true
+    #[serde(default)]
+    pub go_rpc_url: Option<String>,
+    /// Refresh interval for peer discovery in seconds (default: 300 = 5 minutes)
+    #[serde(default = "default_peer_discovery_refresh_secs")]
+    pub peer_discovery_refresh_secs: u64,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -226,6 +237,10 @@ fn default_gradual_shutdown_final_drain_secs() -> Option<u64> {
 
 fn default_epoch_monitor_poll_interval_secs() -> Option<u64> {
     Some(5) // Poll every 5 seconds by default
+}
+
+fn default_peer_discovery_refresh_secs() -> u64 {
+    300 // 5 minutes
 }
 
 impl NodeConfig {
@@ -307,6 +322,9 @@ impl NodeConfig {
                 epoch_monitor_poll_interval_secs: default_epoch_monitor_poll_interval_secs(),
                 peer_rpc_port: Some(19000 + idx as u16), // Default: 19000 + node_id for WAN sync
                 peer_rpc_addresses: vec![],              // Empty by default, configure for WAN sync
+                enable_peer_discovery: false,            // Disabled by default
+                go_rpc_url: None, // Configure when enable_peer_discovery is true
+                peer_discovery_refresh_secs: default_peer_discovery_refresh_secs(),
             };
 
             // Save keys - use private_key_bytes and public key bytes

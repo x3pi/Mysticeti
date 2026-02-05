@@ -231,6 +231,23 @@ pub fn start_unified_epoch_monitor(
                             "✅ [EPOCH MONITOR] Successfully triggered transition to epoch {}",
                             new_epoch
                         );
+
+                        // =========================================================
+                        // MULTI-EPOCH CATCH-UP: Check if more epochs needed
+                        // If still behind network, immediately continue without
+                        // waiting for next poll cycle
+                        // =========================================================
+                        let current_rust_epoch = node_guard.current_epoch;
+                        drop(node_guard); // Release lock before continuing
+
+                        if current_rust_epoch < network_epoch {
+                            info!(
+                                "🔄 [EPOCH MONITOR] Multi-epoch catch-up: still behind (Rust={}, Network={}). Continuing immediately...",
+                                current_rust_epoch, network_epoch
+                            );
+                            // Don't wait for poll interval, continue immediately
+                            continue;
+                        }
                     }
                     Err(e) => {
                         warn!(

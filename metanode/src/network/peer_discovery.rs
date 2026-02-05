@@ -28,6 +28,7 @@ const VALIDATOR_CONTRACT: &str = "0x0000000000000000000000000000000000001001";
 const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
 
 /// Default peer RPC port suffix for discovered validators
+#[allow(dead_code)]
 const DEFAULT_PEER_RPC_PORT: u16 = 6090;
 
 /// JSON-RPC request structure
@@ -53,6 +54,7 @@ struct JsonRpcResponse {
 
 /// Validator info extracted from contract
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ValidatorInfo {
     pub address: String,
     pub hostname: String,
@@ -108,6 +110,7 @@ impl PeerDiscoveryService {
     }
 
     /// Get current peer addresses (snapshot)
+    #[allow(dead_code)]
     pub async fn get_addresses(&self) -> Vec<String> {
         self.peer_addresses.read().await.clone()
     }
