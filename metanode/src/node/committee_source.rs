@@ -255,12 +255,25 @@ impl CommitteeSource {
         const INITIAL_DELAY_MS: u64 = 500;
         const MAX_DELAY_MS: u64 = 5000;
         const LOG_INTERVAL: u32 = 10;
+        const MAX_ATTEMPTS: u32 = 60; // ~5 minutes with exponential backoff
 
         let mut attempt = 0u32;
         let mut delay_ms = INITIAL_DELAY_MS;
 
         loop {
             attempt += 1;
+
+            // CRITICAL FIX: Prevent infinite loop when Go doesn't have epoch data
+            // This can happen when transition_mode_only is called before Go syncs
+            if attempt > MAX_ATTEMPTS {
+                return Err(anyhow::anyhow!(
+                    "Timeout waiting for Go to have epoch {} data after {} attempts. \
+                    Go may not have synced to this epoch yet.",
+                    target_epoch,
+                    MAX_ATTEMPTS
+                ));
+            }
+
             let should_log = attempt == 1 || attempt % LOG_INTERVAL == 0;
 
             match client.get_epoch_boundary_data(target_epoch).await {

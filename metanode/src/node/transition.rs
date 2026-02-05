@@ -34,6 +34,22 @@ pub async fn transition_to_epoch_from_system_tx(
     // CASE 1: Same epoch, but SyncOnly needs to become Validator
     // This is a MODE-ONLY transition - skip full epoch transition, just start authority
     if is_same_epoch && is_sync_only {
+        // CRITICAL FIX: Check if Go has synced to the boundary before attempting mode transition
+        // Without this check, transition_mode_only will call fetch_committee_with_timestamp
+        // which will block indefinitely waiting for Go to have epoch data
+        if let Some(executor_client) = &node.executor_client {
+            let go_current_block = executor_client.get_last_block_number().await.unwrap_or(0);
+            if go_current_block < synced_global_exec_index {
+                info!(
+                    "⏳ [MODE TRANSITION] Deferring SyncOnly → Validator for epoch {}: Go block {} < required boundary {}. Waiting for sync to complete.",
+                    new_epoch, go_current_block, synced_global_exec_index
+                );
+                // Don't call transition_mode_only - return early and let epoch_monitor or
+                // RustSyncNode retry when Go is ready
+                return Ok(());
+            }
+        }
+
         info!(
             "🔄 [MODE TRANSITION] SyncOnly → Validator in epoch {} (not a full epoch transition)",
             new_epoch

@@ -427,11 +427,18 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
 
         // Validate the requested block refs.
         for block in &block_refs {
-            if !self.context.committee.is_valid_index(block.author) {
-                return Err(ConsensusError::InvalidAuthorityIndex {
-                    index: block.author,
-                    max: self.context.committee.size(),
-                });
+            // CROSS-EPOCH FIX: Only validate AuthorityIndex strictly for current epoch blocks.
+            // Historical blocks from previous epochs may have different committee sizes.
+            // When legacy_store_manager is present, we allow any index and let the store lookup
+            // return blocks (or empty) naturally - blocks from other epochs will be found in legacy stores.
+            if self.legacy_store_manager.is_none() {
+                // No legacy stores = current epoch only, strict validation
+                if !self.context.committee.is_valid_index(block.author) {
+                    return Err(ConsensusError::InvalidAuthorityIndex {
+                        index: block.author,
+                        max: self.context.committee.size(),
+                    });
+                }
             }
             if block.round == GENESIS_ROUND {
                 return Err(ConsensusError::UnexpectedGenesisBlockRequested);

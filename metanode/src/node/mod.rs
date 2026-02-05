@@ -1031,7 +1031,7 @@ impl ConsensusNode {
                 (NodeMode::Validator, NodeMode::SyncOnly) => {
                     // =======================================================================
                     // CENTRALIZED ORDERING FIX: Validator → SyncOnly
-                    // ORDER: 1. Stop authority 2. Update mode 3. Notify Go 4. Start sync
+                    // ORDER: 1. Stop authority 1.5. Verify Go sync 2. Update mode 3. Notify Go 4. Start sync
                     // This prevents race conditions where consensus continues after sync starts
                     // =======================================================================
 
@@ -1042,7 +1042,52 @@ impl ConsensusNode {
                         info!("✅ [TRANSITION] Authority stopped successfully");
                     }
 
-                    // STEP 2: Update mode atomically
+                    // ========== STEP 1.5 - BLOCK-BY-BLOCK VERIFICATION ==========
+                    // Poll Go FOREVER until it confirms processing all blocks
+                    // NO TIMEOUT - guarantees no block is lost during transition
+                    let expected_last_block = self.last_global_exec_index;
+                    if let Some(ref executor_client) = self.executor_client {
+                        info!(
+                            "⏳ [TRANSITION] STEP 1.5: Waiting for Go to reach block {}...",
+                            expected_last_block
+                        );
+
+                        let poll_interval = std::time::Duration::from_millis(100);
+                        let mut attempt = 0u64;
+
+                        loop {
+                            attempt += 1;
+                            match executor_client.get_last_block_number().await {
+                                Ok(go_last_block) => {
+                                    if go_last_block >= expected_last_block {
+                                        info!(
+                                            "✅ [TRANSITION] Go reached block {} (expected: {}) after {} polls",
+                                            go_last_block, expected_last_block, attempt
+                                        );
+                                        break;
+                                    }
+                                    // Log progress every 100 polls (~10s)
+                                    if attempt % 100 == 0 {
+                                        info!(
+                                            "⏳ [SYNC WAIT] Go: {}/{} blocks (waiting {}s)",
+                                            go_last_block,
+                                            expected_last_block,
+                                            attempt / 10
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    if attempt % 100 == 0 {
+                                        warn!("⚠️ [SYNC POLL] Cannot reach Go: {}. Retrying...", e);
+                                    }
+                                }
+                            }
+                            tokio::time::sleep(poll_interval).await;
+                        }
+                    }
+                    // ========== END STEP 1.5 ==========
+
+                    // STEP 2: Update mode atomically (only after Go has caught up)
                     self.node_mode = new_mode.clone();
 
                     // MODE TRANSITION STATE LOG
