@@ -21,6 +21,8 @@ pub struct TxSocketServer {
     node: Option<Arc<Mutex<ConsensusNode>>>,
     /// Lock-free flag to check epoch transition status without acquiring node lock
     is_transitioning: Option<Arc<AtomicBool>>,
+    /// Peer RPC addresses for forwarding transactions (SyncOnly mode)
+    peer_rpc_addresses: Vec<String>,
 }
 
 impl TxSocketServer {
@@ -30,12 +32,14 @@ impl TxSocketServer {
         transaction_client: Arc<dyn TransactionSubmitter>,
         node: Arc<Mutex<ConsensusNode>>,
         is_transitioning: Arc<AtomicBool>,
+        peer_rpc_addresses: Vec<String>,
     ) -> Self {
         Self {
             socket_path,
             transaction_client,
             node: Some(node),
             is_transitioning: Some(is_transitioning),
+            peer_rpc_addresses,
         }
     }
 
@@ -77,11 +81,18 @@ impl TxSocketServer {
                     let client = self.transaction_client.clone();
                     let node = self.node.clone();
                     let is_transitioning = self.is_transitioning.clone();
+                    let peer_addresses = self.peer_rpc_addresses.clone();
 
                     tokio::spawn(async move {
                         info!("🔌 [DEBUG] Spawned handler for UDS connection");
-                        if let Err(e) =
-                            Self::handle_connection(stream, client, node, is_transitioning).await
+                        if let Err(e) = Self::handle_connection(
+                            stream,
+                            client,
+                            node,
+                            is_transitioning,
+                            peer_addresses,
+                        )
+                        .await
                         {
                             error!("Error handling UDS connection: {}", e);
                         }
@@ -100,6 +111,7 @@ impl TxSocketServer {
         client: Arc<dyn TransactionSubmitter>,
         node: Option<Arc<Mutex<ConsensusNode>>>,
         is_transitioning: Option<Arc<AtomicBool>>,
+        peer_rpc_addresses: Vec<String>,
     ) -> Result<()> {
         // PERSISTENT CONNECTION: Xử lý multiple requests trên cùng một connection
         // Điều này cho phép Go client gửi nhiều batches qua cùng một connection
@@ -321,6 +333,84 @@ impl TxSocketServer {
                         }
 
                         if !should_accept {
+                            // Check if this is SyncOnly mode (authority.is_none())
+                            // In SyncOnly mode, forward TX to validators instead of rejecting
+                            let is_sync_only = reason.contains("Node is still initializing");
+
+                            if is_sync_only && !peer_rpc_addresses.is_empty() {
+                                // SyncOnly mode: Forward transactions to validators
+                                for tx_data in &transactions_to_submit {
+                                    let tx_hash =
+                                        crate::types::tx_hash::calculate_transaction_hash_hex(
+                                            tx_data,
+                                        );
+                                    info!(
+                                        "🔄 [TX FORWARD] SyncOnly node forwarding transaction: hash={}, {} validator addresses available",
+                                        tx_hash, peer_rpc_addresses.len()
+                                    );
+                                }
+                                drop(node_guard);
+
+                                // Collect all TX data into single bytes (Transactions protobuf)
+                                // Forward to validators using peer_rpc
+                                use crate::network::peer_rpc::forward_transaction_to_validators;
+
+                                // Forward each transaction individually
+                                let mut forward_success = true;
+                                let mut forward_error = String::new();
+
+                                for tx_data in &transactions_to_submit {
+                                    match forward_transaction_to_validators(
+                                        &peer_rpc_addresses,
+                                        tx_data,
+                                    )
+                                    .await
+                                    {
+                                        Ok(resp) if resp.success => {
+                                            let tx_hash = crate::types::tx_hash::calculate_transaction_hash_hex(tx_data);
+                                            info!("✅ [TX FORWARD] Successfully forwarded TX {} to validator", tx_hash);
+                                        }
+                                        Ok(resp) => {
+                                            forward_success = false;
+                                            forward_error = resp
+                                                .error
+                                                .unwrap_or_else(|| "Unknown error".to_string());
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            forward_success = false;
+                                            forward_error = e.to_string();
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if forward_success {
+                                    let success_response = r#"{"success":true,"forwarded":true,"message":"Transaction forwarded to validator"}"#;
+                                    if let Err(e) =
+                                        Self::send_response_string(&mut stream, success_response)
+                                            .await
+                                    {
+                                        error!("❌ [TX FLOW] Failed to send forward success response: {}", e);
+                                        return Err(e.into());
+                                    }
+                                } else {
+                                    let error_response = format!(
+                                        r#"{{"success":false,"error":"Forward failed: {}"}}"#,
+                                        forward_error.replace('"', "\\\"")
+                                    );
+                                    if let Err(e) =
+                                        Self::send_response_string(&mut stream, &error_response)
+                                            .await
+                                    {
+                                        error!("❌ [TX FLOW] Failed to send forward error response: {}", e);
+                                        return Err(e.into());
+                                    }
+                                }
+                                continue; // Continue to next request
+                            }
+
+                            // Regular rejection (not SyncOnly or no peer addresses)
                             for tx_data in &transactions_to_submit {
                                 let tx_hash =
                                     crate::types::tx_hash::calculate_transaction_hash_hex(tx_data);

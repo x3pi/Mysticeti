@@ -30,6 +30,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::node::executor_client::ExecutorClient;
+use crate::node::tx_submitter::TransactionSubmitter;
 
 /// Response for /peer_info endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +97,25 @@ pub struct EpochBoundaryDataResponse {
     pub error: Option<String>,
 }
 
+/// Request for /submit_transaction endpoint (POST)
+/// Used by SyncOnly nodes to forward transactions to validators
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTransactionRequest {
+    /// Hex-encoded transaction data (protobuf Transactions message)
+    pub transactions_hex: String,
+}
+
+/// Response for /submit_transaction endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTransactionResponse {
+    /// Whether the transaction was accepted
+    pub success: bool,
+    /// Number of transactions forwarded
+    pub count: usize,
+    /// Error message if any
+    pub error: Option<String>,
+}
+
 /// Peer RPC Server for exposing node info over HTTP
 pub struct PeerRpcServer {
     /// Node ID
@@ -106,6 +126,8 @@ pub struct PeerRpcServer {
     network_address: String,
     /// Executor client for querying Go Master
     executor_client: Arc<ExecutorClient>,
+    /// Optional transaction submitter for forwarding transactions to consensus
+    transaction_submitter: Option<Arc<dyn TransactionSubmitter>>,
 }
 
 impl PeerRpcServer {
@@ -121,6 +143,24 @@ impl PeerRpcServer {
             port,
             network_address,
             executor_client,
+            transaction_submitter: None,
+        }
+    }
+
+    /// Create Peer RPC Server with transaction submitter (for validators)
+    pub fn new_with_submitter(
+        node_id: usize,
+        port: u16,
+        network_address: String,
+        executor_client: Arc<ExecutorClient>,
+        transaction_submitter: Arc<dyn TransactionSubmitter>,
+    ) -> Self {
+        Self {
+            node_id,
+            port,
+            network_address,
+            executor_client,
+            transaction_submitter: Some(transaction_submitter),
         }
     }
 
@@ -135,6 +175,7 @@ impl PeerRpcServer {
         );
 
         let executor_client = Arc::clone(&self.executor_client);
+        let transaction_submitter = self.transaction_submitter.clone();
         let node_id = self.node_id;
         let network_address = self.network_address.clone();
 
@@ -148,6 +189,7 @@ impl PeerRpcServer {
             };
 
             let executor = Arc::clone(&executor_client);
+            let submitter = transaction_submitter.clone();
             let net_addr = network_address.clone();
 
             tokio::spawn(async move {
@@ -183,6 +225,9 @@ impl PeerRpcServer {
                     Self::handle_get_blocks(&mut stream, &executor, node_id, &request).await;
                 } else if request.starts_with("GET /health") {
                     Self::handle_health(&mut stream).await;
+                } else if request.starts_with("POST /submit_transaction") {
+                    Self::handle_submit_transaction(&mut stream, submitter.as_ref(), &request)
+                        .await;
                 } else {
                     // Return 404 for unknown routes
                     let response = "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Not Found\"}";
@@ -497,6 +542,125 @@ impl PeerRpcServer {
 
         (from_block, to_block)
     }
+
+    /// Handle /submit_transaction POST request
+    /// This endpoint receives transactions from SyncOnly nodes and submits them to consensus
+    async fn handle_submit_transaction(
+        stream: &mut tokio::net::TcpStream,
+        submitter: Option<&Arc<dyn TransactionSubmitter>>,
+        request: &str,
+    ) {
+        // Check if submitter is available (only validators have it)
+        let submitter = match submitter {
+            Some(s) => s,
+            None => {
+                let response = SubmitTransactionResponse {
+                    success: false,
+                    count: 0,
+                    error: Some(
+                        "This node cannot accept forwarded transactions (not a validator)"
+                            .to_string(),
+                    ),
+                };
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                let http_response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\r\n{}",
+                    json
+                );
+                let _ = stream.write_all(http_response.as_bytes()).await;
+                return;
+            }
+        };
+
+        // Parse POST body - find content after double newline
+        let body_start = request
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .or_else(|| request.find("\n\n").map(|i| i + 2))
+            .unwrap_or(0);
+
+        let body = &request[body_start..];
+
+        // Parse JSON request
+        let submit_req: SubmitTransactionRequest = match serde_json::from_str(body.trim()) {
+            Ok(req) => req,
+            Err(e) => {
+                let response = SubmitTransactionResponse {
+                    success: false,
+                    count: 0,
+                    error: Some(format!("Invalid JSON: {}", e)),
+                };
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                let http_response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{}",
+                    json
+                );
+                let _ = stream.write_all(http_response.as_bytes()).await;
+                return;
+            }
+        };
+
+        // Decode hex to bytes
+        let tx_bytes = match hex::decode(&submit_req.transactions_hex) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let response = SubmitTransactionResponse {
+                    success: false,
+                    count: 0,
+                    error: Some(format!("Invalid hex: {}", e)),
+                };
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                let http_response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{}",
+                    json
+                );
+                let _ = stream.write_all(http_response.as_bytes()).await;
+                return;
+            }
+        };
+
+        info!(
+            "📥 [TX FORWARD] Received {} bytes from SyncOnly node, submitting to consensus",
+            tx_bytes.len()
+        );
+
+        // Submit transaction to consensus via TransactionSubmitter
+        // tx_bytes contains Transactions protobuf message, need to split into individual txs
+        match submitter.submit(vec![tx_bytes]).await {
+            Ok((block_ref, indices, _status_rx)) => {
+                info!(
+                    "✅ [TX FORWARD] Successfully submitted {} tx(s) to block {:?}",
+                    indices.len(),
+                    block_ref
+                );
+                let response = SubmitTransactionResponse {
+                    success: true,
+                    count: indices.len(),
+                    error: None,
+                };
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                let http_response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+                    json
+                );
+                let _ = stream.write_all(http_response.as_bytes()).await;
+            }
+            Err(e) => {
+                error!("❌ [TX FORWARD] Failed to submit transaction: {}", e);
+                let response = SubmitTransactionResponse {
+                    success: false,
+                    count: 0,
+                    error: Some(format!("Failed to submit: {}", e)),
+                };
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                let http_response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{}",
+                    json
+                );
+                let _ = stream.write_all(http_response.as_bytes()).await;
+            }
+        }
+    }
 }
 
 /// Query peer info from a remote node via HTTP
@@ -708,6 +872,137 @@ pub async fn query_peer_epoch_boundary_data(
     );
 
     Ok(response)
+}
+
+/// Forward transaction to validator nodes via HTTP POST
+/// This is used by SyncOnly nodes to forward transactions to validators for consensus
+/// Uses round-robin retry logic for fault tolerance
+pub async fn forward_transaction_to_validators(
+    peer_addresses: &[String],
+    tx_data: &[u8],
+) -> Result<SubmitTransactionResponse> {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    if peer_addresses.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No peer addresses configured for forwarding"
+        ));
+    }
+
+    let tx_hex = hex::encode(tx_data);
+    let request_body = serde_json::to_string(&SubmitTransactionRequest {
+        transactions_hex: tx_hex,
+    })?;
+
+    // Round-robin through peers until one succeeds
+    for peer_addr in peer_addresses {
+        info!(
+            "🔄 [TX FORWARD] Attempting to forward transaction to validator: {}",
+            peer_addr
+        );
+
+        // Connect with timeout
+        let stream_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TcpStream::connect(peer_addr),
+        )
+        .await;
+
+        let mut stream = match stream_result {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                warn!("🔄 [TX FORWARD] Failed to connect to {}: {}", peer_addr, e);
+                continue;
+            }
+            Err(_) => {
+                warn!("🔄 [TX FORWARD] Timeout connecting to {}", peer_addr);
+                continue;
+            }
+        };
+
+        // Build HTTP POST request
+        let http_request = format!(
+            "POST /submit_transaction HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            peer_addr,
+            request_body.len(),
+            request_body
+        );
+
+        // Send request
+        if let Err(e) = stream.write_all(http_request.as_bytes()).await {
+            warn!(
+                "🔄 [TX FORWARD] Failed to send request to {}: {}",
+                peer_addr, e
+            );
+            continue;
+        }
+
+        // Read response with timeout
+        let mut buffer = [0u8; 4096];
+        let read_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buffer))
+                .await;
+
+        let n = match read_result {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                warn!(
+                    "🔄 [TX FORWARD] Failed to read response from {}: {}",
+                    peer_addr, e
+                );
+                continue;
+            }
+            Err(_) => {
+                warn!(
+                    "🔄 [TX FORWARD] Timeout reading response from {}",
+                    peer_addr
+                );
+                continue;
+            }
+        };
+
+        let response_str = String::from_utf8_lossy(&buffer[..n]);
+
+        // Parse JSON body from HTTP response
+        let body_start = response_str
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .or_else(|| response_str.find("\n\n").map(|i| i + 2))
+            .unwrap_or(0);
+
+        let body = &response_str[body_start..];
+
+        match serde_json::from_str::<SubmitTransactionResponse>(body.trim()) {
+            Ok(resp) => {
+                if resp.success {
+                    info!(
+                        "✅ [TX FORWARD] Successfully forwarded transaction to {}",
+                        peer_addr
+                    );
+                    return Ok(resp);
+                } else {
+                    warn!(
+                        "🔄 [TX FORWARD] Validator {} rejected transaction: {:?}",
+                        peer_addr, resp.error
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "🔄 [TX FORWARD] Failed to parse response from {}: {}",
+                    peer_addr, e
+                );
+                continue;
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Failed to forward transaction to any validator"
+    ))
 }
 
 #[cfg(test)]

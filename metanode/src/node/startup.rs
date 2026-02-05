@@ -117,6 +117,7 @@ impl InitializedNode {
                 tx_client_uds,
                 node_for_uds,
                 is_transitioning_for_uds,
+                node_config.peer_rpc_addresses.clone(),
             );
             uds_server_handle = Some(tokio::spawn(async move {
                 if let Err(e) = uds_server.start().await {
