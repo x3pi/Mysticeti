@@ -12,7 +12,7 @@ use fastcrypto::{bls12381, ed25519};
 use mysten_network::Multiaddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 #[allow(dead_code)]
 pub async fn build_committee_from_go_validators_at_block_with_epoch(
@@ -110,7 +110,8 @@ pub fn build_committee_from_validator_list(
 
     for (idx, validator) in sorted_validators.iter().enumerate() {
         let stake = validator.stake.parse::<u64>()?;
-        let address: Multiaddr = validator.address.parse()?;
+        // CHANGED: Use p2p_address for network communication (address is now Ethereum wallet address)
+        let address: Multiaddr = validator.p2p_address.parse()?;
 
         // Auth Key
         let authority_key_bytes = if validator.authority_key.starts_with("0x") {
@@ -171,4 +172,105 @@ pub fn build_committee_from_validator_list(
         epoch
     );
     Ok(Committee::new(epoch, authorities))
+}
+
+/// Build committee from validator list and also return Ethereum addresses for leader lookup
+/// Returns (Committee, Vec<eth_address_bytes>) where eth_addresses are in the same order as authorities
+pub fn build_committee_with_eth_addresses(
+    validators: Vec<crate::node::executor_client::proto::ValidatorInfo>,
+    epoch: u64,
+) -> Result<(Committee, Vec<Vec<u8>>)> {
+    let mut sorted_validators: Vec<_> = validators.into_iter().collect();
+    // CRITICAL: Sort by authority_key for DETERMINISTIC ordering (same as build_committee_from_validator_list)
+    sorted_validators.sort_by(|a, b| a.authority_key.cmp(&b.authority_key));
+
+    let mut authorities = Vec::new();
+    let mut eth_addresses = Vec::new(); // Collect eth addresses in same order as authorities
+
+    for (idx, validator) in sorted_validators.iter().enumerate() {
+        let stake = validator.stake.parse::<u64>()?;
+        let address: Multiaddr = validator.p2p_address.parse()?;
+
+        // Parse Ethereum address (0x prefixed hex string → 20 bytes)
+        let eth_addr_bytes = if validator.address.starts_with("0x") && validator.address.len() == 42
+        {
+            match hex::decode(&validator.address[2..]) {
+                Ok(bytes) if bytes.len() == 20 => bytes,
+                _ => {
+                    warn!(
+                        "⚠️ [COMMITTEE] Invalid eth address for validator {}: {}",
+                        idx, validator.address
+                    );
+                    vec![]
+                }
+            }
+        } else {
+            warn!(
+                "⚠️ [COMMITTEE] Missing or invalid eth address for validator {}: {}",
+                idx, validator.address
+            );
+            vec![]
+        };
+        eth_addresses.push(eth_addr_bytes);
+
+        // Auth Key
+        let authority_key_bytes = if validator.authority_key.starts_with("0x") {
+            hex::decode(&validator.authority_key[2..])?
+        } else {
+            match STANDARD.decode(&validator.authority_key) {
+                Ok(b) => b,
+                Err(_) => hex::decode(&validator.authority_key)?,
+            }
+        };
+        let authority_pubkey =
+            bls12381::min_sig::BLS12381PublicKey::from_bytes(&authority_key_bytes)?;
+        let authority_key = AuthorityPublicKey::new(authority_pubkey);
+
+        // Protocol Key
+        let protocol_key_bytes = if validator.protocol_key.starts_with("0x") {
+            hex::decode(&validator.protocol_key[2..])?
+        } else {
+            match STANDARD.decode(&validator.protocol_key) {
+                Ok(b) => b,
+                Err(_) => hex::decode(&validator.protocol_key)?,
+            }
+        };
+        let protocol_pubkey = ed25519::Ed25519PublicKey::from_bytes(&protocol_key_bytes)?;
+        let protocol_key = ProtocolPublicKey::new(protocol_pubkey);
+
+        // Network Key
+        let network_key_bytes = if validator.network_key.starts_with("0x") {
+            hex::decode(&validator.network_key[2..])?
+        } else {
+            match STANDARD.decode(&validator.network_key) {
+                Ok(b) => b,
+                Err(_) => hex::decode(&validator.network_key)?,
+            }
+        };
+        let network_pubkey = ed25519::Ed25519PublicKey::from_bytes(&network_key_bytes)?;
+        let network_key = NetworkPublicKey::new(network_pubkey);
+
+        let hostname = if !validator.name.is_empty() {
+            validator.name.clone()
+        } else {
+            format!("node-{}", idx)
+        };
+
+        authorities.push(Authority {
+            stake,
+            address,
+            hostname,
+            authority_key,
+            protocol_key,
+            network_key,
+        });
+    }
+
+    info!(
+        "📊 Built committee with {} authorities and {} eth_addresses for epoch {}",
+        authorities.len(),
+        eth_addresses.len(),
+        epoch
+    );
+    Ok((Committee::new(epoch, authorities), eth_addresses))
 }

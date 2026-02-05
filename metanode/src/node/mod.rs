@@ -149,6 +149,12 @@ pub struct ConsensusNode {
     /// commit_receiver to close immediately. This field keeps it alive.
     #[allow(dead_code)]
     pub(crate) _commit_consumer_holder: Option<CommitConsumerArgs>,
+
+    /// Multi-epoch committee cache: ETH addresses keyed by epoch
+    /// Keeps last 3 epochs to support lookups during epoch transitions
+    /// Updated when committee is loaded, used by CommitProcessor to send leader_address to Go
+    pub(crate) epoch_eth_addresses:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<u64, Vec<Vec<u8>>>>>,
 }
 
 impl ConsensusNode {
@@ -380,12 +386,13 @@ impl ConsensusNode {
             validators
         };
 
-        // Use helper from committee.rs
-        let committee =
-            committee::build_committee_from_validator_list(validators_to_use, current_epoch)?;
+        // Use helper from committee.rs - also extract eth_addresses for leader lookup
+        let (committee, validator_eth_addresses) =
+            committee::build_committee_with_eth_addresses(validators_to_use, current_epoch)?;
         info!(
-            "✅ Loaded committee with {} authorities (from epoch boundary)",
-            committee.size()
+            "✅ Loaded committee with {} authorities and {} eth_addresses (from epoch boundary)",
+            committee.size(),
+            validator_eth_addresses.len()
         );
 
         // EXECUTION INDEX SYNC
@@ -626,7 +633,13 @@ impl ConsensusNode {
         .with_epoch_info(current_epoch, epoch_base_exec_index) // Start from BASE
         .with_is_transitioning(is_transitioning.clone())
         .with_pending_transactions_queue(pending_transactions_queue.clone())
-        .with_epoch_transition_callback(epoch_transition_callback);
+        .with_epoch_transition_callback(epoch_transition_callback)
+        .with_epoch_eth_addresses({
+            // Create initial multi-epoch cache with current epoch's addresses
+            let mut map = std::collections::HashMap::new();
+            map.insert(current_epoch, validator_eth_addresses.clone());
+            Arc::new(tokio::sync::Mutex::new(map))
+        });
 
         // INITIAL_NEXT_EXPECTED: This is for Replay Protection
         // It should be TIP + 1 (what Go expects next)
@@ -836,6 +849,11 @@ impl ConsensusNode {
             committed_transaction_hashes,
             pending_epoch_transitions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             _commit_consumer_holder: commit_consumer_holder,
+            epoch_eth_addresses: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(current_epoch, validator_eth_addresses.clone());
+                Arc::new(tokio::sync::Mutex::new(map))
+            },
         };
 
         // CRITICAL FIX: Load previous epoch's RocksDB stores into legacy_store_manager

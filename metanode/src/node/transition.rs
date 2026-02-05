@@ -546,6 +546,22 @@ pub async fn transition_to_epoch_from_system_tx(
     let committee = committee_source
         .fetch_committee(&config.executor_send_socket_path, new_epoch)
         .await?;
+
+    // Update epoch_eth_addresses cache with new epoch's committee
+    if let Err(e) = committee_source
+        .fetch_and_update_epoch_eth_addresses(
+            &config.executor_send_socket_path,
+            new_epoch,
+            &node.epoch_eth_addresses,
+        )
+        .await
+    {
+        warn!(
+            "⚠️ [TRANSITION] Failed to update epoch_eth_addresses: {}",
+            e
+        );
+    }
+
     node.check_and_update_node_mode(&committee, config).await?;
 
     // FIX: Use protocol_key matching for consistent identity
@@ -603,6 +619,9 @@ pub async fn transition_to_epoch_from_system_tx(
                 .with_is_transitioning(node.is_transitioning.clone())
                 .with_pending_transactions_queue(node.pending_transactions_queue.clone())
                 .with_epoch_transition_callback(epoch_cb);
+
+        // Share epoch_eth_addresses HashMap reference for leader address lookup
+        processor = processor.with_epoch_eth_addresses(node.epoch_eth_addresses.clone());
 
         if let Some(c) = exec_client_proc {
             processor = processor.with_executor_client(c);
@@ -697,6 +716,9 @@ pub async fn transition_to_epoch_from_system_tx(
                 .with_is_transitioning(node.is_transitioning.clone())
                 .with_pending_transactions_queue(node.pending_transactions_queue.clone())
                 .with_epoch_transition_callback(epoch_cb);
+
+        // Share epoch_eth_addresses HashMap reference for leader address lookup
+        processor = processor.with_epoch_eth_addresses(node.epoch_eth_addresses.clone());
 
         if let Some(c) = exec_client_proc {
             processor = processor.with_executor_client(c);
@@ -1434,6 +1456,22 @@ pub async fn transition_mode_only(
         .fetch_committee_with_timestamp(&config.executor_send_socket_path, epoch)
         .await?;
 
+    // Update epoch_eth_addresses cache with new epoch's committee
+    // CRITICAL: This is needed for leader address resolution in CommitProcessor
+    if let Err(e) = committee_source
+        .fetch_and_update_epoch_eth_addresses(
+            &config.executor_send_socket_path,
+            epoch,
+            &node.epoch_eth_addresses,
+        )
+        .await
+    {
+        warn!(
+            "⚠️ [MODE TRANSITION] Failed to update epoch_eth_addresses: {}",
+            e
+        );
+    }
+
     info!(
         "✅ [MODE TRANSITION] Got UNIFIED committee+timestamp from Go: epoch={}, timestamp={} ms",
         epoch, go_authoritative_timestamp
@@ -1542,6 +1580,9 @@ pub async fn transition_mode_only(
         .with_is_transitioning(node.is_transitioning.clone())
         .with_pending_transactions_queue(node.pending_transactions_queue.clone())
         .with_epoch_transition_callback(epoch_cb);
+
+    // Share epoch_eth_addresses HashMap reference for leader address lookup
+    processor = processor.with_epoch_eth_addresses(node.epoch_eth_addresses.clone());
 
     if let Some(c) = exec_client_proc {
         processor = processor.with_executor_client(c);

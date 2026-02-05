@@ -232,6 +232,96 @@ impl CommitteeSource {
         }
     }
 
+    /// Fetch eth_addresses for a specific epoch and update the epoch_eth_addresses HashMap
+    /// Called after fetch_committee to populate the multi-epoch cache
+    pub async fn fetch_and_update_epoch_eth_addresses(
+        &self,
+        send_socket: &str,
+        target_epoch: u64,
+        epoch_eth_addresses: &std::sync::Arc<
+            tokio::sync::Mutex<std::collections::HashMap<u64, Vec<Vec<u8>>>>,
+        >,
+    ) -> Result<()> {
+        let client = self.create_executor_client(send_socket);
+
+        info!(
+            "📋 [EPOCH ETH ADDRESSES] Fetching eth_addresses for epoch {} to update cache",
+            target_epoch
+        );
+
+        // Get epoch boundary data which contains validators
+        match client.get_epoch_boundary_data(target_epoch).await {
+            Ok((epoch, _timestamp_ms, _boundary_block, validators)) => {
+                if epoch == target_epoch {
+                    // Build eth_addresses from validators (same sorting as committee builder)
+                    let mut sorted_validators: Vec<_> = validators.into_iter().collect();
+                    sorted_validators.sort_by(|a, b| a.authority_key.cmp(&b.authority_key));
+
+                    let mut eth_addresses = Vec::new();
+                    for validator in &sorted_validators {
+                        let eth_addr_bytes = if validator.address.starts_with("0x")
+                            && validator.address.len() == 42
+                        {
+                            match hex::decode(&validator.address[2..]) {
+                                Ok(bytes) if bytes.len() == 20 => bytes,
+                                _ => {
+                                    warn!(
+                                        "⚠️ [EPOCH ETH ADDRESSES] Invalid eth address: {}",
+                                        validator.address
+                                    );
+                                    vec![]
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "⚠️ [EPOCH ETH ADDRESSES] Missing eth address: {}",
+                                validator.address
+                            );
+                            vec![]
+                        };
+                        eth_addresses.push(eth_addr_bytes);
+                    }
+
+                    // Update the HashMap with new epoch's addresses
+                    let mut cache = epoch_eth_addresses.lock().await;
+
+                    // Keep only last 3 epochs to prevent unbounded growth
+                    if cache.len() >= 3 {
+                        let min_epoch = cache.keys().min().copied();
+                        if let Some(old_epoch) = min_epoch {
+                            if old_epoch < target_epoch.saturating_sub(2) {
+                                cache.remove(&old_epoch);
+                                info!(
+                                    "🗑️ [EPOCH ETH ADDRESSES] Removed old epoch {} from cache",
+                                    old_epoch
+                                );
+                            }
+                        }
+                    }
+
+                    cache.insert(target_epoch, eth_addresses.clone());
+                    info!(
+                        "✅ [EPOCH ETH ADDRESSES] Updated cache: epoch {} with {} addresses (cache size: {})",
+                        target_epoch, eth_addresses.len(), cache.len()
+                    );
+
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️ [EPOCH ETH ADDRESSES] Failed to fetch boundary data: {}",
+                    e
+                );
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Failed to fetch eth_addresses for epoch {}",
+            target_epoch
+        ))
+    }
+
     /// Fetch committee AND timestamp from Go (UNIFIED SOURCE)
     ///
     /// CRITICAL: This returns the timestamp from Go's get_epoch_boundary_data response.

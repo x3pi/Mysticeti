@@ -17,7 +17,7 @@ use consensus_core::{
     Commit, CommitAPI, CommitRange, CommitRef, CommittedSubDag, Context, GlobalCommitInfo,
     NetworkClient, SignedBlock, TonicClient, VerifiedBlock,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -224,6 +224,9 @@ pub struct RustSyncNode {
     /// Base global_exec_index for current epoch (commits in this epoch are indexed from 1)
     /// epoch_local_commit_index = global_exec_index - epoch_base_index
     epoch_base_index: Arc<AtomicU64>,
+    /// Multi-epoch cache: epoch -> sorted list of validator ETH addresses
+    /// Used for deterministic leader_address resolution during sync
+    epoch_eth_addresses: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
 }
 
 impl RustSyncNode {
@@ -253,6 +256,7 @@ impl RustSyncNode {
                 initial_global_exec_index as u64,
             ))),
             epoch_base_index: Arc::new(AtomicU64::new(epoch_base_index)),
+            epoch_eth_addresses: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1230,6 +1234,81 @@ impl RustSyncNode {
                 commit_data.commit.global_exec_index(),
             );
 
+            // ═══════════════════════════════════════════════════════════════════════════════
+            // CRITICAL FIX: Ensure Single Source of Truth
+            // Strict Retry Loop: We MUST resolve the leader_address from our cache.
+            // If we cannot, we wait and retry. We NEVER send None to Go.
+            // ═══════════════════════════════════════════════════════════════════════════════
+            let epoch = commit_data.epoch;
+            let leader_author_index = subdag.leader.author.value() as usize;
+
+            let mut retry_count = 0;
+            let leader_address = loop {
+                // 1. Try to resolve from cache
+                {
+                    let mut cache = self.epoch_eth_addresses.lock().await;
+
+                    // Load if missing
+                    if !cache.contains_key(&epoch) {
+                        info!(
+                            "📥 [RUST-SYNC] Cache miss for epoch {}. Fetching from Go...",
+                            epoch
+                        );
+                        match self.executor_client.get_epoch_boundary_data(epoch).await {
+                            Ok((_e, _ts, _boundary, validators)) => {
+                                let mut sorted_validators = validators.clone();
+                                sorted_validators
+                                    .sort_by(|a, b| a.authority_key.cmp(&b.authority_key));
+
+                                let addr_list: Vec<Vec<u8>> = sorted_validators
+                                    .iter()
+                                    .map(|v| {
+                                        hex::decode(&v.address.trim_start_matches("0x"))
+                                            .unwrap_or_default()
+                                    })
+                                    .collect();
+                                cache.insert(epoch, addr_list);
+                                info!("✅ [RUST-SYNC] Cache populated for epoch {}", epoch);
+                            }
+                            Err(e) => warn!("⚠️ [RUST-SYNC] Failed to fetch epoch data: {}", e),
+                        }
+                    }
+
+                    // Lookup
+                    if let Some(addrs) = cache.get(&epoch) {
+                        if leader_author_index < addrs.len() {
+                            let addr = &addrs[leader_author_index];
+                            if addr.len() == 20 {
+                                break Some(addr.clone()); // SUCCESS
+                            } else {
+                                error!(
+                                    "🚨 [FATAL] Invalid address length {} for index {}",
+                                    addr.len(),
+                                    leader_author_index
+                                );
+                                // Invalid data - retry fetching? Or just stuck?
+                                // For fork safety, we STUCK here. We cannot proceed with invalid data.
+                            }
+                        } else {
+                            error!(
+                                "🚨 [FATAL] Leader index {} out of range (size {})",
+                                leader_author_index,
+                                addrs.len()
+                            );
+                        }
+                    }
+                }
+
+                // 2. Backoff and Retry
+                retry_count += 1;
+                if retry_count % 10 == 0 {
+                    warn!("⏳ [RUST-SYNC] Still waiting for leader address... (epoch={}, index={}, retry={})", 
+                        epoch, leader_author_index, retry_count);
+                }
+
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            };
+
             // Send to Go executor - MUST succeed before continuing
             match self
                 .executor_client
@@ -1237,7 +1316,7 @@ impl RustSyncNode {
                     &subdag,
                     commit_data.epoch,
                     commit_data.commit.global_exec_index(),
-                    None, // leader_address - let Go lookup from index
+                    leader_address, // Now properly resolved from cache!
                 )
                 .await
             {

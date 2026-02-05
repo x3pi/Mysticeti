@@ -176,9 +176,10 @@ message SyncBlocksResponse {
 }
 
 // Validator info từ Go state - các trường cần thiết cho committee.json + metadata + phí/phần thưởng
+// Field names match ValidatorState interface in Go for consistency
 message ValidatorInfo {
-    // Các trường cần thiết cho committee.json (tên khớp với committee.json)
-    string address = 1;        // P2P address (Multiaddr format) - khớp với "address" trong committee.json
+    // RENAMED: address = Ethereum wallet address (matches ValidatorState.Address())
+    string address = 1;        // Ethereum wallet address (e.g., "0x1234...abcd")
     string stake = 2;          // Stake amount (string) - khớp với "stake" trong committee.json (sau khi normalize)
     string authority_key = 3;   // BLS public key (base64) - khớp với "authority_key" trong committee.json
     string protocol_key = 4;   // Ed25519 protocol key (base64) - khớp với "protocol_key" trong committee.json
@@ -194,6 +195,10 @@ message ValidatorInfo {
     uint64 commission_rate = 10;   // Tỷ lệ hoa hồng (ví dụ: 1000 = 10%, tối đa 10000)
     string min_self_delegation = 11; // Lượng stake tối thiểu validator phải tự ủy quyền
     string accumulated_rewards_per_share = 12; // Tổng phần thưởng tích lũy trên mỗi đơn vị stake
+    
+    // NEW: P2P address (matches ValidatorState.P2PAddress())
+    // Used for committee.json network communication
+    string p2p_address = 13;   // P2P address (Multiaddr format, e.g., "/ip4/127.0.0.1/tcp/9000")
 }
 
 // Danh sách validators (tương thích với Go ValidatorInfoList)
