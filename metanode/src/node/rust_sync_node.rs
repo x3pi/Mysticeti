@@ -195,6 +195,8 @@ pub struct RustSyncConfig {
     pub fetch_batch_size: u32,
     pub turbo_batch_size: u32, // Larger batch when catching up
     pub fetch_timeout_secs: u64,
+    /// Peer RPC addresses for fallback epoch boundary data fetch
+    pub peer_rpc_addresses: Vec<String>,
 }
 
 impl Default for RustSyncConfig {
@@ -205,6 +207,7 @@ impl Default for RustSyncConfig {
             fetch_batch_size: 500,       // OPTIMIZED: 500 (was 100) blocks per fetch
             turbo_batch_size: 2000,      // OPTIMIZED: 2000 (was 500) for aggressive catchup
             fetch_timeout_secs: 30,      // OPTIMIZED: 30s (was 10s) for larger batches
+            peer_rpc_addresses: vec![],  // Configure for WAN sync
         }
     }
 }
@@ -270,6 +273,12 @@ impl RustSyncNode {
         let tonic_client = TonicClient::new(context, network_keypair);
         self.network_client = Some(Arc::new(tonic_client));
         *self.committee.write().unwrap() = Some(committee);
+        self
+    }
+
+    /// Set peer RPC addresses for fallback epoch boundary data fetch
+    pub fn with_peer_rpc_addresses(mut self, addresses: Vec<String>) -> Self {
+        self.config.peer_rpc_addresses = addresses;
         self
     }
 
@@ -1251,9 +1260,13 @@ impl RustSyncNode {
                     // Load if missing
                     if !cache.contains_key(&epoch) {
                         info!(
-                            "📥 [RUST-SYNC] Cache miss for epoch {}. Fetching from Go...",
+                            "📥 [RUST-SYNC] Cache miss for epoch {}. Trying local Go...",
                             epoch
                         );
+
+                        let mut loaded = false;
+
+                        // 1. Try local Go first
                         match self.executor_client.get_epoch_boundary_data(epoch).await {
                             Ok((_e, _ts, _boundary, validators)) => {
                                 let mut sorted_validators = validators.clone();
@@ -1268,9 +1281,63 @@ impl RustSyncNode {
                                     })
                                     .collect();
                                 cache.insert(epoch, addr_list);
-                                info!("✅ [RUST-SYNC] Cache populated for epoch {}", epoch);
+                                info!(
+                                    "✅ [RUST-SYNC] Cache populated from local Go for epoch {}",
+                                    epoch
+                                );
+                                loaded = true;
                             }
-                            Err(e) => warn!("⚠️ [RUST-SYNC] Failed to fetch epoch data: {}", e),
+                            Err(e) => {
+                                warn!(
+                                    "⚠️ [RUST-SYNC] Local Go failed for epoch {}: {}. Trying peer...",
+                                    epoch, e
+                                );
+                            }
+                        }
+
+                        // 2. Fallback to peer if local Go failed
+                        if !loaded {
+                            // Get peer addresses from config
+                            if !self.config.peer_rpc_addresses.is_empty() {
+                                for peer_addr in &self.config.peer_rpc_addresses {
+                                    match query_peer_epoch_boundary_data(peer_addr, epoch).await {
+                                        Ok(response) => {
+                                            if response.error.is_none() {
+                                                let mut sorted = response.validators.clone();
+                                                sorted.sort_by(|a, b| {
+                                                    a.authority_key.cmp(&b.authority_key)
+                                                });
+                                                let addr_list: Vec<Vec<u8>> = sorted
+                                                    .iter()
+                                                    .map(|v| {
+                                                        hex::decode(
+                                                            &v.address.trim_start_matches("0x"),
+                                                        )
+                                                        .unwrap_or_default()
+                                                    })
+                                                    .collect();
+                                                cache.insert(epoch, addr_list);
+                                                info!("✅ [RUST-SYNC] Cache populated from PEER {} for epoch {}", peer_addr, epoch);
+                                                loaded = true;
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "⚠️ [RUST-SYNC] Peer {} query failed: {}",
+                                                peer_addr, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !loaded {
+                                warn!(
+                                    "⚠️ [RUST-SYNC] All sources failed for epoch {}. Will retry...",
+                                    epoch
+                                );
+                            }
                         }
                     }
 
@@ -1524,6 +1591,7 @@ pub async fn start_rust_sync_task_with_network(
     context: Arc<Context>,
     network_keypair: NetworkKeyPair,
     committee: Committee,
+    peer_rpc_addresses: Vec<String>, // For epoch boundary data fallback
 ) -> Result<RustSyncHandle> {
     info!("🚀 [RUST-SYNC] Starting Rust P2P sync task with network");
 
@@ -1567,7 +1635,8 @@ pub async fn start_rust_sync_task_with_network(
         initial_global_exec_index, // Use global_exec_index, not commit_index
         epoch_base_index,
     )
-    .with_network(context, network_keypair, committee);
+    .with_network(context, network_keypair, committee)
+    .with_peer_rpc_addresses(peer_rpc_addresses);
 
     Ok(sync_node.start())
 }

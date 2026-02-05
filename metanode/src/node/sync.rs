@@ -196,6 +196,7 @@ pub async fn start_sync_task(node: &mut ConsensusNode, _config: &NodeConfig) -> 
         sync_context,
         node.network_keypair.clone(),
         committee,
+        _config.peer_rpc_addresses.clone(), // For epoch boundary data fallback
     )
     .await
     {

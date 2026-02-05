@@ -792,6 +792,7 @@ pub async fn transition_to_epoch_from_system_tx(
             sync_context,
             node.network_keypair.clone(),
             committee.clone(),
+            config.peer_rpc_addresses.clone(), // For epoch boundary data fallback
         )
         .await
         {
