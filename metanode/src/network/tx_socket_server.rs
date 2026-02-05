@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
 /// Unix Domain Socket server for transaction submission
@@ -21,8 +21,10 @@ pub struct TxSocketServer {
     node: Option<Arc<Mutex<ConsensusNode>>>,
     /// Lock-free flag to check epoch transition status without acquiring node lock
     is_transitioning: Option<Arc<AtomicBool>>,
-    /// Peer RPC addresses for forwarding transactions (SyncOnly mode)
+    /// Static peer RPC addresses for forwarding transactions (SyncOnly mode)
     peer_rpc_addresses: Vec<String>,
+    /// Dynamic peer addresses from PeerDiscoveryService (takes precedence if set)
+    peer_discovery_addresses: Option<Arc<RwLock<Vec<String>>>>,
 }
 
 impl TxSocketServer {
@@ -40,6 +42,7 @@ impl TxSocketServer {
             node: Some(node),
             is_transitioning: Some(is_transitioning),
             peer_rpc_addresses,
+            peer_discovery_addresses: None,
         }
     }
 
@@ -81,7 +84,14 @@ impl TxSocketServer {
                     let client = self.transaction_client.clone();
                     let node = self.node.clone();
                     let is_transitioning = self.is_transitioning.clone();
-                    let peer_addresses = self.peer_rpc_addresses.clone();
+
+                    // Prefer dynamic addresses from PeerDiscoveryService, fallback to static config
+                    let peer_addresses =
+                        if let Some(ref dynamic_addrs) = self.peer_discovery_addresses {
+                            dynamic_addrs.read().await.clone()
+                        } else {
+                            self.peer_rpc_addresses.clone()
+                        };
 
                     tokio::spawn(async move {
                         info!("🔌 [DEBUG] Spawned handler for UDS connection");

@@ -34,20 +34,84 @@ pub async fn transition_to_epoch_from_system_tx(
     // CASE 1: Same epoch, but SyncOnly needs to become Validator
     // This is a MODE-ONLY transition - skip full epoch transition, just start authority
     if is_same_epoch && is_sync_only {
-        // CRITICAL FIX: Check if Go has synced to the boundary before attempting mode transition
-        // Without this check, transition_mode_only will call fetch_committee_with_timestamp
-        // which will block indefinitely waiting for Go to have epoch data
-        if let Some(executor_client) = &node.executor_client {
-            let go_current_block = executor_client.get_last_block_number().await.unwrap_or(0);
-            if go_current_block < synced_global_exec_index {
+        // CRITICAL FIX 2026-02-05: MUST WAIT for Go to sync before promoting to Validator
+        // Previously we deferred (returned early) but there was no guarantee of retry.
+        // Now we ACTIVELY POLL and WAIT until Go catches up, then promote immediately.
+        //
+        // IMPORTANT: If a NEW epoch transition occurs while waiting, we must abort and
+        // let the new epoch's transition handler take over.
+        //
+        // Create FRESH executor client for reliable communication
+        let fresh_executor_client = ExecutorClient::new(
+            true,
+            false, // Don't need commit capability for just checking block number
+            config.executor_send_socket_path.clone(),
+            config.executor_receive_socket_path.clone(),
+            None,
+        );
+
+        // ACTIVE WAIT: Poll Go until it reaches the required boundary
+        // With epoch change detection and timeout safety
+        let poll_interval = Duration::from_millis(500);
+        let max_attempts = 600; // 5 minutes max (600 * 500ms)
+        let mut attempt = 0u64;
+        
+        loop {
+            attempt += 1;
+            
+            // SAFETY: Check if a new epoch has started - if so, abort and let new handler take over
+            let go_current_epoch = fresh_executor_client.get_current_epoch().await.unwrap_or(0);
+            if go_current_epoch > new_epoch {
                 info!(
-                    "⏳ [MODE TRANSITION] Deferring SyncOnly → Validator for epoch {}: Go block {} < required boundary {}. Waiting for sync to complete.",
-                    new_epoch, go_current_block, synced_global_exec_index
+                    "🔄 [MODE TRANSITION] New epoch {} detected (was waiting for epoch {}). Aborting to let new epoch handler take over.",
+                    go_current_epoch, new_epoch
                 );
-                // Don't call transition_mode_only - return early and let epoch_monitor or
-                // RustSyncNode retry when Go is ready
                 return Ok(());
             }
+            
+            let go_current_block = match fresh_executor_client.get_last_block_number().await {
+                Ok(block) => block,
+                Err(e) => {
+                    if attempt % 20 == 0 {
+                        warn!(
+                            "⚠️ [MODE TRANSITION] Cannot reach Go (attempt {}): {}. Will keep trying...",
+                            attempt, e
+                        );
+                    }
+                    0
+                }
+            };
+
+            if go_current_block >= synced_global_exec_index {
+                info!(
+                    "✅ [MODE TRANSITION] Go synced! block {} >= boundary {}. Proceeding to Validator mode. (took {} attempts)",
+                    go_current_block, synced_global_exec_index, attempt
+                );
+                break;
+            }
+
+            // Timeout safety - after 5 minutes, give up and let epoch_monitor retry
+            if attempt >= max_attempts {
+                warn!(
+                    "⚠️ [MODE TRANSITION] Timeout after {} attempts (5 min). Go block {} still < boundary {}. Will retry via epoch_monitor.",
+                    attempt, go_current_block, synced_global_exec_index
+                );
+                return Ok(());
+            }
+
+            // Log progress every 20 attempts (10 seconds)
+            if attempt % 20 == 0 {
+                info!(
+                    "⏳ [MODE TRANSITION] Waiting for Go sync: block {} / {} ({}% complete, epoch={}, waiting {}s)",
+                    go_current_block, 
+                    synced_global_exec_index,
+                    if synced_global_exec_index > 0 { go_current_block * 100 / synced_global_exec_index } else { 0 },
+                    go_current_epoch,
+                    attempt / 2
+                );
+            }
+
+            sleep(poll_interval).await;
         }
 
         info!(

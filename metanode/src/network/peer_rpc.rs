@@ -147,23 +147,6 @@ impl PeerRpcServer {
         }
     }
 
-    /// Create Peer RPC Server with transaction submitter (for validators)
-    pub fn new_with_submitter(
-        node_id: usize,
-        port: u16,
-        network_address: String,
-        executor_client: Arc<ExecutorClient>,
-        transaction_submitter: Arc<dyn TransactionSubmitter>,
-    ) -> Self {
-        Self {
-            node_id,
-            port,
-            network_address,
-            executor_client,
-            transaction_submitter: Some(transaction_submitter),
-        }
-    }
-
     /// Start the Peer RPC Server
     pub async fn start(self) -> Result<()> {
         // Listen on all interfaces for WAN access
