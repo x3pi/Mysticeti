@@ -539,8 +539,12 @@ pub async fn transition_to_epoch_from_system_tx(
     // This ensures deterministic, identical timestamps across all nodes
     // =============================================================================
     let mut epoch_timestamp_to_use = epoch_timestamp_to_use; // Make mutable to allow update
+    // Store epoch boundary block for later use in Validator Priority check
+    let mut epoch_boundary_block: u64 = synced_index; // Default to synced_index if get_epoch_boundary_data fails
     match executor_client.get_epoch_boundary_data(new_epoch).await {
         Ok((stored_epoch, stored_timestamp, stored_boundary, _validators)) => {
+            // Save the authoritative epoch boundary block
+            epoch_boundary_block = stored_boundary;
             // Validate boundary block matches what we sent
             if stored_boundary != required_boundary {
                 error!(
@@ -610,6 +614,10 @@ pub async fn transition_to_epoch_from_system_tx(
     let committee = committee_source
         .fetch_committee(&config.executor_send_socket_path, new_epoch)
         .await?;
+    
+    // Clone committee for later use in Validator Priority check
+    // (original committee will be moved into ConsensusAuthority::start())
+    let committee_for_priority_check = committee.clone();
 
     // Update epoch_eth_addresses cache with new epoch's committee
     if let Err(e) = committee_source
@@ -659,7 +667,7 @@ pub async fn transition_to_epoch_from_system_tx(
                 true,
                 config.executor_send_socket_path.clone(),
                 config.executor_receive_socket_path.clone(),
-                synced_index + 1,
+                epoch_boundary_block + 1, // Use epoch boundary block, not synced_index
                 Some(node.storage_path.clone()), // Enable persistence for commit client
             )))
         } else {
@@ -679,7 +687,7 @@ pub async fn transition_to_epoch_from_system_tx(
                     ),
                 )
                 .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
-                .with_epoch_info(new_epoch, synced_index)
+                .with_epoch_info(new_epoch, epoch_boundary_block) // Use epoch boundary block
                 .with_is_transitioning(node.is_transitioning.clone())
                 .with_pending_transactions_queue(node.pending_transactions_queue.clone())
                 .with_epoch_transition_callback(epoch_cb);
@@ -706,7 +714,7 @@ pub async fn transition_to_epoch_from_system_tx(
                 ConsensusAuthority::start(
                     NetworkType::Tonic,
                     epoch_timestamp_to_use, // CRITICAL: Use verified timestamp from CommitteeSource
-                    synced_index, // epoch_base_index is the synced_index (last global_exec_index of prev epoch)
+                    epoch_boundary_block, // epoch_base_index is the boundary block (last global_exec_index of prev epoch)
                     node.own_index,
                     committee,
                     params,
@@ -756,7 +764,7 @@ pub async fn transition_to_epoch_from_system_tx(
                 true,
                 config.executor_send_socket_path.clone(),
                 config.executor_receive_socket_path.clone(),
-                synced_index + 1,
+                epoch_boundary_block + 1, // Use epoch boundary block, not synced_index
                 Some(node.storage_path.clone()),
             )))
         } else {
@@ -776,7 +784,7 @@ pub async fn transition_to_epoch_from_system_tx(
                     ),
                 )
                 .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
-                .with_epoch_info(new_epoch, synced_index)
+                .with_epoch_info(new_epoch, epoch_boundary_block) // Use epoch boundary block
                 .with_is_transitioning(node.is_transitioning.clone())
                 .with_pending_transactions_queue(node.pending_transactions_queue.clone())
                 .with_epoch_transition_callback(epoch_cb);
@@ -880,6 +888,53 @@ pub async fn transition_to_epoch_from_system_tx(
 
     node.is_transitioning.store(false, Ordering::SeqCst);
     let _ = node.submit_queued_transactions().await;
+
+    // =========================================================================
+    // VALIDATOR PRIORITY FIX: After SyncOnly setup, re-check if we should be Validator
+    // 
+    // Problem: When a SyncOnly node transitions epochs, check_and_update_node_mode()
+    // is called BEFORE committee is fetched for the new epoch. If the new epoch's
+    // committee includes this node, we must upgrade to Validator.
+    //
+    // Solution: After SyncOnly mode is established and sync starts, re-check
+    // committee membership. If we're now in the committee, trigger mode upgrade.
+    // =========================================================================
+    if matches!(node.node_mode, NodeMode::SyncOnly) {
+        let own_protocol_pubkey = node.protocol_keypair.public();
+        let is_now_in_committee = committee_for_priority_check
+            .authorities()
+            .any(|(_, authority)| authority.protocol_key == own_protocol_pubkey);
+        
+        if is_now_in_committee {
+            info!(
+                "🚀 [VALIDATOR PRIORITY] SyncOnly node IS in committee for epoch {}! Triggering upgrade.",
+                new_epoch
+            );
+            
+            // Trigger upgrade: SyncOnly → Validator
+            // Use synced_index as boundary for the mode-only transition
+            // Use epoch_boundary_block (from get_epoch_boundary_data) instead of synced_index
+            // This ensures we use the correct epoch boundary, not just the last committed block
+            let _upgrade_result = transition_mode_only(
+                node,
+                new_epoch,
+                epoch_boundary_block, // boundary_block from get_epoch_boundary_data
+                epoch_boundary_block, // synced_global_exec_index
+                config,
+            )
+            .await;
+            
+            info!(
+                "✅ [VALIDATOR PRIORITY] Mode upgrade complete: now {:?}",
+                node.node_mode
+            );
+        } else {
+            info!(
+                "ℹ️ [VALIDATOR PRIORITY] Node NOT in committee for epoch {}. Staying SyncOnly.",
+                new_epoch
+            );
+        }
+    }
 
     node.reset_reconfig_state().await;
 
