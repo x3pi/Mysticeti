@@ -12,16 +12,19 @@
 
 use crate::node::executor_client::ExecutorClient;
 use anyhow::Result;
-use consensus_config::{Committee, NetworkKeyPair};
+use consensus_config::{AuthorityIndex, Committee, NetworkKeyPair};
 use consensus_core::{
     Commit, CommitAPI, CommitRange, CommitRef, CommittedSubDag, Context, GlobalCommitInfo,
     NetworkClient, SignedBlock, TonicClient, VerifiedBlock,
 };
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_util::bytes::Bytes;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::network::peer_rpc::{query_peer_epoch_boundary_data, query_peer_epochs_network};
@@ -262,7 +265,7 @@ impl RustSyncNode {
                 initial_global_exec_index as u64,
             ))),
             epoch_base_index: Arc::new(AtomicU64::new(epoch_base_index)),
-            epoch_base_index: Arc::new(AtomicU64::new(epoch_base_index)),
+
             epoch_eth_addresses: Arc::new(Mutex::new(HashMap::new())),
             context: None,
             network_keypair: None,
@@ -831,48 +834,115 @@ impl RustSyncNode {
             commit_range
         );
 
-        let authorities: Vec<_> = committee.authorities().map(|(idx, _)| idx).collect();
-        let mut fetch_handles = Vec::with_capacity(authorities.len());
-
-        for authority_idx in authorities {
-            let client = network_client.clone();
-            let range = commit_range.clone();
-
-            let handle = tokio::spawn(async move {
-                match client
-                    .fetch_commits(authority_idx, range.clone(), timeout)
-                    .await
-                {
-                    Ok((commits, certs)) => {
-                        if commits.is_empty() {
-                            Err(anyhow::anyhow!("Empty response from {}", authority_idx))
-                        } else {
-                            Ok((authority_idx, commits, certs))
-                        }
-                    }
-                    Err(e) => Err(anyhow::anyhow!("Peer {} failed: {:?}", authority_idx, e)),
+        let authorities: Vec<_> = committee
+            .authorities()
+            .filter(|(_, auth)| {
+                // Filter out self to avoid "Connection refused" on loopback
+                if let Some(keypair) = &self.network_keypair {
+                    auth.network_key != keypair.public()
+                } else {
+                    true
                 }
-            });
-            fetch_handles.push(handle);
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+
+        // Race pattern: Fetch from ALL peers in parallel, take the FIRST valid response
+        // This avoids waiting for timeouts on slow/dead peers
+        // SMART SHARDING + HEDGING
+        // 1. Deterministically assign a primary peer for this batch
+        //    Logic: (start_index) % num_peers.
+        //    This distributes load across peers when multiple batches are fetched in parallel.
+        if authorities.is_empty() {
+            warn!("⚠️ [RUST-SYNC] No peers available (all filtered out or committee empty).");
+            return Ok(0);
         }
 
-        // Wait for first successful response (race pattern)
-        let mut serialized_commits = Vec::new();
+        let primary_idx = (commit_range.start() as usize) % authorities.len();
+        let primary_peer = authorities[primary_idx];
+
+        info!(
+            "🎯 [SMART-SHARDING] Assigned primary peer {} for range {:?} (Hedging in 500ms)",
+            primary_peer, commit_range
+        );
+
+        let mut fetch_futures = FuturesUnordered::new();
+
+        // Helper to spawn a request
+        let spawn_req = |peer_idx: AuthorityIndex,
+                         client: Arc<TonicClient>,
+                         range: CommitRange,
+                         timeout: Duration| {
+            async move {
+                match client.fetch_commits(peer_idx, range.clone(), timeout).await {
+                    Ok((commits, certs)) => {
+                        if commits.is_empty() {
+                            Err(anyhow::anyhow!("Empty response from {}", peer_idx))
+                        } else {
+                            Ok((peer_idx, commits, certs))
+                        }
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Peer {} failed: {:?}", peer_idx, e)),
+                }
+            }
+        };
+
+        // Start Primary
+        fetch_futures.push(spawn_req(
+            primary_peer,
+            network_client.clone(),
+            commit_range.clone(),
+            timeout,
+        ));
+
+        let mut hedging_timer = Box::pin(tokio::time::sleep(Duration::from_millis(500)));
+        let mut hedged = false;
+
+        let mut serialized_commits: Vec<Bytes> = Vec::new();
         let mut winning_peer = None;
 
-        for handle in fetch_handles {
-            match handle.await {
-                Ok(Ok((peer_idx, commits, _certs))) => {
-                    if commits.len() > serialized_commits.len() {
-                        serialized_commits = commits;
-                        winning_peer = Some(peer_idx);
+        loop {
+            tokio::select! {
+                // Trigger Hedging if timer expires (and we haven't hedged yet)
+                _ = &mut hedging_timer, if !hedged => {
+                    hedged = true;
+                    if authorities.len() > 1 {
+                        info!("🚀 [HEDGING] Primary {} slow (500ms). Racing against others...", primary_peer);
+                        for &peer_idx in &authorities {
+                            if peer_idx != primary_peer {
+                                fetch_futures.push(spawn_req(peer_idx, network_client.clone(), commit_range.clone(), timeout));
+                            }
+                        }
                     }
                 }
-                Ok(Err(e)) => {
-                    trace!("[PARALLEL-FETCH] {}", e);
-                }
-                Err(e) => {
-                    warn!("[PARALLEL-FETCH] Task join error: {}", e);
+
+                // Process results
+                res = fetch_futures.next() => {
+                    match res {
+                        Some(Ok((peer_idx, commits, _))) => {
+                             if !commits.is_empty() {
+                                // Winner!
+                                info!("✅ [RUST-SYNC] Received data from peer {}", peer_idx);
+                                serialized_commits = commits;
+                                winning_peer = Some(peer_idx);
+                                break; // Stop waiting
+                             }
+                        }
+                        Some(Err(e)) => {
+                            trace!("Peer error: {}", e);
+                            // If primary failed instantly, trigger hedging NOW
+                            if !hedged {
+                                hedged = true;
+                                info!("⚠️ [RUST-SYNC] Primary failed immediately. Triggering fallback race.");
+                                for &peer_idx in &authorities {
+                                    if peer_idx != primary_peer {
+                                        fetch_futures.push(spawn_req(peer_idx, network_client.clone(), commit_range.clone(), timeout));
+                                    }
+                                }
+                            }
+                        }
+                        None => break, // All futures finished (and failed)
+                    }
                 }
             }
         }
@@ -880,7 +950,7 @@ impl RustSyncNode {
         if serialized_commits.is_empty() {
             // Fallback to global range sync
             warn!(
-                "⚠️ [PARALLEL-FETCH] All validators returned empty for range {:?}. Falling back to global range!",
+                "⚠️ [PARALLEL-FETCH] All validators returned empty/error for range {:?}. Falling back to global range!",
                 commit_range
             );
             return self

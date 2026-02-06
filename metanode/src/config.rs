@@ -157,6 +157,19 @@ pub struct NodeConfig {
     /// Set to 0 to disable Peer RPC server
     #[serde(default)]
     pub peer_rpc_port: Option<u16>,
+
+    /// Fetch interval in seconds (default: 2)
+    #[serde(default = "default_fetch_interval_secs")]
+    pub fetch_interval_secs: u64,
+
+    /// Turbo fetch interval in milliseconds (default: 200)
+    #[serde(default = "default_turbo_fetch_interval_ms")]
+    pub turbo_fetch_interval_ms: u64,
+
+    /// Fetch timeout in seconds (default: 10)
+    #[serde(default = "default_fetch_timeout_secs")]
+    pub fetch_timeout_secs: u64,
+
     /// Peer RPC addresses for WAN-based epoch discovery (IP:Port format)
     /// When node is behind and local Go Master is stale, it can query these peers over network
     /// Format: ["192.168.1.100:19000", "192.168.1.101:19000"]
@@ -243,6 +256,18 @@ fn default_peer_discovery_refresh_secs() -> u64 {
     300 // 5 minutes
 }
 
+fn default_fetch_interval_secs() -> u64 {
+    2
+}
+
+fn default_turbo_fetch_interval_ms() -> u64 {
+    200
+}
+
+fn default_fetch_timeout_secs() -> u64 {
+    10
+}
+
 impl NodeConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
@@ -321,9 +346,12 @@ impl NodeConfig {
                 adaptive_delay_ms: default_adaptive_delay_ms(),
                 epoch_monitor_poll_interval_secs: default_epoch_monitor_poll_interval_secs(),
                 peer_rpc_port: Some(19000 + idx as u16), // Default: 19000 + node_id for WAN sync
-                peer_rpc_addresses: vec![],              // Empty by default, configure for WAN sync
-                enable_peer_discovery: false,            // Disabled by default
-                go_rpc_url: None, // Configure when enable_peer_discovery is true
+                fetch_interval_secs: default_fetch_interval_secs(),
+                turbo_fetch_interval_ms: default_turbo_fetch_interval_ms(),
+                fetch_timeout_secs: default_fetch_timeout_secs(),
+                peer_rpc_addresses: vec![], // Empty by default, configure for WAN sync
+                enable_peer_discovery: false, // Disabled by default
+                go_rpc_url: None,           // Configure when enable_peer_discovery is true
                 peer_discovery_refresh_secs: default_peer_discovery_refresh_secs(),
             };
 
