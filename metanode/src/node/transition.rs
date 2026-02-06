@@ -674,6 +674,17 @@ pub async fn transition_to_epoch_from_system_tx(
             None
         };
 
+        // Initialize BlockCoordinator for dual-stream block production
+        let coordinator = Arc::new(
+            crate::node::block_coordinator::BlockCoordinator::new(
+                epoch_boundary_block + 1, // next_expected = boundary + 1
+                crate::node::block_coordinator::CoordinatorConfig::default(),
+            )
+        );
+        node.block_coordinator = Some(coordinator.clone());
+        info!("📦 [COORDINATOR] BlockCoordinator initialized for epoch {} (next_expected={})", 
+            new_epoch, epoch_boundary_block + 1);
+
         let mut processor =
             crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
                 .with_commit_index_callback(
@@ -690,7 +701,8 @@ pub async fn transition_to_epoch_from_system_tx(
                 .with_epoch_info(new_epoch, epoch_boundary_block) // Use epoch boundary block
                 .with_is_transitioning(node.is_transitioning.clone())
                 .with_pending_transactions_queue(node.pending_transactions_queue.clone())
-                .with_epoch_transition_callback(epoch_cb);
+                .with_epoch_transition_callback(epoch_cb)
+                .with_block_coordinator(coordinator.clone()); // Connect to BlockCoordinator
 
         // Share epoch_eth_addresses HashMap reference for leader address lookup
         processor = processor.with_epoch_eth_addresses(node.epoch_eth_addresses.clone());
@@ -771,6 +783,17 @@ pub async fn transition_to_epoch_from_system_tx(
             None
         };
 
+        // Initialize BlockCoordinator for dual-stream block production
+        let coordinator = Arc::new(
+            crate::node::block_coordinator::BlockCoordinator::new(
+                epoch_boundary_block + 1,
+                crate::node::block_coordinator::CoordinatorConfig::default(),
+            )
+        );
+        node.block_coordinator = Some(coordinator.clone());
+        info!("📦 [COORDINATOR] BlockCoordinator initialized for SyncOnly epoch {} (next_expected={})", 
+            new_epoch, epoch_boundary_block + 1);
+
         let mut processor =
             crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
                 .with_commit_index_callback(
@@ -787,7 +810,8 @@ pub async fn transition_to_epoch_from_system_tx(
                 .with_epoch_info(new_epoch, epoch_boundary_block) // Use epoch boundary block
                 .with_is_transitioning(node.is_transitioning.clone())
                 .with_pending_transactions_queue(node.pending_transactions_queue.clone())
-                .with_epoch_transition_callback(epoch_cb);
+                .with_epoch_transition_callback(epoch_cb)
+                .with_block_coordinator(coordinator.clone()); // Connect to BlockCoordinator
 
         // Share epoch_eth_addresses HashMap reference for leader address lookup
         processor = processor.with_epoch_eth_addresses(node.epoch_eth_addresses.clone());
@@ -1696,6 +1720,17 @@ pub async fn transition_mode_only(
         None
     };
 
+    // Initialize BlockCoordinator for dual-stream block production
+    let coordinator = Arc::new(
+        crate::node::block_coordinator::BlockCoordinator::new(
+            synced_global_exec_index + 1,
+            crate::node::block_coordinator::CoordinatorConfig::default(),
+        )
+    );
+    node.block_coordinator = Some(coordinator.clone());
+    info!("📦 [COORDINATOR] BlockCoordinator initialized for mode transition epoch {} (next_expected={})", 
+        epoch, synced_global_exec_index + 1);
+
     let mut processor = crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
         .with_commit_index_callback(
             crate::consensus::commit_callbacks::create_commit_index_callback(
@@ -1711,7 +1746,8 @@ pub async fn transition_mode_only(
         .with_epoch_info(epoch, synced_global_exec_index)
         .with_is_transitioning(node.is_transitioning.clone())
         .with_pending_transactions_queue(node.pending_transactions_queue.clone())
-        .with_epoch_transition_callback(epoch_cb);
+        .with_epoch_transition_callback(epoch_cb)
+        .with_block_coordinator(coordinator.clone()); // Connect to BlockCoordinator
 
     // Share epoch_eth_addresses HashMap reference for leader address lookup
     processor = processor.with_epoch_eth_addresses(node.epoch_eth_addresses.clone());

@@ -13,6 +13,7 @@ use tokio::time::sleep; // [Added] Import sleep for retry mechanism
 use tracing::{error, info, trace, warn};
 
 use crate::consensus::checkpoint::calculate_global_exec_index;
+use crate::node::block_coordinator::BlockCoordinator;
 use crate::node::executor_client::ExecutorClient;
 use crate::types::tx_hash::calculate_transaction_hash_hex;
 
@@ -45,6 +46,8 @@ pub struct CommitProcessor {
     /// Multi-epoch committee cache: ETH addresses keyed by epoch
     /// Supports looking up leaders from previous epochs during transitions
     epoch_eth_addresses: Arc<tokio::sync::Mutex<std::collections::HashMap<u64, Vec<Vec<u8>>>>>,
+    /// Block Coordinator for dual-stream block production (optional)
+    block_coordinator: Option<Arc<BlockCoordinator>>,
 }
 
 impl CommitProcessor {
@@ -65,6 +68,7 @@ impl CommitProcessor {
             epoch_eth_addresses: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
+            block_coordinator: None,
         }
     }
 
@@ -167,6 +171,12 @@ impl CommitProcessor {
         &self,
     ) -> Arc<tokio::sync::Mutex<std::collections::HashMap<u64, Vec<Vec<u8>>>>> {
         self.epoch_eth_addresses.clone()
+    }
+
+    /// Set block coordinator for dual-stream block production
+    pub fn with_block_coordinator(mut self, coordinator: Arc<BlockCoordinator>) -> Self {
+        self.block_coordinator = Some(coordinator);
+        self
     }
 
     /// Process commits in order

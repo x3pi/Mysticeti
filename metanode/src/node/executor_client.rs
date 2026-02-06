@@ -203,6 +203,9 @@ pub struct ExecutorClient {
     storage_path: Option<std::path::PathBuf>,
     /// Last verified Go block number (for fork detection)
     last_verified_go_index: Arc<tokio::sync::Mutex<u64>>,
+    /// Track sent global_exec_indices to prevent duplicates from dual-stream
+    /// This prevents both Consensus and Sync from sending the same block
+    sent_indices: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
 }
 
 /// Production safety constants
@@ -263,6 +266,7 @@ impl ExecutorClient {
             next_expected_index: Arc::new(tokio::sync::Mutex::new(initial_next_expected)),
             storage_path,
             last_verified_go_index: Arc::new(tokio::sync::Mutex::new(0)),
+            sent_indices: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -481,6 +485,17 @@ impl ExecutorClient {
                 }
                 return Ok(());
             }
+        }
+
+        // DUAL-STREAM DEDUP: Prevent duplicate sends from Consensus and Sync streams
+        // This is critical for BlockCoordinator integration
+        {
+            let mut sent = self.sent_indices.lock().await;
+            if sent.contains(&global_exec_index) {
+                info!("🔄 [DEDUP] Skipping already-sent block from dual-stream: global_exec_index={}", global_exec_index);
+                return Ok(()); // Already sent, skip
+            }
+            // Don't insert yet - insert only after successful send
         }
         
         // #region agent log
@@ -723,6 +738,19 @@ impl ExecutorClient {
                     *next_expected += 1;
                     info!("✅ [SEQUENTIAL-BUFFER] Successfully sent block global_exec_index={}, next_expected={}", 
                         current_expected, *next_expected);
+                    
+                    // DUAL-STREAM TRACKING: Mark this index as successfully sent
+                    // This prevents duplicate sends from both Consensus and Sync streams
+                    {
+                        let mut sent = self.sent_indices.lock().await;
+                        sent.insert(current_expected);
+                        // Limit memory: only keep last 10000 indices
+                        if sent.len() > 10000 {
+                            if let Some(&min_idx) = sent.iter().min() {
+                                sent.remove(&min_idx);
+                            }
+                        }
+                    }
                     
                     // PERSIST: Save last successfully sent index for crash recovery
                     if let Some(ref storage_path) = self.storage_path {

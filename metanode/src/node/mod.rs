@@ -29,6 +29,7 @@ use crate::node::tx_submitter::{TransactionClientProxy, TransactionSubmitter};
 use consensus_core::storage::rocksdb_store::RocksDBStore;
 
 // Declare submodules
+pub mod block_coordinator;
 pub mod catchup;
 pub mod committee;
 pub mod committee_source;
@@ -156,6 +157,10 @@ pub struct ConsensusNode {
     /// Updated when committee is loaded, used by CommitProcessor to send leader_address to Go
     pub(crate) epoch_eth_addresses:
         Arc<tokio::sync::Mutex<std::collections::HashMap<u64, Vec<Vec<u8>>>>>,
+
+    /// Block Coordinator for dual-stream block production
+    /// Handles both Consensus and Sync streams with deduplication and priority
+    pub(crate) block_coordinator: Option<Arc<block_coordinator::BlockCoordinator>>,
 }
 
 impl ConsensusNode {
@@ -855,6 +860,8 @@ impl ConsensusNode {
                 map.insert(current_epoch, validator_eth_addresses.clone());
                 Arc::new(tokio::sync::Mutex::new(map))
             },
+            // BlockCoordinator initialized later when executor_client is ready
+            block_coordinator: None,
         };
 
         // CRITICAL FIX: Load previous epoch's RocksDB stores into legacy_store_manager

@@ -321,8 +321,10 @@ pub async fn start_sync_task(node: &mut ConsensusNode, _config: &NodeConfig) -> 
 pub async fn stop_sync_task(node: &mut ConsensusNode) -> Result<()> {
     if let Some(handle) = node.sync_task_handle.take() {
         info!("🛑 [SYNC TASK] Stopping...");
-        handle.task_handle.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle.task_handle).await;
+        // CRITICAL FIX: Call stop() which sends shutdown signal before aborting
+        // Previously we only called abort() which didn't stop internal loops
+        handle.stop().await;
+        info!("✅ [SYNC TASK] Stopped successfully");
     }
     Ok(())
 }
