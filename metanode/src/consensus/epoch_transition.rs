@@ -19,8 +19,33 @@ pub fn start_epoch_transition_handler(
         while let Some((new_epoch, boundary_block_from_tx, synced_global_exec_index)) =
             receiver.recv().await
         {
-            info!("🚀 [EPOCH TRANSITION HANDLER] Processing transition request: epoch={}, boundary_block={}, synced_global_exec_index={}",
-                new_epoch, boundary_block_from_tx, synced_global_exec_index);
+            info!(
+                "🚀 [EPOCH TRANSITION HANDLER] Processing transition request (source=system_tx): epoch={}, boundary_block={}, synced_global_exec_index={}",
+                new_epoch, boundary_block_from_tx, synced_global_exec_index
+            );
+
+            // Check with EpochTransitionManager before proceeding
+            // This prevents race conditions with epoch_monitor
+            let epoch_manager = match crate::node::epoch_transition_manager::get_epoch_manager() {
+                Some(m) => m,
+                None => {
+                    // Manager not initialized yet, skip this message
+                    warn!("⚠️ [EPOCH TRANSITION HANDLER] Epoch manager not initialized yet, will retry");
+                    continue;
+                }
+            };
+
+            // Try to acquire transition lock
+            if let Err(e) = epoch_manager
+                .try_start_epoch_transition(new_epoch, "system_tx")
+                .await
+            {
+                info!(
+                    "⏳ [EPOCH TRANSITION HANDLER] Cannot start transition: {} (another source may be handling it)",
+                    e
+                );
+                continue;
+            }
 
             // [FIX CRITICAL]: Không update provider ở đây.
             // Nếu update trước, đồng hồ đếm giờ của Provider sẽ bị reset.
@@ -40,6 +65,9 @@ pub fn start_epoch_transition_handler(
                     )
                     .await
                 {
+                    // Mark transition as failed in manager
+                    epoch_manager.fail_transition(&e.to_string()).await;
+
                     error!(
                         "❌ [EPOCH TRANSITION HANDLER] Failed to transition epoch: {}",
                         e
@@ -47,6 +75,9 @@ pub fn start_epoch_transition_handler(
                     // Nếu thất bại: Provider KHÔNG được update.
                     // Provider sẽ tiếp tục thấy epoch cũ -> tiếp tục bắn System Transaction -> Hệ thống sẽ thử lại (retry).
                 } else {
+                    // Mark transition as complete in manager
+                    epoch_manager.complete_epoch_transition(new_epoch).await;
+
                     info!(
                         "✅ [EPOCH TRANSITION HANDLER] Successfully transitioned to epoch {}",
                         new_epoch
@@ -63,6 +94,9 @@ pub fn start_epoch_transition_handler(
                         .await;
                 }
             } else {
+                // No node available, fail the transition
+                epoch_manager.fail_transition("Node not registered").await;
+
                 warn!("⚠️ [EPOCH TRANSITION HANDLER] Node not registered in global registry yet - transition will be handled when node is available");
                 // Không update provider -> Hệ thống sẽ tiếp tục thử lại ở lần check tiếp theo
             }

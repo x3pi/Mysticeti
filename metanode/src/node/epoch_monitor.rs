@@ -203,10 +203,29 @@ pub fn start_unified_epoch_monitor(
 
             let (new_epoch, epoch_timestamp_ms, boundary_block) = boundary_data;
 
-            // 5. DO NOT check membership here - let transition.rs determine mode
-            // This ensures single source of truth from LOCAL Go committee
+            // 5. Check with EpochTransitionManager before proceeding
+            // This prevents race conditions with system_tx handler
+            let epoch_manager = match crate::node::epoch_transition_manager::get_epoch_manager() {
+                Some(m) => m,
+                None => {
+                    // Manager not initialized yet, skip this cycle
+                    debug!("⏳ [EPOCH MONITOR] Epoch manager not initialized yet, skipping");
+                    continue;
+                }
+            };
+
+            // Try to acquire transition lock
+            if let Err(e) = epoch_manager
+                .try_start_epoch_transition(new_epoch, "epoch_monitor")
+                .await
+            {
+                debug!("⏳ [EPOCH MONITOR] Cannot start transition: {}", e);
+                continue;
+            }
+
+            // 6. Log with source tracking
             info!(
-                "🔄 [EPOCH MONITOR] Triggering transition: epoch {} → {} | boundary_block={} | mode will be determined by transition.rs",
+                "🔄 [EPOCH MONITOR] Triggering transition (source=epoch_monitor): epoch {} → {} | boundary_block={} | mode will be determined by transition.rs",
                 rust_epoch, new_epoch, boundary_block
             );
 
@@ -227,6 +246,9 @@ pub fn start_unified_epoch_monitor(
                     .await
                 {
                     Ok(()) => {
+                        // Mark transition as complete in manager
+                        epoch_manager.complete_epoch_transition(new_epoch).await;
+
                         info!(
                             "✅ [EPOCH MONITOR] Successfully triggered transition to epoch {}",
                             new_epoch
@@ -250,12 +272,18 @@ pub fn start_unified_epoch_monitor(
                         }
                     }
                     Err(e) => {
+                        // Mark transition as failed in manager
+                        epoch_manager.fail_transition(&e.to_string()).await;
+
                         warn!(
                             "❌ [EPOCH MONITOR] Failed to transition to epoch {}: {}",
                             new_epoch, e
                         );
                     }
                 }
+            } else {
+                // No node available, fail the transition
+                epoch_manager.fail_transition("Node not registered").await;
             }
 
             // CRITICAL: Do NOT exit the loop! Monitor continues running

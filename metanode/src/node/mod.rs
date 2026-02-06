@@ -33,6 +33,7 @@ pub mod catchup;
 pub mod committee;
 pub mod committee_source;
 pub mod epoch_monitor;
+pub mod epoch_transition_manager;
 pub mod executor_client;
 pub mod notification_listener;
 pub mod notification_server;
@@ -865,13 +866,28 @@ impl ConsensusNode {
         //     current_epoch,
         // );
 
+        // Initialize the global StateTransitionManager
+        // This MUST happen before epoch_transition_handler and epoch_monitor start
+        // Pass is_in_committee to set initial mode
+        epoch_transition_manager::init_state_manager(current_epoch, is_in_committee).await;
+        info!(
+            "🔧 [STARTUP] Initialized StateTransitionManager: epoch={}, mode={}",
+            current_epoch,
+            if is_in_committee {
+                "Validator"
+            } else {
+                "SyncOnly"
+            }
+        );
+
         crate::consensus::epoch_transition::start_epoch_transition_handler(
             epoch_tx_receiver,
             node.system_transaction_provider.clone(),
             config.clone(),
         );
 
-        node.check_and_update_node_mode(&committee, &config).await?;
+        node.check_and_update_node_mode(&committee, &config, false)
+            .await?;
 
         // Start sync task for SyncOnly nodes
         if matches!(node.node_mode, NodeMode::SyncOnly) {
@@ -950,10 +966,14 @@ impl ConsensusNode {
     }
 
     // Delegated methods
+    /// Check if node mode needs to change based on committee membership.
+    /// `bypass_lock`: Set to true when calling from within an ongoing epoch transition
+    /// to avoid deadlock (the epoch lock is already held by the transition).
     pub async fn check_and_update_node_mode(
         &mut self,
         committee: &Committee,
         config: &NodeConfig,
+        bypass_lock: bool,
     ) -> Result<()> {
         // FIX: Use protocol_key matching for consistent identity check
         let own_protocol_pubkey = self.protocol_keypair.public();
@@ -968,6 +988,37 @@ impl ConsensusNode {
         };
 
         if self.node_mode != new_mode {
+            // ====================================================================
+            // UNIFIED STATE MANAGER: Check with manager before mode transition
+            // Skip lock check if bypass_lock is true (called from within epoch transition)
+            // ====================================================================
+            let state_manager = epoch_transition_manager::get_state_manager();
+
+            // For bootstrap case (manager not initialized), we proceed without lock
+            // and just track the transition directly in the mode switch logic below
+            if !bypass_lock {
+                if let Some(ref manager) = state_manager {
+                    // Try to acquire mode transition lock
+                    if let Err(e) = manager
+                        .try_start_mode_transition(
+                            should_be_validator,
+                            "check_and_update_node_mode",
+                        )
+                        .await
+                    {
+                        info!(
+                            "⏳ [NODE MODE] Cannot start mode transition: {} (will retry later)",
+                            e
+                        );
+                        return Ok(()); // Skip this cycle, will be retried
+                    }
+                } else {
+                    warn!("⚠️ [NODE MODE] StateTransitionManager not initialized, proceeding without lock (bootstrap)");
+                }
+            } else {
+                info!("🔓 [NODE MODE] Bypassing lock check (called from epoch transition context)");
+            }
+
             info!(
                 "🔄 [NODE MODE] Switching from {:?} to {:?}",
                 self.node_mode, new_mode
@@ -1044,6 +1095,11 @@ impl ConsensusNode {
                     {
                         info!("🔄 [EPOCH MONITOR] Restarted epoch monitor after promotion to Validator");
                         self.epoch_monitor_handle = Some(handle);
+                    }
+
+                    // Mark mode transition as complete in state manager
+                    if let Some(ref manager) = state_manager {
+                        manager.complete_mode_transition(true).await;
                     }
                 }
                 (NodeMode::Validator, NodeMode::SyncOnly) => {
@@ -1150,6 +1206,11 @@ impl ConsensusNode {
                     {
                         info!("🔄 [EPOCH MONITOR] Started unified epoch monitor after demotion to SyncOnly");
                         self.epoch_monitor_handle = Some(handle);
+                    }
+
+                    // Mark mode transition as complete in state manager
+                    if let Some(ref manager) = state_manager {
+                        manager.complete_mode_transition(false).await;
                     }
                 }
                 _ => {
@@ -1265,6 +1326,32 @@ impl ConsensusNode {
 
     pub async fn should_accept_tx(&self) -> bool {
         self.reconfig_state.read().await.should_accept_tx()
+    }
+}
+
+// ============================================================================
+// DIAGNOSTIC: Drop implementation to track unexpected node drops
+// ============================================================================
+impl Drop for ConsensusNode {
+    fn drop(&mut self) {
+        // Log when node is being dropped for debugging race conditions
+        tracing::warn!(
+            "🔴 [CONSENSUS NODE DROP] Node being dropped! epoch={}, mode={:?}, has_authority={}, is_transitioning={}",
+            self.current_epoch,
+            self.node_mode,
+            self.authority.is_some(),
+            self.is_transitioning.load(Ordering::SeqCst)
+        );
+
+        // Capture backtrace to identify the source of the drop
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            tracing::warn!("🔴 [CONSENSUS NODE DROP] Backtrace:\n{}", backtrace);
+        } else {
+            tracing::warn!(
+                "🔴 [CONSENSUS NODE DROP] Backtrace not available (set RUST_BACKTRACE=1 to enable)"
+            );
+        }
     }
 }
 

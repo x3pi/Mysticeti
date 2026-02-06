@@ -626,7 +626,7 @@ pub async fn transition_to_epoch_from_system_tx(
         );
     }
 
-    node.check_and_update_node_mode(&committee, config).await?;
+    node.check_and_update_node_mode(&committee, config, true).await?;
 
     // FIX: Use protocol_key matching for consistent identity
     let own_protocol_pubkey = node.protocol_keypair.public();
@@ -1555,7 +1555,7 @@ pub async fn transition_mode_only(
     );
 
     // Update node mode (this also handles Go handoff)
-    node.check_and_update_node_mode(&committee, config).await?;
+    node.check_and_update_node_mode(&committee, config, true).await?;
 
     // Find our index in committee
     let own_protocol_pubkey = node.protocol_keypair.public();

@@ -89,15 +89,41 @@ pub trait CoreThreadDispatcher: Sync + Send + 'static {
 }
 
 pub(crate) struct CoreThreadHandle {
-    sender: Sender<CoreThreadCommand>,
-    join_handle: tokio::task::JoinHandle<()>,
+    sender: Option<Sender<CoreThreadCommand>>,
+    join_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CoreThreadHandle {
-    pub async fn stop(self) {
-        // drop the sender, that will force all the other weak senders to not able to upgrade.
-        drop(self.sender);
-        self.join_handle.await.ok();
+    pub async fn stop(mut self) {
+        // Take the sender, that will force all the other weak senders to not able to upgrade.
+        if let Some(sender) = self.sender.take() {
+            drop(sender);
+        }
+        if let Some(join_handle) = self.join_handle.take() {
+            join_handle.await.ok();
+        }
+    }
+}
+
+// ============================================================================
+// DIAGNOSTIC: Drop implementation to track when CoreThreadHandle is dropped
+// ============================================================================
+impl Drop for CoreThreadHandle {
+    fn drop(&mut self) {
+        // Only log if sender/handle are still present (unexpected drop)
+        // If stop() was called, both will be None
+        if self.sender.is_some() || self.join_handle.is_some() {
+            tracing::warn!(
+                "🔴 [CORE THREAD HANDLE DROP] Handle being dropped unexpectedly! sender={}, join_handle={}",
+                self.sender.is_some(),
+                self.join_handle.is_some()
+            );
+            // Capture backtrace to identify the source of the drop
+            let backtrace = std::backtrace::Backtrace::capture();
+            if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                tracing::warn!("🔴 [CORE THREAD HANDLE DROP] Backtrace:\n{}", backtrace);
+            }
+        }
     }
 }
 
@@ -117,7 +143,14 @@ impl CoreThread {
             tokio::select! {
                 command = self.receiver.recv() => {
                     let Some(command) = command else {
-                        tracing::info!("⚠️ [CORE THREAD] Command receiver closed - Shutting down");
+                        tracing::warn!("🔴 [CORE THREAD] Command receiver CLOSED - sender was dropped!");
+                        // Capture backtrace to identify where the drop occurred
+                        let backtrace = std::backtrace::Backtrace::capture();
+                        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                            tracing::warn!("🔴 [CORE THREAD] Backtrace at receiver close:\n{}", backtrace);
+                        } else {
+                            tracing::warn!("🔴 [CORE THREAD] Backtrace not available (set RUST_BACKTRACE=1)");
+                        }
                         break;
                     };
                     self.context.metrics.node_metrics.core_lock_dequeued.inc();
@@ -237,8 +270,8 @@ impl ChannelCoreThreadDispatcher {
             highest_received_rounds: Arc::new(highest_received_rounds),
         };
         let handle = CoreThreadHandle {
-            join_handle,
-            sender,
+            join_handle: Some(join_handle),
+            sender: Some(sender),
         };
         (dispatcher, handle)
     }

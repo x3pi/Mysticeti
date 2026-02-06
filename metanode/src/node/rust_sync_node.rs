@@ -230,6 +230,9 @@ pub struct RustSyncNode {
     /// Multi-epoch cache: epoch -> sorted list of validator ETH addresses
     /// Used for deterministic leader_address resolution during sync
     epoch_eth_addresses: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
+    // Stored to allow rebuilding TonicClient on committee change
+    context: Option<Arc<Context>>,
+    network_keypair: Option<NetworkKeyPair>,
 }
 
 impl RustSyncNode {
@@ -259,7 +262,10 @@ impl RustSyncNode {
                 initial_global_exec_index as u64,
             ))),
             epoch_base_index: Arc::new(AtomicU64::new(epoch_base_index)),
+            epoch_base_index: Arc::new(AtomicU64::new(epoch_base_index)),
             epoch_eth_addresses: Arc::new(Mutex::new(HashMap::new())),
+            context: None,
+            network_keypair: None,
         }
     }
 
@@ -270,9 +276,11 @@ impl RustSyncNode {
         network_keypair: NetworkKeyPair,
         committee: Committee,
     ) -> Self {
-        let tonic_client = TonicClient::new(context, network_keypair);
+        let tonic_client = TonicClient::new(context.clone(), network_keypair.clone());
         self.network_client = Some(Arc::new(tonic_client));
         *self.committee.write().unwrap() = Some(committee);
+        self.context = Some(context);
+        self.network_keypair = Some(network_keypair);
         self
     }
 
@@ -308,7 +316,7 @@ impl RustSyncNode {
 
     /// Main sync loop - fetches commits from peers
     /// Uses adaptive interval: turbo mode (200ms) when catching up, normal (2s) otherwise
-    async fn sync_loop(self, shutdown_rx: &mut oneshot::Receiver<()>) {
+    async fn sync_loop(mut self, shutdown_rx: &mut oneshot::Receiver<()>) {
         let normal_interval = Duration::from_secs(self.config.fetch_interval_secs);
         let turbo_interval = Duration::from_millis(self.config.turbo_fetch_interval_ms);
         let mut is_turbo_mode = false;
@@ -368,7 +376,7 @@ impl RustSyncNode {
     /// 1. Sync queue with Go's progress (authoritative)
     /// 2. Fetch commits from peers → push to queue
     /// 3. Drain ready commits from queue → send to Go sequentially
-    async fn sync_once(&self) -> Result<()> {
+    async fn sync_once(&mut self) -> Result<()> {
         // Get current state from Go - this is the AUTHORITATIVE source of truth
         let go_last_block = self.executor_client.get_last_block_number().await?;
         let go_epoch = self.executor_client.get_current_epoch().await?;
@@ -415,6 +423,22 @@ impl RustSyncNode {
                                     "✅ [EPOCH-AUTO-SYNC] Committee rebuilt with {} authorities for epoch {}",
                                     new_committee.size(), go_epoch
                                 );
+
+                                // UPDATE NETWORK CLIENT WITH NEW COMMITTEE
+                                // This is crucial because TonicClient holds a Context with the *internal* committee.
+                                // If we don't update it, looking up new authorities (e.g. index 4 in size 5)
+                                // will PANIC on the old committee (size 4).
+                                if let (Some(context), Some(keypair)) =
+                                    (&self.context, &self.network_keypair)
+                                {
+                                    info!("🔄 [EPOCH-AUTO-SYNC] Rebuilding TonicClient with new committee for epoch {}", go_epoch);
+                                    let new_context = Arc::new(
+                                        (**context).clone().with_committee(new_committee.clone()),
+                                    );
+                                    let new_client = TonicClient::new(new_context, keypair.clone());
+                                    self.network_client = Some(Arc::new(new_client));
+                                }
+
                                 *self.committee.write().unwrap() = Some(new_committee);
                             }
                             Err(e) => {
@@ -469,6 +493,19 @@ impl RustSyncNode {
                                     "✅ [COMMITTEE-REFRESH] Committee rebuilt with {} authorities for epoch {}",
                                     new_committee.size(), go_epoch
                                 );
+
+                                // UPDATE NETWORK CLIENT WITH NEW COMMITTEE
+                                if let (Some(context), Some(keypair)) =
+                                    (&self.context, &self.network_keypair)
+                                {
+                                    info!("🔄 [COMMITTEE-REFRESH] Rebuilding TonicClient with new committee for epoch {}", go_epoch);
+                                    let new_context = Arc::new(
+                                        (**context).clone().with_committee(new_committee.clone()),
+                                    );
+                                    let new_client = TonicClient::new(new_context, keypair.clone());
+                                    self.network_client = Some(Arc::new(new_client));
+                                }
+
                                 *self.committee.write().unwrap() = Some(new_committee);
                             }
                             Err(e) => {

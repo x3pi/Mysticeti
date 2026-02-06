@@ -45,7 +45,7 @@ use crate::{
 /// It hides the details of the implementation from the caller, MysticetiManager.
 #[allow(private_interfaces)]
 pub enum ConsensusAuthority {
-    WithTonic(AuthorityNode<TonicManager>),
+    WithTonic(Option<AuthorityNode<TonicManager>>),
 }
 
 impl ConsensusAuthority {
@@ -92,27 +92,33 @@ impl ConsensusAuthority {
                     legacy_store_manager,
                 )
                 .await;
-                Self::WithTonic(authority)
+                Self::WithTonic(Some(authority))
             }
         }
     }
 
-    pub async fn stop(self) {
-        match self {
-            Self::WithTonic(authority) => authority.stop().await,
+    pub async fn stop(mut self) {
+        match &mut self {
+            Self::WithTonic(authority_opt) => {
+                if let Some(authority) = authority_opt.take() {
+                    authority.stop().await;
+                }
+            }
         }
     }
 
     pub fn transaction_client(&self) -> Arc<TransactionClient> {
         match self {
-            Self::WithTonic(authority) => authority.transaction_client(),
+            Self::WithTonic(Some(authority)) => authority.transaction_client(),
+            Self::WithTonic(None) => panic!("Authority already stopped"),
         }
     }
 
     #[cfg(test)]
     fn context(&self) -> &Arc<Context> {
         match self {
-            Self::WithTonic(authority) => &authority.context,
+            Self::WithTonic(Some(authority)) => &authority.context,
+            Self::WithTonic(None) => panic!("Authority already stopped"),
         }
     }
 
@@ -120,7 +126,35 @@ impl ConsensusAuthority {
     /// This should be called before stop() to preserve the store for legacy sync.
     pub fn take_store(&self) -> Arc<dyn crate::storage::Store> {
         match self {
-            Self::WithTonic(authority) => authority.store.clone(),
+            Self::WithTonic(Some(authority)) => authority.store.clone(),
+            Self::WithTonic(None) => panic!("Authority already stopped"),
+        }
+    }
+}
+
+// ============================================================================
+// DIAGNOSTIC: Drop implementation to track unexpected authority drops
+// ============================================================================
+impl Drop for ConsensusAuthority {
+    fn drop(&mut self) {
+        // Only log if authority is still present (unexpected drop)
+        // If stop() was called, it will be None
+        match self {
+            Self::WithTonic(Some(authority)) => {
+                let epoch = authority.context.committee.epoch();
+                tracing::warn!(
+                    "🔴 [CONSENSUS AUTHORITY DROP] Authority being dropped unexpectedly! epoch={}",
+                    epoch
+                );
+                // Capture backtrace to identify the source of the drop
+                let backtrace = std::backtrace::Backtrace::capture();
+                if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                    tracing::warn!("🔴 [CONSENSUS AUTHORITY DROP] Backtrace:\n{}", backtrace);
+                }
+            }
+            Self::WithTonic(None) => {
+                // Normal case - stop() was called
+            }
         }
     }
 }
