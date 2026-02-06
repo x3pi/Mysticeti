@@ -276,6 +276,33 @@ impl ExecutorClient {
         self.can_commit
     }
 
+    /// Force reset all connections to Go executor
+    /// This is used to recover from stale connections after Go restart
+    /// Next call to connect() or connect_request() will create fresh connections
+    pub async fn reset_connections(&self) {
+        info!("🔄 [EXECUTOR] Force resetting all connections (triggered by consecutive errors)...");
+        
+        // Reset data connection
+        {
+            let mut conn = self.connection.lock().await;
+            if conn.is_some() {
+                info!("🔌 [EXECUTOR] Closing stale data connection");
+            }
+            *conn = None;
+        }
+        
+        // Reset request connection
+        {
+            let mut req_conn = self.request_connection.lock().await;
+            if req_conn.is_some() {
+                info!("🔌 [EXECUTOR] Closing stale request connection");
+            }
+            *req_conn = None;
+        }
+        
+        info!("✅ [EXECUTOR] All connections reset. Next operation will create fresh connections.");
+    }
+
     /// Initialize next_expected_index from Go Master's last block number
     /// This should be called ONCE when executor client is created, not on every connect
     /// After initialization, Rust will send blocks continuously and Go will buffer/process them sequentially

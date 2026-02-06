@@ -319,10 +319,15 @@ impl RustSyncNode {
 
     /// Main sync loop - fetches commits from peers
     /// Uses adaptive interval: turbo mode (200ms) when catching up, normal (2s) otherwise
+    /// STABILITY FIX: Tracks consecutive errors and resets connections after 5 failures
     async fn sync_loop(mut self, shutdown_rx: &mut oneshot::Receiver<()>) {
         let normal_interval = Duration::from_secs(self.config.fetch_interval_secs);
         let turbo_interval = Duration::from_millis(self.config.turbo_fetch_interval_ms);
         let mut is_turbo_mode = false;
+
+        // STABILITY FIX: Track consecutive sync errors to detect stale connections
+        let mut consecutive_errors: u32 = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
         loop {
             // Determine if we're catching up (behind network)
@@ -363,8 +368,32 @@ impl RustSyncNode {
 
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {
-                    if let Err(e) = self.sync_once().await {
-                        warn!("[RUST-SYNC] Sync error: {}", e);
+                    match self.sync_once().await {
+                        Ok(_) => {
+                            // Success - reset error counter
+                            if consecutive_errors > 0 {
+                                info!("✅ [RUST-SYNC] Sync recovered after {} errors", consecutive_errors);
+                            }
+                            consecutive_errors = 0;
+                        }
+                        Err(e) => {
+                            consecutive_errors += 1;
+                            warn!("[RUST-SYNC] Sync error #{}: {}", consecutive_errors, e);
+
+                            // STABILITY FIX: After MAX_CONSECUTIVE_ERRORS, force reset connections
+                            // This handles stale connections after Go restart
+                            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                warn!(
+                                    "🔄 [RUST-SYNC] {} consecutive errors detected. Resetting connections to recover from potential stale socket...",
+                                    consecutive_errors
+                                );
+                                self.executor_client.reset_connections().await;
+                                consecutive_errors = 0;
+
+                                // Extra delay after reset to allow Go to accept new connection
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                        }
                     }
                 }
                 _ = &mut *shutdown_rx => {
