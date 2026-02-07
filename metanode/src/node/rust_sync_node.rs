@@ -1512,10 +1512,12 @@ impl RustSyncNode {
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             };
 
-            // Send to Go executor - MUST succeed before continuing
+            // Send to Go executor - DIRECT SEND (bypass buffer)
+            // SyncOnly nodes may receive blocks out-of-order or with gaps,
+            // so we use direct send instead of the sequential buffer
             match self
                 .executor_client
-                .send_committed_subdag(
+                .send_committed_subdag_direct(
                     &subdag,
                     commit_data.epoch,
                     commit_data.commit.global_exec_index(),

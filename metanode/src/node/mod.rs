@@ -33,6 +33,7 @@ pub mod block_coordinator;
 pub mod catchup;
 pub mod committee;
 pub mod committee_source;
+pub mod epoch_checkpoint;
 pub mod epoch_monitor;
 pub mod epoch_transition_manager;
 pub mod executor_client;
@@ -44,6 +45,7 @@ pub mod recovery;
 pub mod rust_sync_node;
 pub mod startup;
 pub mod sync;
+pub mod sync_controller;
 pub mod transition;
 pub mod tx_submitter;
 
@@ -132,6 +134,8 @@ pub struct ConsensusNode {
 
     // Handles for background tasks
     pub(crate) sync_task_handle: Option<crate::node::rust_sync_node::RustSyncHandle>,
+    /// Centralized controller for sync task lifecycle
+    pub(crate) sync_controller: Arc<crate::node::sync_controller::SyncController>,
     pub(crate) epoch_monitor_handle: Option<tokio::task::JoinHandle<()>>,
     pub(crate) notification_server_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     pub(crate) executor_client: Option<Arc<ExecutorClient>>,
@@ -848,6 +852,7 @@ impl ConsensusNode {
             system_transaction_provider,
             epoch_transition_sender: epoch_tx_sender,
             sync_task_handle: None,
+            sync_controller: Arc::new(crate::node::sync_controller::SyncController::new()),
             epoch_monitor_handle: None,
             notification_server_handle: None,
             executor_client: Some(executor_client_for_proc),

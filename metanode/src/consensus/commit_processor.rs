@@ -722,9 +722,22 @@ impl CommitProcessor {
 
                             // Track committed transaction hashes to prevent duplicates during epoch transitions
                             // CRITICAL: Only track when commit is actually processed, not just submitted
+                            //
+                            // FIX 2026-02-06: Use try_lock() to avoid deadlock with transition handler
+                            // The transition handler may hold the node lock while waiting for Go to sync.
+                            // If we block here, CommitProcessor stalls and Go never gets more commits = DEADLOCK.
+                            // If lock is unavailable, skip tracking - next commit will retry.
                             if let Some(node_arc) = crate::node::get_transition_handler_node().await
                             {
-                                let node_guard = node_arc.lock().await;
+                                // Use try_lock() instead of lock().await to avoid blocking
+                                let node_guard = match node_arc.try_lock() {
+                                    Ok(guard) => guard,
+                                    Err(_) => {
+                                        // Lock held by transition handler - skip TX tracking to avoid deadlock
+                                        trace!("⏭️ [TX TRACKING] Skipping tracking for commit {} - node lock held by transition handler", commit_index);
+                                        break; // Exit the retry loop, commit was sent successfully
+                                    }
+                                };
                                 let mut hashes_guard =
                                     node_guard.committed_transaction_hashes.lock().await;
 

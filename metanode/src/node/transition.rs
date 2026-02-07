@@ -40,7 +40,19 @@ pub async fn transition_to_epoch_from_system_tx(
         //
         // IMPORTANT: If a NEW epoch transition occurs while waiting, we must abort and
         // let the new epoch's transition handler take over.
-        //
+        
+        // ===========================================================================
+        // SAFETY CHECK: Verify role explicitly before upgrading
+        // ===========================================================================
+        let own_protocol_pubkey = node.protocol_keypair.public();
+        let role_check = determine_role_for_epoch(new_epoch, &own_protocol_pubkey, config).await?;
+        
+        if matches!(role_check, NodeMode::SyncOnly) {
+             info!("ℹ️ [MODE TRANSITION] Re-checked role for epoch {}: Still SyncOnly (not in committee). Aborting upgrade.", new_epoch);
+             return Ok(());
+        }
+        info!("✅ [MODE TRANSITION] Verified role for epoch {}: Validator. Proceeding with sync wait...", new_epoch);
+        
         // Create FRESH executor client for reliable communication
         let fresh_executor_client = ExecutorClient::new(
             true,
@@ -173,6 +185,104 @@ pub async fn transition_to_epoch_from_system_tx(
         }
     }
     let _guard = Guard(node.is_transitioning.clone());
+
+    // =============================================================================
+    // FIX 2026-02-06: Call advance_epoch on Go FIRST, before fetching committee!
+    // 
+    // PROBLEM: determine_role_and_check_transition() calls fetch_committee() which
+    // waits for Go to have epoch N data. But Go doesn't have it because advance_epoch
+    // was only called AFTER this check (line 558). Circular dependency = deadlock!
+    //
+    // SOLUTION: Call advance_epoch() FIRST, so Go stores the epoch boundary data.
+    // Then fetch_committee can succeed.
+    // =============================================================================
+    
+    // Initialize checkpoint manager for crash recovery
+    let checkpoint_manager = crate::node::epoch_checkpoint::CheckpointManager::new(
+        &config.storage_path,
+        &format!("node-{}", config.node_id),
+    );
+    
+    // Check for incomplete transition from previous crash
+    if let Ok(Some(incomplete)) = checkpoint_manager.get_incomplete_transition().await {
+        info!(
+            "🔄 [CHECKPOINT] Found incomplete transition: state={}, epoch={:?}",
+            incomplete.state.name(),
+            incomplete.state.epoch()
+        );
+        // For now, just log and continue - future: implement resume logic
+    }
+    
+    {
+        info!(
+            "📤 [ADVANCE EPOCH FIRST] Notifying Go about epoch {} BEFORE fetching committee (boundary: {}, synced: {})",
+            new_epoch, boundary_block_from_tx, synced_global_exec_index
+        );
+        
+        let early_executor_client = crate::node::executor_client::ExecutorClient::new(
+            true,
+            false,
+            config.executor_send_socket_path.clone(),
+            config.executor_receive_socket_path.clone(),
+            None,
+        );
+        
+        // Use synced_global_exec_index as the boundary (this is when the EndOfEpoch tx was committed)
+        // Timestamp is provisional (current time) - Go will derive real timestamp from block header
+        let provisional_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        match early_executor_client
+            .advance_epoch(new_epoch, provisional_timestamp, synced_global_exec_index)
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "✅ [ADVANCE EPOCH FIRST] Go notified about epoch {} (boundary={}). Committee fetch should now work.",
+                    new_epoch, synced_global_exec_index
+                );
+                
+                // Save checkpoint: Go has been notified
+                if let Err(e) = checkpoint_manager
+                    .checkpoint_advance_epoch(new_epoch, synced_global_exec_index, provisional_timestamp)
+                    .await
+                {
+                    warn!("⚠️ Failed to save checkpoint: {}", e);
+                }
+            }
+            Err(e) => {
+                // Go now accepts advance_epoch even when sync is incomplete
+                // So this error path is for other unexpected errors
+                warn!(
+                    "⚠️ [ADVANCE EPOCH FIRST] Failed to notify Go about epoch {}: {}. Continuing anyway.",
+                    new_epoch, e
+                );
+                // Continue to fetch_committee - Go may still work
+            }
+        }
+    }
+
+    // =============================================================================
+    // STEP 0: ROLE-FIRST CHECK (MUST BE FIRST!)
+    // =============================================================================
+    // Determine node's role for the new epoch BEFORE any other operations.
+    // This ensures we know whether to setup Validator or SyncOnly infrastructure.
+    // NOTE: Go now has epoch boundary data from advance_epoch call above.
+    // =============================================================================
+    let own_protocol_pubkey = node.protocol_keypair.public();
+    let (target_role, needs_mode_change) = determine_role_and_check_transition(
+        new_epoch,
+        &node.node_mode,
+        &own_protocol_pubkey,
+        config,
+    ).await?;
+    
+    info!(
+        "📋 [ROLE-FIRST] Epoch {} transition: target_role={:?}, needs_mode_change={}, current_mode={:?}",
+        new_epoch, target_role, needs_mode_change, node.node_mode
+    );
 
     node.close_user_certs().await;
 
@@ -893,8 +1003,12 @@ pub async fn transition_to_epoch_from_system_tx(
         .await
         {
             Ok(handle) => {
-                node.sync_task_handle = Some(handle);
-                info!("✅ [SYNC ONLY] Rust P2P sync started with full networking");
+                // Use SyncController for centralized state management
+                if let Err(e) = node.sync_controller.enable_sync(handle).await {
+                    warn!("⚠️ [SYNC ONLY] SyncController enable failed: {}", e);
+                } else {
+                    info!("✅ [SYNC ONLY] Rust P2P sync started via SyncController");
+                }
             }
             Err(e) => {
                 warn!("⚠️ [SYNC ONLY] Failed to start Rust P2P sync: {}", e);
@@ -1577,6 +1691,16 @@ pub async fn transition_mode_only(
         epoch
     );
 
+    // CRITICAL FIX: Stop sync task FIRST when upgrading to Validator
+    // Sync is redundant once we're a Validator - blocks come from DAG consensus
+    // Use SyncController for centralized state management
+    if node.sync_controller.is_enabled() {
+        info!("🛑 [MODE TRANSITION] Stopping sync task via SyncController (Validator gets blocks from DAG)");
+        if let Err(e) = node.sync_controller.disable_sync().await {
+            warn!("⚠️ [MODE TRANSITION] SyncController disable failed: {}. Continuing anyway.", e);
+        }
+    }
+
     // Use existing epoch DB path
     let db_path = node
         .storage_path
@@ -1992,3 +2116,103 @@ pub async fn check_promotion_eligibility(
     }
 }
 
+// =============================================================================
+// ROLE-FIRST DESIGN: Determine node role BEFORE any epoch operations
+// =============================================================================
+
+/// Determine the role (Validator or SyncOnly) for a specific epoch.
+/// 
+/// # CRITICAL DESIGN PRINCIPLE
+/// This function MUST be called FIRST before any epoch-related operations.
+/// The node's role determines what infrastructure to start and how to behave.
+/// 
+/// # Arguments
+/// * `epoch` - The epoch to determine role for
+/// * `own_protocol_pubkey` - This node's protocol public key
+/// * `config` - Node configuration
+/// 
+/// # Returns
+/// * `Ok(NodeMode)` - The determined role (Validator or SyncOnly)
+/// * `Err` - If committee cannot be fetched
+pub async fn determine_role_for_epoch(
+    epoch: u64,
+    own_protocol_pubkey: &consensus_config::ProtocolPublicKey,
+    config: &NodeConfig,
+) -> Result<NodeMode> {
+    info!("🔍 [ROLE-FIRST] Determining role for epoch {}...", epoch);
+    
+    // Step 1: Discover committee source (local Go or peer)
+    let committee_source = match crate::node::committee_source::CommitteeSource::discover(config).await {
+        Ok(source) => source,
+        Err(e) => {
+            warn!("⚠️ [ROLE-FIRST] Cannot discover committee source for epoch {}: {}. Defaulting to SyncOnly.", epoch, e);
+            return Ok(NodeMode::SyncOnly);
+        }
+    };
+    
+    // Step 2: Fetch committee for this epoch
+    let committee = match committee_source
+        .fetch_committee(&config.executor_send_socket_path, epoch)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("⚠️ [ROLE-FIRST] Cannot fetch committee for epoch {}: {}. Defaulting to SyncOnly.", epoch, e);
+            return Ok(NodeMode::SyncOnly);
+        }
+    };
+    
+    // Step 3: Check if we're in the committee
+    let is_in_committee = committee
+        .authorities()
+        .any(|(_, authority)| authority.protocol_key == *own_protocol_pubkey);
+    
+    // Step 4: Determine and log role
+    let role = if is_in_committee {
+        info!(
+            "✅ [ROLE-FIRST] Epoch {}: Node IS in committee ({} validators) → VALIDATOR",
+            epoch, committee.size()
+        );
+        NodeMode::Validator
+    } else {
+        info!(
+            "ℹ️ [ROLE-FIRST] Epoch {}: Node NOT in committee ({} validators) → SYNC_ONLY",
+            epoch, committee.size()
+        );
+        NodeMode::SyncOnly
+    };
+    
+    Ok(role)
+}
+
+/// Determine role and handle mode transition if needed.
+/// This is a convenience wrapper that:
+/// 1. Determines role for epoch
+/// 2. Compares with current mode
+/// 3. Logs any mode change needed
+/// 
+/// Returns (target_role, needs_mode_change)
+pub async fn determine_role_and_check_transition(
+    epoch: u64,
+    current_mode: &NodeMode,
+    own_protocol_pubkey: &consensus_config::ProtocolPublicKey,
+    config: &NodeConfig,
+) -> Result<(NodeMode, bool)> {
+    let target_role = determine_role_for_epoch(epoch, own_protocol_pubkey, config).await?;
+    
+    let needs_change = *current_mode != target_role;
+    
+    if needs_change {
+        info!(
+            "🔄 [ROLE-FIRST] Epoch {}: Mode change needed: {:?} → {:?}",
+            epoch, current_mode, target_role
+        );
+    } else {
+        info!(
+            "✓ [ROLE-FIRST] Epoch {}: Mode unchanged ({:?})",
+            epoch, current_mode
+        );
+    }
+    
+    Ok((target_role, needs_change))
+}

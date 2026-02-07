@@ -1,5 +1,6 @@
 // Copyright (c) MetaNode Team
 // SPDX-License-Identifier: Apache-2.0
+#![allow(dead_code)]
 
 //! Block Coordinator - Dual-Stream Block Production with Unified Output
 //!

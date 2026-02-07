@@ -16,8 +16,34 @@ use crate::config::NodeConfig;
 use crate::node::executor_client::ExecutorClient;
 use anyhow::Result;
 use consensus_config::Committee;
+use sha3::{Digest, Keccak256};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// Calculate a deterministic hash of the committee for verification/debugging
+/// This hash can be compared across nodes to detect committee mismatches
+#[allow(dead_code)]
+pub fn calculate_committee_hash(committee: &Committee) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+
+    // Hash committee size first
+    hasher.update(&(committee.size() as u64).to_le_bytes());
+
+    // Collect authorities in index order (deterministic)
+    for i in 0..committee.size() {
+        let idx = consensus_config::AuthorityIndex::new_for_test(i as u32);
+        let authority = committee.authority(idx);
+
+        // Hash public key
+        hasher.update(&authority.protocol_key.to_bytes());
+        // Hash stake
+        hasher.update(&authority.stake.to_le_bytes());
+        // Hash hostname (network identity)
+        hasher.update(authority.hostname.as_bytes());
+    }
+
+    hasher.finalize().into()
+}
 
 /// Unified committee source for both SyncOnly and Validator modes
 /// Ensures fork-safe committee fetching by always using the best available source
@@ -157,36 +183,29 @@ impl CommitteeSource {
     ///
     /// The sync process (rust_sync_node) must complete BEFORE this returns.
     /// This ensures all nodes derive committee from the same verified blockchain state.
+    ///
+    /// SIMPLIFIED: Go now returns data even when boundary block not fully synced.
     pub async fn fetch_committee(&self, send_socket: &str, target_epoch: u64) -> Result<Committee> {
         let client = self.create_executor_client(send_socket);
 
         info!(
-            "📋 [COMMITTEE SOURCE] Fetching committee for target_epoch {} from LOCAL Go ONLY (single source)",
+            "📋 [COMMITTEE SOURCE] Fetching committee for epoch {} from local Go",
             target_epoch
         );
 
-        // Retry configuration - wait indefinitely for sync to complete
-        const INITIAL_DELAY_MS: u64 = 500;
-        const MAX_DELAY_MS: u64 = 5000;
-        const LOG_INTERVAL: u32 = 10;
+        // Configuration: reasonable timeout since Go now handles unsynced state
+        const MAX_ATTEMPTS: u32 = 60; // ~30 seconds
+        const DELAY_MS: u64 = 500;
 
-        let mut attempt = 0u32;
-        let mut delay_ms = INITIAL_DELAY_MS;
-
-        loop {
-            attempt += 1;
-            let should_log = attempt == 1 || attempt % LOG_INTERVAL == 0;
-
-            // SINGLE SOURCE: Only use local Go Master
+        for attempt in 1..=MAX_ATTEMPTS {
             match client.get_epoch_boundary_data(target_epoch).await {
                 Ok((epoch, timestamp_ms, boundary_block, validators)) => {
-                    if epoch == target_epoch {
+                    if epoch == target_epoch && !validators.is_empty() {
                         info!(
-                            "✅ [COMMITTEE SOURCE] Got epoch boundary data from LOCAL Go: epoch={}, timestamp_ms={}, boundary_block={}, validator_count={} (attempt {})",
-                            epoch, timestamp_ms, boundary_block, validators.len(), attempt
+                            "✅ [COMMITTEE SOURCE] Got epoch {} (ts={}, boundary={}, validators={})",
+                            epoch, timestamp_ms, boundary_block, validators.len()
                         );
 
-                        // Build committee from validators
                         match crate::node::committee::build_committee_from_validator_info_list(
                             &validators,
                             target_epoch,
@@ -195,41 +214,39 @@ impl CommitteeSource {
                         {
                             Ok(committee) => {
                                 info!(
-                                    "✅ [COMMITTEE SOURCE] Successfully built committee with {} authorities from LOCAL source",
+                                    "✅ [COMMITTEE SOURCE] Built committee with {} authorities",
                                     committee.size()
                                 );
                                 return Ok(committee);
                             }
                             Err(e) => {
-                                if should_log {
-                                    warn!(
-                                        "⚠️ [COMMITTEE SOURCE] build_committee failed: {} (attempt {}). Waiting for sync...",
-                                        e, attempt
-                                    );
-                                }
+                                warn!("⚠️ [COMMITTEE SOURCE] build_committee failed: {}", e);
                             }
                         }
-                    } else if should_log {
+                    } else if attempt % 10 == 0 {
                         info!(
-                            "⏳ [COMMITTEE SOURCE] Local Go at epoch {}, waiting for epoch {} (attempt {}). Sync in progress...",
-                            epoch, target_epoch, attempt
+                            "⏳ [COMMITTEE SOURCE] Waiting for epoch {} (got epoch={}, attempt {}/{})",
+                            target_epoch, epoch, attempt, MAX_ATTEMPTS
                         );
                     }
                 }
                 Err(e) => {
-                    if should_log {
+                    if attempt == 1 || attempt % 10 == 0 {
                         info!(
-                            "⏳ [COMMITTEE SOURCE] Local Go not ready: {} (attempt {}). Waiting for sync to complete...",
-                            e, attempt
+                            "⏳ [COMMITTEE SOURCE] Local Go not ready: {} (attempt {}/{})",
+                            e, attempt, MAX_ATTEMPTS
                         );
                     }
                 }
             }
-
-            // Wait and retry - sync must complete before proceeding
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-            delay_ms = std::cmp::min(delay_ms * 2, MAX_DELAY_MS);
+            tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MS)).await;
         }
+
+        Err(anyhow::anyhow!(
+            "Timeout waiting for epoch {} committee from local Go after {} attempts",
+            target_epoch,
+            MAX_ATTEMPTS
+        ))
     }
 
     /// Fetch eth_addresses for a specific epoch and update the epoch_eth_addresses HashMap

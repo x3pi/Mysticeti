@@ -490,7 +490,7 @@ impl ExecutorClient {
         // DUAL-STREAM DEDUP: Prevent duplicate sends from Consensus and Sync streams
         // This is critical for BlockCoordinator integration
         {
-            let mut sent = self.sent_indices.lock().await;
+            let sent = self.sent_indices.lock().await;
             if sent.contains(&global_exec_index) {
                 info!("🔄 [DEDUP] Skipping already-sent block from dual-stream: global_exec_index={}", global_exec_index);
                 return Ok(()); // Already sent, skip
@@ -840,6 +840,43 @@ impl ExecutorClient {
         Ok(())
     }
     
+    /// Send committed sub-DAG directly to Go executor (BYPASS BUFFER)
+    /// 
+    /// This is used by SyncOnly nodes to send blocks directly without using
+    /// the sequential buffer. SyncOnly may receive blocks out-of-order or
+    /// with gaps, so the buffer-based approach doesn't work.
+    /// 
+    /// IMPORTANT: This does NOT update next_expected_index or sent_indices.
+    /// Go is responsible for handling ordering when receiving synced blocks.
+    pub async fn send_committed_subdag_direct(
+        &self,
+        subdag: &CommittedSubDag,
+        epoch: u64,
+        global_exec_index: u64,
+        leader_address: Option<Vec<u8>>,
+    ) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(()); // Silently skip if not enabled
+        }
+
+        if !self.can_commit() {
+            return Ok(()); // Skip if cannot commit
+        }
+
+        // Convert to protobuf bytes
+        let epoch_data_bytes = self.convert_to_protobuf(subdag, epoch, global_exec_index, leader_address)?;
+        
+        info!("📤 [SYNC-DIRECT] Sending block directly: global_exec_index={}, epoch={}, size={} bytes",
+            global_exec_index, epoch, epoch_data_bytes.len());
+        
+        // Send directly - bypass buffer
+        self.send_block_data(&epoch_data_bytes, global_exec_index, epoch, subdag.commit_ref.index).await?;
+        
+        info!("✅ [SYNC-DIRECT] Block sent successfully: global_exec_index={}", global_exec_index);
+        
+        Ok(())
+    }
+    
     /// Send block data via UDS (internal helper)
     async fn send_block_data(
         &self,
@@ -848,6 +885,16 @@ impl ExecutorClient {
         epoch: u64,
         commit_index: u32,
     ) -> Result<()> {
+        // Auto-reconnect if connection is None
+        {
+            let conn_check = self.connection.lock().await;
+            if conn_check.is_none() {
+                drop(conn_check);
+                info!("🔄 [EXECUTOR] Connection not established, connecting...");
+                self.connect().await?;
+            }
+        }
+        
         // Send via UDS with Uvarint length prefix (Go expects Uvarint)
         let mut conn_guard = self.connection.lock().await;
         if let Some(ref mut stream) = *conn_guard {

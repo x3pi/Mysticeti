@@ -40,11 +40,57 @@ pub fn start_epoch_transition_handler(
                 .try_start_epoch_transition(new_epoch, "system_tx")
                 .await
             {
-                info!(
-                    "⏳ [EPOCH TRANSITION HANDLER] Cannot start transition: {} (another source may be handling it)",
-                    e
+                // ===========================================================================
+                // CRITICAL FIX: EpochAlreadyCurrent does NOT mean we should skip!
+                //
+                // SCENARIO: DEFERRED EPOCH for SyncOnly nodes
+                // 1. Sync catches up, calls advance_epoch(3)
+                // 2. epoch_manager.current_epoch is set to 3
+                // 3. Signal sent to epoch_transition_handler for epoch 3
+                // 4. try_start_epoch_transition(3) returns EpochAlreadyCurrent
+                // 5. OLD CODE: `continue` → SKIP! → SyncOnly never upgrades to Validator!
+                //
+                // FIX: When EpochAlreadyCurrent, check if this is a same-epoch mode upgrade
+                // (SyncOnly → Validator). If so, still call transition_to_epoch_from_system_tx
+                // which will handle the mode-only transition.
+                // ===========================================================================
+                let is_epoch_current = matches!(
+                    e,
+                    crate::node::epoch_transition_manager::TransitionError::EpochAlreadyCurrent { .. }
                 );
-                continue;
+
+                if is_epoch_current {
+                    // Check if node is SyncOnly - might need mode upgrade
+                    if let Some(node_arc) = crate::node::get_transition_handler_node().await {
+                        let node_guard = node_arc.lock().await;
+                        let is_sync_only =
+                            matches!(node_guard.node_mode, crate::node::NodeMode::SyncOnly);
+                        drop(node_guard);
+
+                        if is_sync_only {
+                            info!(
+                                "🔄 [EPOCH TRANSITION HANDLER] Epoch {} already current, but node is SyncOnly. Checking for mode upgrade...",
+                                new_epoch
+                            );
+                            // Don't continue - let the transition function handle mode-only transition
+                            // Fall through to the transition code below
+                        } else {
+                            info!(
+                                "⏳ [EPOCH TRANSITION HANDLER] Epoch {} already current and already Validator. Skipping.",
+                                new_epoch
+                            );
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                } else {
+                    info!(
+                        "⏳ [EPOCH TRANSITION HANDLER] Cannot start transition: {} (another source may be handling it)",
+                        e
+                    );
+                    continue;
+                }
             }
 
             // [FIX CRITICAL]: Không update provider ở đây.
