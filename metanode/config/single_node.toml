@@ -22,6 +22,3 @@ commit_sync_batches_ahead = 64
 adaptive_catchup_enabled = true
 adaptive_delay_enabled = true
 adaptive_delay_ms = 50
-enable_lvm_snapshot = false
-lvm_snapshot_bin_path = "/home/abc/chain-n/Mysticeti/metanode/bin/lvm-snap-rsync"
-lvm_snapshot_delay_seconds = 5

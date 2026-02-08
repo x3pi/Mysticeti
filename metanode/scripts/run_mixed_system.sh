@@ -170,11 +170,7 @@ sed -i 's|executor_commit_enabled = false|executor_commit_enabled = true|g' conf
 # Ensure read enabled too
 sed -i 's|executor_read_enabled = false|executor_read_enabled = true|g' config/node_1.toml
 
-# 6. CRITICAL: Disable LVM Snapshot for Node 0 (Go handles snapshots via rsync now)
-print_info "🔧 Disabling Rust LVM Snapshot for Node 0 (Go uses rsync method)..."
-sed -i 's|enable_lvm_snapshot = true|enable_lvm_snapshot = false|g' config/node_0.toml
-# Remove obsolete snapshot binary path if present
-sed -i '/lvm_snapshot_bin_path/d' config/node_0.toml
+
 
 if [ -f "scripts/update_committee_from_genesis.py" ]; then
     if python3 "scripts/update_committee_from_genesis.py"; then

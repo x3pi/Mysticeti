@@ -149,5 +149,5 @@ else
 fi
 
 echo ""
-print_info "🔧 LVM Snapshot: $(grep -q 'enable_lvm_snapshot = true' $METANODE_ROOT/config/node_0.toml && echo 'ENABLED' || echo 'disabled')"
+
 print_step "🎉 Node 0 System Restarted (Data Preserved)!"

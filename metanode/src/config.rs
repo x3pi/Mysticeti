@@ -117,17 +117,7 @@ pub struct NodeConfig {
     /// This is used as base when calculating adaptive delay when node is ahead of network
     #[serde(default = "default_adaptive_delay_ms")]
     pub adaptive_delay_ms: u64,
-    /// Enable LVM snapshot creation after epoch transition (default: false)
-    /// Only nodes with this enabled will create snapshots
-    #[serde(default)]
-    pub enable_lvm_snapshot: bool,
-    /// Path to lvm-snap-rsync binary (required if enable_lvm_snapshot = true)
-    #[serde(default)]
-    pub lvm_snapshot_bin_path: Option<PathBuf>,
-    /// Delay in seconds before creating snapshot after epoch transition (default: 120 = 2 minutes)
-    /// This delay allows Go executor to finish processing and stabilize before snapshot
-    #[serde(default = "default_lvm_snapshot_delay_seconds")]
-    pub lvm_snapshot_delay_seconds: u64,
+
     /// Epoch transition optimization level (default: "balanced")
     /// Options: "fast" (minimal waits, faster transitions), "balanced" (reasonable waits), "safe" (conservative waits)
     #[serde(default = "default_epoch_transition_optimization")]
@@ -222,10 +212,6 @@ fn default_adaptive_delay() -> bool {
 
 fn default_adaptive_delay_ms() -> u64 {
     50 // Default base delay: 50ms
-}
-
-fn default_lvm_snapshot_delay_seconds() -> u64 {
-    5 // Default delay: 5 seconds
 }
 
 fn default_epoch_transition_optimization() -> String {
@@ -334,9 +320,7 @@ impl NodeConfig {
                 commit_sync_batches_ahead: default_commit_sync_batches_ahead(),
                 adaptive_catchup_enabled: default_adaptive_catchup(),
                 adaptive_delay_enabled: default_adaptive_delay(),
-                enable_lvm_snapshot: false,
-                lvm_snapshot_bin_path: None,
-                lvm_snapshot_delay_seconds: 20,
+
                 epoch_transition_optimization: "balanced".to_string(),
                 enable_gradual_shutdown: true,
                 initial_node_mode: default_node_mode(),
