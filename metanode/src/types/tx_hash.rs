@@ -15,7 +15,7 @@ use proto::{AccessTuple, Transaction, Transactions};
 
 /// Calculate official transaction hash using Keccak256(TransactionHashData)
 /// This matches the Go implementation exactly
-/// 
+///
 /// Transaction data can be:
 /// - A protobuf `Transactions` message (containing multiple Transaction)
 /// - A single protobuf `Transaction` message
@@ -29,12 +29,12 @@ pub fn calculate_transaction_hash(tx_data: &[u8]) -> Vec<u8> {
             return calculate_single_transaction_hash(&transactions.transactions[0]);
         }
     }
-    
+
     // Try to parse as single Transaction
     if let Ok(tx) = Transaction::decode(tx_data) {
         return calculate_single_transaction_hash(&tx);
     }
-    
+
     // If parsing fails, this might be non-protobuf data
     // Log a warning but still return a hash (using Keccak256 of raw data as fallback)
     warn!("Failed to parse transaction as protobuf, using raw data hash");
@@ -95,84 +95,33 @@ pub fn calculate_transaction_hash_hex(tx_data: &[u8]) -> String {
 }
 
 /// Verify that transaction data is valid protobuf (Transaction or Transactions)
-/// Returns true if data can be parsed as protobuf, false otherwise
-/// This is used to ensure data integrity from Go sub node
+/// Returns true if data can be parsed as protobuf with valid fields, false otherwise
+///
+/// STRICT VALIDATION: After decoding, we check that at least one transaction has
+/// a non-empty `from_address`. This prevents false positives from permissive
+/// protobuf decoding (e.g. a raw Transaction being incorrectly decoded as Transactions).
 pub fn verify_transaction_protobuf(tx_data: &[u8]) -> bool {
     // Try to parse as Transactions (multiple transactions)
-    match Transactions::decode(tx_data) {
-        Ok(_) => {
-            // #region agent log
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                    let preview_len = tx_data.len().min(32);
-                    let preview_hex = hex::encode(&tx_data[..preview_len]);
-                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"tx_hash.rs:102","message":"VERIFY SUCCESS - decoded as Transactions","data":{{"size":{},"preview_hex":"{}","hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                        ts.as_secs(), ts.as_nanos() % 1000000,
-                        ts.as_millis(),
-                        tx_data.len(), preview_hex);
-                }
-            }
-            // #endregion
+    if let Ok(txs) = Transactions::decode(tx_data) {
+        // Strict: at least one transaction must have a non-empty from_address
+        if txs
+            .transactions
+            .iter()
+            .any(|tx| !tx.from_address.is_empty())
+        {
             return true;
         }
-        Err(e) => {
-            // #region agent log
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                    let preview_len = tx_data.len().min(32);
-                    let preview_hex = hex::encode(&tx_data[..preview_len]);
-                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"tx_hash.rs:102","message":"VERIFY FAILED - not Transactions","data":{{"size":{},"preview_hex":"{}","error":"{}","hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                        ts.as_secs(), ts.as_nanos() % 1000000,
-                        ts.as_millis(),
-                        tx_data.len(), preview_hex, e);
-                }
-            }
-            // #endregion
-        }
+        // Decoded but no valid from_address — likely a false positive
     }
-    
+
     // Try to parse as single Transaction
-    match Transaction::decode(tx_data) {
-        Ok(_) => {
-            // #region agent log
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                    let preview_len = tx_data.len().min(32);
-                    let preview_hex = hex::encode(&tx_data[..preview_len]);
-                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"tx_hash.rs:107","message":"VERIFY SUCCESS - decoded as Transaction","data":{{"size":{},"preview_hex":"{}","hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                        ts.as_secs(), ts.as_nanos() % 1000000,
-                        ts.as_millis(),
-                        tx_data.len(), preview_hex);
-                }
-            }
-            // #endregion
+    if let Ok(tx) = Transaction::decode(tx_data) {
+        // Strict: from_address must be present (valid user transaction)
+        if !tx.from_address.is_empty() {
             return true;
         }
-        Err(e) => {
-            // #region agent log
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                    let preview_len = tx_data.len().min(32);
-                    let preview_hex = hex::encode(&tx_data[..preview_len]);
-                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"tx_hash.rs:107","message":"VERIFY FAILED - not Transaction","data":{{"size":{},"preview_hex":"{}","error":"{}","hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                        ts.as_secs(), ts.as_nanos() % 1000000,
-                        ts.as_millis(),
-                        tx_data.len(), preview_hex, e);
-                }
-            }
-            // #endregion
-        }
     }
-    
-    // Not valid protobuf
+
+    // Not valid protobuf or missing required fields
     false
 }
-

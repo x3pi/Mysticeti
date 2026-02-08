@@ -496,22 +496,7 @@ impl ExecutorClient {
                 return Ok(()); // Already sent, skip
             }
             // Don't insert yet - insert only after successful send
-        }
-        
-        // #region agent log
-        {
-            use std::io::Write;
-            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                let block_tx_counts: Vec<usize> = subdag.blocks.iter().map(|b| b.transactions().len()).collect();
-                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:180","message":"BEFORE convert_to_protobuf - block transaction counts","data":{{"global_exec_index":{},"commit_index":{},"total_tx_before":{},"block_tx_counts":{:?},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                    ts.as_secs(), ts.as_nanos() % 1000000,
-                    ts.as_millis(),
-                    global_exec_index, subdag.commit_ref.index, total_tx_before, block_tx_counts);
-            }
-        }
-        // #endregion
-        
+        }        
         // Convert CommittedSubDag to protobuf CommittedEpochData
         // CRITICAL FORK-SAFETY: Include global_exec_index and commit_index for deterministic ordering
         let epoch_data_bytes = self.convert_to_protobuf(subdag, epoch, global_exec_index, leader_address)?;
@@ -528,21 +513,7 @@ impl ExecutorClient {
                 error!("🚨 [BUFFER LIMIT] Buffer is full ({} blocks). Rejecting block global_exec_index={}. This indicates severe sync issues.",
                     buffer.len(), global_exec_index);
                 return Err(anyhow::anyhow!("Buffer full: {} blocks (max {})", buffer.len(), MAX_BUFFER_SIZE));
-            }
-            // #region agent log
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                    let existing = buffer.get(&global_exec_index).is_some();
-                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:193","message":"BEFORE buffer insert","data":{{"global_exec_index":{},"commit_index":{},"epoch":{},"total_tx":{},"buffer_size":{},"already_exists":{},"hypothesisId":"C"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                        ts.as_secs(), ts.as_nanos() % 1000000,
-                        ts.as_millis(),
-                        global_exec_index, subdag.commit_ref.index, epoch, total_tx, buffer.len(), existing);
-                }
-            }
-            // #endregion
-            if buffer.contains_key(&global_exec_index) {
+            }            if buffer.contains_key(&global_exec_index) {
                 // CRITICAL: Duplicate global_exec_index detected - this should NOT happen
                 // Possible causes:
                 // 1. Commit processor sent same commit twice
@@ -551,21 +522,7 @@ impl ExecutorClient {
                 // 4. Buffer wasn't cleared properly after restart
                 let (existing_epoch_data, existing_epoch, existing_commit) = buffer.get(&global_exec_index)
                     .map(|(d, e, c)| (d.len(), *e, *c))
-                    .unwrap_or((0, 0, 0));
-                
-                // #region agent log
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:255","message":"DUPLICATE GLOBAL_EXEC_INDEX DETECTED - root cause analysis","data":{{"global_exec_index":{},"new_commit_index":{},"existing_commit_index":{},"new_epoch":{},"existing_epoch":{},"total_tx":{},"existing_data_size":{},"hypothesisId":"C"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                            ts.as_secs(), ts.as_nanos() % 1000000,
-                            ts.as_millis(),
-                            global_exec_index, subdag.commit_ref.index, existing_commit, epoch, existing_epoch, total_tx, existing_epoch_data);
-                    }
-                }
-                // #endregion
-                
+                    .unwrap_or((0, 0, 0));                
                 error!("🚨 [DUPLICATE GLOBAL_EXEC_INDEX] Duplicate global_exec_index={} detected!", global_exec_index);
                 error!("   📊 Existing: epoch={}, commit_index={}, data_size={} bytes", existing_epoch, existing_commit, existing_epoch_data);
                 error!("   📊 New:      epoch={}, commit_index={}, data_size={} bytes, total_tx={}", epoch, subdag.commit_ref.index, epoch_data_bytes.len(), total_tx);
@@ -697,34 +654,7 @@ impl ExecutorClient {
             if let Some((epoch_data_bytes, epoch, commit_index)) = block_data {
                 // This is the next expected block - send it immediately
                 info!("📤 [SEQUENTIAL-BUFFER] Sending block: global_exec_index={}, commit_index={}, epoch={}, size={} bytes",
-                    current_expected, commit_index, epoch, epoch_data_bytes.len());
-                
-                // #region agent log
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:254","message":"BEFORE send_block_data","data":{{"global_exec_index":{},"commit_index":{},"hypothesisId":"C"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                            ts.as_secs(), ts.as_nanos() % 1000000,
-                            ts.as_millis(),
-                            current_expected, commit_index);
-                    }
-                }
-                // #endregion
-                if let Err(e) = self.send_block_data(&epoch_data_bytes, current_expected, epoch, commit_index).await {
-                    // #region agent log
-                    {
-                        use std::io::Write;
-                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                            let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:254","message":"SEND_BLOCK_DATA FAILED - re-adding to buffer","data":{{"global_exec_index":{},"commit_index":{},"error":"{}","hypothesisId":"C"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                                ts.as_secs(), ts.as_nanos() % 1000000,
-                                ts.as_millis(),
-                                current_expected, commit_index, e.to_string().replace("\"", "\\\""));
-                        }
-                    }
-                    // #endregion
-                    warn!("⚠️  [SEQUENTIAL-BUFFER] Failed to send block global_exec_index={}: {}, re-adding to buffer", 
+                    current_expected, commit_index, epoch, epoch_data_bytes.len());                if let Err(e) = self.send_block_data(&epoch_data_bytes, current_expected, epoch, commit_index).await {                    warn!("⚠️  [SEQUENTIAL-BUFFER] Failed to send block global_exec_index={}: {}, re-adding to buffer", 
                         current_expected, e);
                     // Re-add to buffer for retry
                     let mut buffer_retry = self.send_buffer.lock().await;
@@ -814,20 +744,7 @@ impl ExecutorClient {
             if !buffer.is_empty() {
                 let min_buffered = *buffer.keys().next().unwrap_or(&0);
                 let max_buffered = *buffer.keys().last().unwrap_or(&0);
-                let gap = min_buffered.saturating_sub(*next_expected);
-                // #region agent log
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:313","message":"BUFFER STATUS","data":{{"buffer_size":{},"min_buffered":{},"max_buffered":{},"next_expected":{},"gap":{},"hypothesisId":"C"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                            ts.as_secs(), ts.as_nanos() % 1000000,
-                            ts.as_millis(),
-                            buffer.len(), min_buffered, max_buffered, *next_expected, gap);
-                    }
-                }
-                // #endregion
-                if buffer.len() > 10 {
+                let gap = min_buffered.saturating_sub(*next_expected);                if buffer.len() > 10 {
                     warn!("⚠️  [SEQUENTIAL-BUFFER] Buffer has {} blocks waiting (range: {}..{}, next_expected={}, gap={}). Some blocks may be missing or out-of-order.",
                         buffer.len(), min_buffered, max_buffered, *next_expected, gap);
                 } else {
@@ -927,37 +844,11 @@ impl ExecutorClient {
             };
             
             match send_result {
-                Ok(_) => {
-                    // #region agent log
-                    {
-                        use std::io::Write;
-                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                            let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:372","message":"SEND SUCCESS - data written to socket","data":{{"global_exec_index":{},"commit_index":{},"data_size":{},"hypothesisId":"C"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                                ts.as_secs(), ts.as_nanos() % 1000000,
-                                ts.as_millis(),
-                                global_exec_index, commit_index, epoch_data_bytes.len());
-                        }
-                    }
-                    // #endregion
-                    info!("📤 [TX FLOW] Sent committed sub-DAG to Go executor: global_exec_index={}, commit_index={}, epoch={}, data_size={} bytes", 
+                Ok(_) => {                    info!("📤 [TX FLOW] Sent committed sub-DAG to Go executor: global_exec_index={}, commit_index={}, epoch={}, data_size={} bytes", 
                         global_exec_index, commit_index, epoch, epoch_data_bytes.len());
                     Ok(())
                 }
-                Err(e) => {
-                    // #region agent log
-                    {
-                        use std::io::Write;
-                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                            let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:377","message":"SEND ERROR - connection issue","data":{{"global_exec_index":{},"commit_index":{},"error":"{}","hypothesisId":"D"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                                ts.as_secs(), ts.as_nanos() % 1000000,
-                                ts.as_millis(),
-                                global_exec_index, commit_index, e.to_string().replace("\"", "\\\""));
-                        }
-                    }
-                    // #endregion
-                    warn!("⚠️  [EXECUTOR] Failed to send committed sub-DAG (global_exec_index={}, commit_index={}): {}, reconnecting...", 
+                Err(e) => {                    warn!("⚠️  [EXECUTOR] Failed to send committed sub-DAG (global_exec_index={}, commit_index={}): {}, reconnecting...", 
                         global_exec_index, commit_index, e);
                     // Connection is dead, clear it so next send will reconnect
                     *conn_guard = None;
@@ -981,54 +872,15 @@ impl ExecutorClient {
                         }).await;
                         
                         match retry_result {
-                            Ok(Ok(())) => {
-                                // #region agent log
-                                {
-                                    use std::io::Write;
-                                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:402","message":"RETRY SEND SUCCESS","data":{{"global_exec_index":{},"commit_index":{},"hypothesisId":"D"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                                            ts.as_secs(), ts.as_nanos() % 1000000,
-                                            ts.as_millis(),
-                                            global_exec_index, commit_index);
-                                    }
-                                }
-                                // #endregion
-                                info!("✅ [EXECUTOR] Successfully sent committed sub-DAG after reconnection: global_exec_index={}, commit_index={}", 
+                            Ok(Ok(())) => {                                info!("✅ [EXECUTOR] Successfully sent committed sub-DAG after reconnection: global_exec_index={}, commit_index={}", 
                                     global_exec_index, commit_index);
                                 Ok(())
                             }
-                            Ok(Err(retry_err)) => {
-                                // #region agent log
-                                {
-                                    use std::io::Write;
-                                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:407","message":"RETRY SEND FAILED - transaction may be lost","data":{{"global_exec_index":{},"commit_index":{},"error":"{}","hypothesisId":"D"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                                            ts.as_secs(), ts.as_nanos() % 1000000,
-                                            ts.as_millis(),
-                                            global_exec_index, commit_index, retry_err.to_string().replace("\"", "\\\""));
-                                    }
-                                }
-                                // #endregion
-                                warn!("⚠️  [EXECUTOR] Retry send also failed: {}", retry_err);
+                            Ok(Err(retry_err)) => {                                warn!("⚠️  [EXECUTOR] Retry send also failed: {}", retry_err);
                                 *retry_guard = None; // Clear connection for next attempt
                                 Err(anyhow::anyhow!("Retry send failed: {}", retry_err))
                             }
-                            Err(_) => {
-                                // #region agent log
-                                {
-                                    use std::io::Write;
-                                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:413","message":"RETRY SEND TIMEOUT - transaction may be lost","data":{{"global_exec_index":{},"commit_index":{},"hypothesisId":"D"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                                            ts.as_secs(), ts.as_nanos() % 1000000,
-                                            ts.as_millis(),
-                                            global_exec_index, commit_index);
-                                    }
-                                }
-                                // #endregion
-                                warn!("⏱️  [EXECUTOR] Retry send timeout after {}s (global_exec_index={}, commit_index={})", 
+                            Err(_) => {                                warn!("⏱️  [EXECUTOR] Retry send timeout after {}s (global_exec_index={}, commit_index={})", 
                                     SEND_TIMEOUT.as_secs(), global_exec_index, commit_index);
                                 *retry_guard = None; // Clear connection
                                 Err(anyhow::anyhow!("Retry send timeout"))
@@ -1039,20 +891,7 @@ impl ExecutorClient {
                     }
                 }
             }
-        } else {
-            // #region agent log
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:389","message":"CONNECTION LOST - transaction may be lost","data":{{"global_exec_index":{},"commit_index":{},"hypothesisId":"D"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                        ts.as_secs(), ts.as_nanos() % 1000000,
-                        ts.as_millis(),
-                        global_exec_index, commit_index);
-                }
-            }
-            // #endregion
-            warn!("⚠️  [EXECUTOR] Executor connection lost, skipping send");
+        } else {            warn!("⚠️  [EXECUTOR] Executor connection lost, skipping send");
             Err(anyhow::anyhow!("Connection lost"))
         }
     }
@@ -1081,113 +920,38 @@ impl ExecutorClient {
             // OPTIMIZATION: Use references during sorting to reduce memory allocations
             let mut transactions_with_hash: Vec<(&[u8], Vec<u8>)> = Vec::with_capacity(block.transactions().len()); // (tx_data_ref, tx_hash)
             let mut skipped_count = 0;
-            let total_tx_in_block = block.transactions().len();
-            
-            // #region agent log
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:459","message":"PROCESSING BLOCK - counting transactions","data":{{"global_exec_index":{},"block_idx":{},"total_tx_in_block":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                        ts.as_secs(), ts.as_nanos() % 1000000,
-                        ts.as_millis(),
-                        global_exec_index, block_idx, total_tx_in_block);
-                }
-            }
-            // #endregion
-            
+            let total_tx_in_block = block.transactions().len();            
             for (tx_idx, tx) in block.transactions().iter().enumerate() {
                 // Get transaction data (raw bytes) - Go needs transaction data, not digest
                 // IMPORTANT: tx.data() returns a reference to the original bytes, no modification
-                let tx_data = tx.data();
-                
-                // #region agent log - RAW TRANSACTION DATA FROM CONSENSUS
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                        let preview_len = tx_data.len().min(64);
-                        let preview_hex = hex::encode(&tx_data[..preview_len]);
-                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:601","message":"RAW TX DATA FROM CONSENSUS","data":{{"global_exec_index":{},"block_idx":{},"tx_idx":{},"size":{},"preview_hex":"{}","is_first":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                            ts.as_secs(), ts.as_nanos() % 1000000,
-                            ts.as_millis(),
-                            global_exec_index, block_idx, tx_idx, tx_data.len(), preview_hex, tx_idx == 0);
-                    }
-                }
-                // #endregion
-                
+                let tx_data = tx.data();                
                 // 🔍 HASH INTEGRITY CHECK: Verify transaction data integrity by calculating hash
                 // This ensures data hasn't been modified during consensus
                 use crate::types::tx_hash::calculate_transaction_hash;
                 let tx_hash = calculate_transaction_hash(tx_data);
                 let tx_hash_hex = hex::encode(&tx_hash[..8.min(tx_hash.len())]);
-                let tx_hash_full_hex = hex::encode(&tx_hash);
+                let _tx_hash_full_hex = hex::encode(&tx_hash);
 
                 // 🔍 FILTER: Check if this is a SystemTransaction (BCS format) - skip if so
                 // SystemTransaction should not be sent to Go executor as Go doesn't understand BCS
                 if SystemTransaction::from_bytes(tx_data).is_ok() {
-                    info!("ℹ️ [SYSTEM TX FILTER] Skipping SystemTransaction (BCS format) in block {} tx {}: hash={}..., size={} bytes - not sending to Go executor",
+                    trace!("ℹ️ [SYSTEM TX FILTER] Skipping SystemTransaction (BCS format) in block {} tx {}: hash={}..., size={} bytes",
                         block_idx, tx_idx, tx_hash_hex, tx_data.len());
                     skipped_count += 1;
-
-                    // #region agent log - System transaction filtered
-                    {
-                        use std::io::Write;
-                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                            let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:726","message":"SYSTEM TX FILTERED - BCS transaction skipped","data":{{"global_exec_index":{},"block_idx":{},"tx_idx":{},"tx_hash":"{}","size":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#,
-                                ts.as_secs(), ts.as_nanos() % 1000000,
-                                ts.as_millis(),
-                                global_exec_index, block_idx, tx_idx, tx_hash_hex, tx_data.len());
-                        }
-                    }
-                    // #endregion
-
-                    continue; // Skip this SystemTransaction, don't send to Go
+                    continue;
                 }
 
                 // Log transaction processing (general tracking, not specific transaction)
                 trace!("🔍 [TX HASH] Processing transaction: hash={}..., size={} bytes, block_idx={}, tx_idx={}",
                     tx_hash_hex, tx_data.len(), block_idx, tx_idx);
 
-                // CRITICAL: Verify transaction data is valid protobuf before sending to Go
-                // Go executor expects protobuf Transactions or Transaction message
+                // Verify transaction data is valid protobuf before sending to Go
+                // Uses strict validation (from_address must be non-empty) to filter
+                // non-user data like consensus internal messages
                 use crate::types::tx_hash::verify_transaction_protobuf;
-                // #region agent log
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:750","message":"BEFORE verify_transaction_protobuf","data":{{"tx_hash":"{}","size":{},"block_idx":{},"tx_idx":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#,
-                            ts.as_secs(), ts.as_nanos() % 1000000,
-                            ts.as_millis(),
-                            tx_hash_hex, tx_data.len(), block_idx, tx_idx);
-                    }
-                }
-                // #endregion
                 if !verify_transaction_protobuf(tx_data) {
-                    // #region agent log
-                    {
-                        use std::io::Write;
-                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                            let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:432","message":"INVALID PROTOBUF - transaction skipped","data":{{"tx_hash":"{}","tx_hash_full":"{}","size":{},"block_idx":{},"tx_idx":{},"global_exec_index":{},"commit_index":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                                ts.as_secs(), ts.as_nanos() % 1000000,
-                                ts.as_millis(),
-                                tx_hash_hex, tx_hash_full_hex, tx_data.len(), block_idx, tx_idx, global_exec_index, subdag.commit_ref.index);
-                        }
-                    }
-                    // #endregion
-                    warn!("🚫 [TX INTEGRITY] Invalid transaction protobuf in committed block (hash={}..., full_hash={}, size={} bytes, global_exec_index={}, commit_index={}). This transaction will cause unmarshal errors in Go executor. Skipping send.", 
-                        tx_hash_hex, tx_hash_full_hex, tx_data.len(), global_exec_index, subdag.commit_ref.index);
-                    
-                    // Log first few bytes for debugging
-                    let preview_len = tx_data.len().min(32);
-                    let preview_hex = hex::encode(&tx_data[..preview_len]);
-                    warn!("   📋 [TX INTEGRITY] Transaction data preview (first {} bytes): {}", preview_len, preview_hex);
-                    
-                    // CRITICAL: Skip invalid protobuf transactions to prevent Go executor errors
-                    // TODO: Investigate why invalid protobuf is in consensus blocks
+                    trace!("🚫 [TX FILTER] Non-user transaction in committed block (hash={}..., size={} bytes, global_exec_index={}, commit_index={}). Skipping.", 
+                        tx_hash_hex, tx_data.len(), global_exec_index, subdag.commit_ref.index);
                     skipped_count += 1;
                     continue;
                 }
@@ -1197,21 +961,7 @@ impl ExecutorClient {
                 
                 // Store transaction data reference with hash for sorting
                 // OPTIMIZATION: Avoid first clone by storing reference during sorting
-                transactions_with_hash.push((tx_data, tx_hash));
-                
-                // #region agent log - General transaction tracking
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:644","message":"VALID PROTOBUF - added to sort list","data":{{"global_exec_index":{},"commit_index":{},"block_idx":{},"tx_idx":{},"tx_hash":"{}","tx_hash_full":"{}","size":{},"is_first_in_block":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                            ts.as_secs(), ts.as_nanos() % 1000000,
-                            ts.as_millis(),
-                            global_exec_index, subdag.commit_ref.index, block_idx, tx_idx, tx_hash_hex, tx_hash_full_hex, tx_data.len(), tx_idx == 0);
-                    }
-                }
-                // #endregion
-                
+                transactions_with_hash.push((tx_data, tx_hash));                
                 trace!("✅ [TX INTEGRITY] Transaction data preserved: hash={}..., size={} bytes (unchanged from submission)", 
                     tx_hash_hex, tx_data.len());
             }
@@ -1221,43 +971,12 @@ impl ExecutorClient {
             // Sort by hash bytes (lexicographic order) - deterministic across all nodes
             transactions_with_hash.sort_by(|(_, hash_a), (_, hash_b)| hash_a.cmp(hash_b));
             
-            // #region agent log
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                    let first_hash = if !transactions_with_hash.is_empty() {
-                        hex::encode(&transactions_with_hash[0].1[..8.min(transactions_with_hash[0].1.len())])
-                    } else {
-                        "NONE".to_string()
-                    };
-                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:653","message":"AFTER SORT - first transaction","data":{{"global_exec_index":{},"block_idx":{},"total_after_sort":{},"first_hash":"{}","hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                        ts.as_secs(), ts.as_nanos() % 1000000,
-                        ts.as_millis(),
-                        global_exec_index, block_idx, transactions_with_hash.len(), first_hash);
-                }
-            }
-            // #endregion
-            
             // Convert to TransactionExe messages after sorting
             // OPTIMIZATION: Only clone once here instead of twice (during push + here)
             let mut transactions = Vec::new();
-            for (sorted_idx, (tx_data_ref, tx_hash)) in transactions_with_hash.iter().enumerate() {
+            for (_sorted_idx, (tx_data_ref, tx_hash)) in transactions_with_hash.iter().enumerate() {
                 let tx_hash_hex = hex::encode(&tx_hash[..8.min(tx_hash.len())]);
-                info!("📋 [FORK-SAFETY] Sorted transaction in block[{}]: hash={}", block_idx, tx_hash_hex);
-                
-                // #region agent log
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                        let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:657","message":"CREATING TransactionExe","data":{{"global_exec_index":{},"block_idx":{},"sorted_idx":{},"tx_hash":"{}","size":{},"is_first":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#,
-                            ts.as_secs(), ts.as_nanos() % 1000000,
-                            ts.as_millis(),
-                            global_exec_index, block_idx, sorted_idx, tx_hash_hex, tx_data_ref.len(), sorted_idx == 0);
-                    }
-                }
-                // #endregion
+                trace!("📋 [FORK-SAFETY] Sorted transaction in block[{}]: hash={}", block_idx, tx_hash_hex);
                 
                 // Create TransactionExe message using generated protobuf code
                 // NOTE: We use "digest" field to store transaction data (raw bytes)
@@ -1269,24 +988,11 @@ impl ExecutorClient {
                 };
                 transactions.push(tx_exe);
             }
-            
-            // #region agent log
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                    let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:551","message":"AFTER CONVERSION - transaction counts","data":{{"global_exec_index":{},"block_idx":{},"total_tx_in_block":{},"valid_tx":{},"skipped_tx":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                        ts.as_secs(), ts.as_nanos() % 1000000,
-                        ts.as_millis(),
-                        global_exec_index, block_idx, total_tx_in_block, transactions.len(), skipped_count);
-                }
-            }
-            // #endregion
             if skipped_count > 0 {
-                warn!("⚠️  [TX FILTER] Block[{}] skipped {} invalid protobuf transactions out of {} total", 
+                trace!("⏭️ [TX FILTER] Block[{}] skipped {} non-user transactions out of {} total", 
                     block_idx, skipped_count, total_tx_in_block);
             }
-            info!("✅ [FORK-SAFETY] Block[{}] transactions sorted: {} transactions (deterministic order by hash)", 
+            trace!("✅ [FORK-SAFETY] Block[{}] transactions sorted: {} transactions (deterministic order by hash)", 
                 block_idx, transactions.len());
             
             // Create CommittedBlock message using generated protobuf code
@@ -1325,21 +1031,7 @@ impl ExecutorClient {
         epoch_data.encode(&mut buf)?;
         
         // Count total transactions in encoded data
-        let total_tx_encoded: usize = epoch_data.blocks.iter().map(|b| b.transactions.len()).sum();
-        
-        // #region agent log
-        {
-            use std::io::Write;
-            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log") {
-                let _ = writeln!(f, r#"{{"id":"log_{}_{}","timestamp":{},"location":"executor_client.rs:579","message":"ENCODED PROTOBUF - final transaction count","data":{{"global_exec_index":{},"commit_index":{},"total_tx_encoded":{},"blocks":{},"hypothesisId":"B"}},"sessionId":"debug-session","runId":"run1"}}"#, 
-                    ts.as_secs(), ts.as_nanos() % 1000000,
-                    ts.as_millis(),
-                    global_exec_index, subdag.commit_ref.index, total_tx_encoded, epoch_data.blocks.len());
-            }
-        }
-        // #endregion
-        
+        let total_tx_encoded: usize = epoch_data.blocks.iter().map(|b| b.transactions.len()).sum();        
         info!("📦 [TX INTEGRITY] Encoded CommittedEpochData: global_exec_index={}, commit_index={}, epoch={}, blocks={}, total_tx={}, total_size={} bytes (using protobuf encoding)", 
             global_exec_index, subdag.commit_ref.index, epoch, epoch_data.blocks.len(), total_tx_encoded, buf.len());
         

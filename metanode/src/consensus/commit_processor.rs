@@ -207,32 +207,6 @@ impl CommitProcessor {
                 0
             }
         };
-
-        // #region agent log
-        {
-            use std::io::Write;
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap();
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log")
-            {
-                let _ = writeln!(
-                    f,
-                    r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:124","message":"COMMIT PROCESSOR STARTED","data":{{"current_epoch":{},"last_global_exec_index":{},"next_expected_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#,
-                    ts.as_secs(),
-                    ts.as_nanos() % 1000000,
-                    ts.as_millis(),
-                    current_epoch,
-                    epoch_base_index,
-                    next_expected_index
-                );
-            }
-        }
-        // #endregion
-
         info!("🚀 [COMMIT PROCESSOR] Started processing commits for epoch {} (epoch_base_index={}, next_expected_index={})",
             current_epoch, epoch_base_index, next_expected_index);
 
