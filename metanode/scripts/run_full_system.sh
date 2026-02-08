@@ -642,7 +642,7 @@ if [ -f "$NODE_0_CONFIG" ]; then
 
 # LVM Snapshot Configuration
 # Enable snapshot creation after epoch transition (only for nodes that should create snapshots)
-enable_lvm_snapshot = true
+enable_lvm_snapshot = false
 # Path to lvm-snap-rsync binary
 lvm_snapshot_bin_path = "$LVM_SNAPSHOT_BIN_PATH"
 # Delay in seconds before creating snapshot after epoch transition (default: 20 seconds)
@@ -654,7 +654,7 @@ EOF
         # Update existing config
         print_info "  📝 Cập nhật cấu hình snapshot trong node_0.toml..."
         # Enable snapshot
-        sed -i 's/^enable_lvm_snapshot = false/enable_lvm_snapshot = true/' "$NODE_0_CONFIG" 2>/dev/null || true
+        sed -i 's/^enable_lvm_snapshot = true/enable_lvm_snapshot = false/' "$NODE_0_CONFIG" 2>/dev/null || true
         # Add or update bin path
         if ! grep -q "^lvm_snapshot_bin_path" "$NODE_0_CONFIG" 2>/dev/null; then
             sed -i "/^enable_lvm_snapshot = true/a lvm_snapshot_bin_path = \"$LVM_SNAPSHOT_BIN_PATH\"" "$NODE_0_CONFIG" 2>/dev/null || true

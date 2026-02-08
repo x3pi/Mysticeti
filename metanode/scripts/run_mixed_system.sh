@@ -170,15 +170,11 @@ sed -i 's|executor_commit_enabled = false|executor_commit_enabled = true|g' conf
 # Ensure read enabled too
 sed -i 's|executor_read_enabled = false|executor_read_enabled = true|g' config/node_1.toml
 
-# 6. CRITICAL: Enable LVM Snapshot for Node 0 (Primary node creates epoch snapshots)
-print_info "🔧 Enabling LVM Snapshot for Node 0..."
-sed -i 's|enable_lvm_snapshot = false|enable_lvm_snapshot = true|g' config/node_0.toml
-# Add snapshot binary path if not present
-if ! grep -q "lvm_snapshot_bin_path" config/node_0.toml; then
-    sed -i '/enable_lvm_snapshot = true/a lvm_snapshot_bin_path = "/home/abc/chain-n/Mysticeti/lvm-manager/target/release/lvm-snap-rsync"' config/node_0.toml
-else
-    sed -i 's|lvm_snapshot_bin_path = .*|lvm_snapshot_bin_path = "/home/abc/chain-n/Mysticeti/lvm-manager/target/release/lvm-snap-rsync"|g' config/node_0.toml
-fi
+# 6. CRITICAL: Disable LVM Snapshot for Node 0 (Go handles snapshots via rsync now)
+print_info "🔧 Disabling Rust LVM Snapshot for Node 0 (Go uses rsync method)..."
+sed -i 's|enable_lvm_snapshot = true|enable_lvm_snapshot = false|g' config/node_0.toml
+# Remove obsolete snapshot binary path if present
+sed -i '/lvm_snapshot_bin_path/d' config/node_0.toml
 
 if [ -f "scripts/update_committee_from_genesis.py" ]; then
     if python3 "scripts/update_committee_from_genesis.py"; then

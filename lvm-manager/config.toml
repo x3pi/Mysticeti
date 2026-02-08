@@ -1,7 +1,7 @@
 vg_name = "ubuntu-vg"
 lv_name = "ubuntu-lv"
 snap_prefix = "snap_id"     # Tiền tố tên snapshot
-max_snapshots = 2            # Giữ tối đa 2 bản (mỗi snapshot 3GB)
-base_path = "/mnt/lvm_public" # Thư mục để mount và chia sẻ Rsync
-share_subdir = "/home/abc/chain-n/mtn-simple-2025/cmd/simple_chain/sample/simple/data-write/data"   # Thư mục con cần chia sẻ dưới mỗi snapshot
-sudo_password = "1234@abcd" # Thay đổi thành mật khẩu sudo để tự động cấp quyền
+max_snapshots = 2            # Giữ tối đa 2 bản mới nhất
+base_path = "/mnt/lvm_public" # Thư mục để mount snapshot
+sudo_password = "1234@abcd"  # Mật khẩu sudo để tự động cấp quyền
+serve_port = 8600            # Port cho HTTP download server

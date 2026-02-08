@@ -42,6 +42,11 @@ print_step "Bước 0: Xóa tất cả dữ liệu Go nodes (giữ config/keys).
 
 # Clean ALL Go node data directories
 print_info "🗑️  Xóa dữ liệu Go Standard (simple)..."
+
+# Clean snapshot data directory
+rm -rf "$GO_PROJECT_ROOT/cmd/simple_chain/snapshot_data" 2>/dev/null || true
+
+
 rm -rf "$GO_PROJECT_ROOT/cmd/simple_chain/sample/simple/data" 2>/dev/null || true
 rm -rf "$GO_PROJECT_ROOT/cmd/simple_chain/sample/simple/data-write" 2>/dev/null || true
 rm -rf "$GO_PROJECT_ROOT/cmd/simple_chain/sample/simple/back_up" 2>/dev/null || true
