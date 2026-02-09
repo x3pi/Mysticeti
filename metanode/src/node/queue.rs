@@ -1,19 +1,19 @@
 // Copyright (c) MetaNode Team
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::Result;
-use tracing::{info, warn, error, trace};
-use tokio::sync::Mutex;
-use std::path::Path;
-use std::io::{Write, Read};
-use consensus_core::SystemTransaction;
+use crate::node::tx_submitter::TransactionSubmitter;
 use crate::node::ConsensusNode;
-use crate::node::tx_submitter::TransactionSubmitter; // Added TransactionSubmitter trait
+use anyhow::Result;
+use consensus_core::SystemTransaction;
+use std::io::{Read, Write};
+use std::path::Path;
+use tokio::sync::Mutex;
+use tracing::{error, info, trace, warn}; // Added TransactionSubmitter trait
 
 pub async fn queue_transaction(
     pending_queue: &Mutex<Vec<Vec<u8>>>,
     storage_path: &Path,
-    tx_data: Vec<u8>
+    tx_data: Vec<u8>,
 ) -> Result<()> {
     let mut queue = pending_queue.lock().await;
     queue.push(tx_data);
@@ -38,7 +38,11 @@ pub async fn persist_transaction_queue(queue: &[Vec<u8>], storage_path: &Path) -
         file.write_all(tx_data)?;
     }
     file.flush()?;
-    trace!("💾 Persisted {} txs to {}", queue.len(), queue_path.display());
+    trace!(
+        "💾 Persisted {} txs to {}",
+        queue.len(),
+        queue_path.display()
+    );
     Ok(())
 }
 
@@ -73,14 +77,20 @@ pub async fn submit_queued_transactions(node: &mut ConsensusNode) -> Result<usiz
         return Ok(0);
     }
 
-    info!("📤 [TX FLOW] Submitting {} queued transactions", original_count);
+    info!(
+        "📤 [TX FLOW] Submitting {} queued transactions",
+        original_count
+    );
 
     // Load committed transaction hashes to avoid resubmitting already committed transactions
     let committed_hashes = {
         let hashes_guard = node.committed_transaction_hashes.lock().await;
         hashes_guard.clone()
     };
-    info!("📋 [TX FLOW] Loaded {} committed transaction hashes from current epoch", committed_hashes.len());
+    info!(
+        "📋 [TX FLOW] Loaded {} committed transaction hashes from current epoch",
+        committed_hashes.len()
+    );
 
     // Filter out transactions that were already committed
     let mut filtered_transactions = Vec::new();
@@ -91,39 +101,57 @@ pub async fn submit_queued_transactions(node: &mut ConsensusNode) -> Result<usiz
         if committed_hashes.contains(&tx_hash) {
             skipped_duplicates += 1;
             let hash_hex = hex::encode(&tx_hash);
-            info!("⏭️ [TX FLOW] Skipping already committed transaction: {}", hash_hex);
+            info!(
+                "⏭️ [TX FLOW] Skipping already committed transaction: {}",
+                hash_hex
+            );
         } else {
             filtered_transactions.push(tx_data.clone());
         }
     }
 
     // Dedup among remaining transactions
-    let mut transactions_with_hash: Vec<(Vec<u8>, Vec<u8>)> = filtered_transactions.into_iter()
-        .map(|tx| (tx.clone(), crate::types::tx_hash::calculate_transaction_hash(&tx)))
+    let mut transactions_with_hash: Vec<(Vec<u8>, Vec<u8>)> = filtered_transactions
+        .into_iter()
+        .map(|tx| {
+            (
+                tx.clone(),
+                crate::types::tx_hash::calculate_transaction_hash(&tx),
+            )
+        })
         .collect();
 
     transactions_with_hash.sort_by(|(_, a), (_, b)| a.cmp(b));
     transactions_with_hash.dedup_by(|a, b| a.1 == b.1);
 
-    let transactions: Vec<Vec<u8>> = transactions_with_hash.into_iter().map(|(tx, _)| tx).collect();
+    let transactions: Vec<Vec<u8>> = transactions_with_hash
+        .into_iter()
+        .map(|(tx, _)| tx)
+        .collect();
     queue.clear();
     drop(queue); // Release lock
 
-    info!("🔄 [TX FLOW] Filtered {} duplicates, submitting {} unique transactions", skipped_duplicates, transactions.len());
+    info!(
+        "🔄 [TX FLOW] Filtered {} duplicates, submitting {} unique transactions",
+        skipped_duplicates,
+        transactions.len()
+    );
 
     let mut successful_count = 0;
     let mut requeued_count = 0;
 
     for tx_data in transactions {
-        if SystemTransaction::from_bytes(&tx_data).is_ok() || !crate::types::tx_hash::verify_transaction_protobuf(&tx_data) {
+        if SystemTransaction::from_bytes(&tx_data).is_ok()
+            || !crate::types::tx_hash::verify_transaction_protobuf(&tx_data)
+        {
             continue;
         }
 
         if node.transaction_client_proxy.is_none() {
-             let mut q = node.pending_transactions_queue.lock().await;
-             q.push(tx_data);
-             requeued_count += 1;
-             continue;
+            let mut q = node.pending_transactions_queue.lock().await;
+            q.push(tx_data);
+            requeued_count += 1;
+            continue;
         }
 
         let mut retry = 0;
@@ -131,7 +159,17 @@ pub async fn submit_queued_transactions(node: &mut ConsensusNode) -> Result<usiz
         let mut submitted = false;
 
         while retry < max_retries {
-            match node.transaction_client_proxy.as_ref().unwrap().submit(vec![tx_data.clone()]).await {
+            let proxy = match node.transaction_client_proxy.as_ref() {
+                Some(p) => p,
+                None => {
+                    // Should not happen given the check at line 122, but guard anyway
+                    let mut q = node.pending_transactions_queue.lock().await;
+                    q.push(tx_data.clone());
+                    requeued_count += 1;
+                    break;
+                }
+            };
+            match proxy.submit(vec![tx_data.clone()]).await {
                 Ok(_) => {
                     successful_count += 1;
                     submitted = true;
@@ -140,21 +178,24 @@ pub async fn submit_queued_transactions(node: &mut ConsensusNode) -> Result<usiz
                     // Queue submissions are just temporary - only commit processing truly commits transactions
 
                     break;
-                },
+                }
                 Err(e) => {
                     retry += 1;
                     let delay = 200 * (1 << (retry - 1));
-                    warn!("⚠️ Failed to submit (attempt {}): {}. Retry in {}ms", retry, e, delay);
+                    warn!(
+                        "⚠️ Failed to submit (attempt {}): {}. Retry in {}ms",
+                        retry, e, delay
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
             }
         }
 
         if !submitted {
-             error!("❌ Failed to submit tx after retries. Re-queuing.");
-             let mut q = node.pending_transactions_queue.lock().await;
-             q.push(tx_data);
-             requeued_count += 1;
+            error!("❌ Failed to submit tx after retries. Re-queuing.");
+            let mut q = node.pending_transactions_queue.lock().await;
+            q.push(tx_data);
+            requeued_count += 1;
         }
     }
 

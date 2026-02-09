@@ -36,7 +36,10 @@ pub async fn perform_block_recovery_check(
         return Ok(());
     }
 
-    let recovery_store = Arc::new(RocksDBStore::new(db_path.to_str().unwrap()));
+    let db_path_str = db_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("DB path contains non-UTF-8 characters: {:?}", db_path))?;
+    let recovery_store = Arc::new(RocksDBStore::new(db_path_str));
 
     // Calculate start commit index
     // global_exec_index = epoch_base + commit_index

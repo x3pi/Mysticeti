@@ -1,184 +1,43 @@
 // Copyright (c) MetaNode Team
 // SPDX-License-Identifier: Apache-2.0
 
+//! ExecutorClient module - communicates with Go executor via sockets.
+//!
+//! Submodules:
+//! - `socket_stream`: Socket abstraction (Unix + TCP)
+//! - `persistence`: Crash recovery persistence helpers
+//! - `block_sync`: Block sync methods for validators and SyncOnly nodes
+
+pub mod socket_stream;
+pub mod persistence;
+mod block_sync;
+
+// Re-export public items from submodules
+pub use socket_stream::{SocketAddress, SocketStream};
+pub use persistence::{
+    write_uvarint, persist_last_sent_index,
+    persist_last_block_number, read_last_block_number, load_persisted_last_index,
+};
+
 use anyhow::Result;
 use consensus_core::{CommittedSubDag, BlockAPI, SystemTransaction};
 use prost::Message;
-use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use tokio::net::UnixStream;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{error, info, trace, warn};
 
+use crate::node::rpc_circuit_breaker::RpcCircuitBreaker;
+
 // Include generated protobuf code
-// Note: prost_build generates all messages from executor.proto into proto.rs
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/proto.rs"));
 }
 
-// Include validator_rpc protobuf code for Request/Response
-// Note: prost generates files based on package name, so "proto" package becomes "proto.rs"
-// All proto files with package "proto" are merged into one proto.rs file
-// So we can use the same proto module for all messages
-
 use proto::{CommittedBlock, CommittedEpochData, TransactionExe, GetValidatorsAtBlockRequest, GetCurrentEpochRequest, GetEpochStartTimestampRequest, AdvanceEpochRequest, Request, Response, ValidatorInfo};
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 
-// ============================================================================
-// Socket Abstraction Layer - Support both Unix and TCP sockets
-// ============================================================================
 
-/// Socket address type - supports both Unix domain sockets and TCP sockets
-#[derive(Debug, Clone)]
-pub enum SocketAddress {
-    /// Unix domain socket path (e.g., "/tmp/socket.sock")
-    Unix(String),
-    /// TCP socket address (e.g., "192.168.1.100:9001")
-    Tcp(SocketAddr),
-}
-
-impl SocketAddress {
-    /// Parse socket address from string with auto-detection
-    /// 
-    /// Format:
-    /// - Unix: "/tmp/socket.sock" or "unix:///tmp/socket.sock"
-    /// - TCP: "tcp://host:port" or "host:port"
-    /// 
-    /// # Examples
-    /// ```
-    /// let unix_addr = SocketAddress::parse("/tmp/socket.sock").unwrap();
-    /// let tcp_addr = SocketAddress::parse("tcp://192.168.1.100:9001").unwrap();
-    /// let tcp_addr2 = SocketAddress::parse("192.168.1.100:9001").unwrap();
-    /// ```
-    pub fn parse(addr: &str) -> Result<Self> {
-        if addr.starts_with("tcp://") {
-            // TCP format: "tcp://host:port"
-            let addr_str = addr.strip_prefix("tcp://").unwrap();
-            let sock_addr: SocketAddr = addr_str.parse()
-                .map_err(|e| anyhow::anyhow!("Invalid TCP address '{}': {}", addr_str, e))?;
-            Ok(SocketAddress::Tcp(sock_addr))
-        } else if addr.starts_with("unix://") {
-            // Unix format: "unix:///tmp/socket.sock"
-            let path = addr.strip_prefix("unix://").unwrap();
-            Ok(SocketAddress::Unix(path.to_string()))
-        } else if addr.contains(':') && !addr.starts_with('/') {
-            // TCP format without prefix: "host:port" or "192.168.1.100:9001"
-            let sock_addr: SocketAddr = addr.parse()
-                .map_err(|e| anyhow::anyhow!("Invalid TCP address '{}': {}", addr, e))?;
-            Ok(SocketAddress::Tcp(sock_addr))
-        } else {
-            // Default to Unix socket (path format)
-            Ok(SocketAddress::Unix(addr.to_string()))
-        }
-    }
-
-    /// Get display string for logging
-    pub fn as_str(&self) -> String {
-        match self {
-            SocketAddress::Unix(path) => path.clone(),
-            SocketAddress::Tcp(addr) => format!("tcp://{}", addr),
-        }
-    }
-}
-
-/// Unified socket stream - wraps either Unix or TCP stream
-pub enum SocketStream {
-    Unix(UnixStream),
-    Tcp(TcpStream),
-}
-
-impl SocketStream {
-    /// Connect to a socket address with retry logic
-    /// 
-    /// For TCP: includes timeout and TCP keepalive settings
-    /// For Unix: connects directly to socket file
-    pub async fn connect(addr: &SocketAddress, timeout_secs: u64) -> Result<Self> {
-        match addr {
-            SocketAddress::Unix(path) => {
-                let stream = UnixStream::connect(path).await
-                    .map_err(|e| anyhow::anyhow!("Failed to connect to Unix socket '{}': {}", path, e))?;
-                Ok(SocketStream::Unix(stream))
-            }
-            SocketAddress::Tcp(sock_addr) => {
-                use tokio::time::{timeout, Duration};
-                
-                // Connect with timeout
-                let stream = timeout(
-                    Duration::from_secs(timeout_secs),
-                    TcpStream::connect(sock_addr)
-                ).await
-                    .map_err(|_| anyhow::anyhow!("TCP connection timeout after {}s to {}", timeout_secs, sock_addr))?
-                    .map_err(|e| anyhow::anyhow!("Failed to connect to TCP socket '{}': {}", sock_addr, e))?;
-                
-                // Enable TCP keepalive to detect dead connections
-                let socket = socket2::Socket::from(stream.into_std()?);
-                socket.set_keepalive(true)
-                    .map_err(|e| anyhow::anyhow!("Failed to set TCP keepalive: {}", e))?;
-                
-                // Convert back to tokio TcpStream
-                let stream = TcpStream::from_std(socket.into())?;
-                
-                Ok(SocketStream::Tcp(stream))
-            }
-        }
-    }
-
-    /// Check if stream is writable (for connection health check)
-    pub async fn writable(&mut self) -> std::io::Result<()> {
-        match self {
-            SocketStream::Unix(s) => s.writable().await,
-            SocketStream::Tcp(s) => s.writable().await,
-        }
-    }
-}
-
-// Implement AsyncRead for SocketStream
-impl AsyncRead for SocketStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            SocketStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
-            SocketStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-// Implement AsyncWrite for SocketStream
-impl AsyncWrite for SocketStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match &mut *self {
-            SocketStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
-            SocketStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            SocketStream::Unix(s) => Pin::new(s).poll_flush(cx),
-            SocketStream::Tcp(s) => Pin::new(s).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            SocketStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
-            SocketStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
-        }
-    }
-}
 
 // ============================================================================
 // ExecutorClient - Now supports both Unix and TCP sockets
@@ -190,7 +49,7 @@ impl AsyncWrite for SocketStream {
 pub struct ExecutorClient {
     socket_address: SocketAddress,  // Changed from socket_path: String
     connection: Arc<Mutex<Option<SocketStream>>>,  // Changed from UnixStream
-    request_socket_address: SocketAddress,  // Changed from request_socket_path: String
+    pub(crate) request_socket_address: SocketAddress,  // Changed from request_socket_path: String
     request_connection: Arc<Mutex<Option<SocketStream>>>,  // Changed from UnixStream
     enabled: bool,
     can_commit: bool, // Only node 0 can actually commit transactions to Go state
@@ -206,6 +65,8 @@ pub struct ExecutorClient {
     /// Track sent global_exec_indices to prevent duplicates from dual-stream
     /// This prevents both Consensus and Sync from sending the same block
     sent_indices: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
+    /// Circuit breaker for Go Master RPC calls (read-path only)
+    rpc_circuit_breaker: Arc<RpcCircuitBreaker>,
 }
 
 /// Production safety constants
@@ -267,6 +128,7 @@ impl ExecutorClient {
             storage_path,
             last_verified_go_index: Arc::new(tokio::sync::Mutex::new(0)),
             sent_indices: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            rpc_circuit_breaker: Arc::new(RpcCircuitBreaker::new()),
         }
     }
 
@@ -278,6 +140,12 @@ impl ExecutorClient {
     /// Check if this node can commit transactions (only node 0)
     pub fn can_commit(&self) -> bool {
         self.can_commit
+    }
+
+    /// Get reference to the RPC circuit breaker
+    #[allow(dead_code)]
+    pub fn circuit_breaker(&self) -> &RpcCircuitBreaker {
+        &self.rpc_circuit_breaker
     }
 
     /// Force reset all connections to Go executor
@@ -1095,6 +963,11 @@ impl ExecutorClient {
             return Err(anyhow::anyhow!("Executor client is not enabled"));
         }
 
+        // Circuit breaker check
+        if let Err(reason) = self.rpc_circuit_breaker.check("get_validators_at_block") {
+            return Err(anyhow::anyhow!("Circuit breaker: {}", reason));
+        }
+
         // Connect to Go request socket if needed
         if let Err(e) = self.connect_request().await {
             return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
@@ -1299,6 +1172,11 @@ impl ExecutorClient {
     pub async fn get_current_epoch(&self) -> Result<u64> {
         if !self.is_enabled() {
             return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Circuit breaker check
+        if let Err(reason) = self.rpc_circuit_breaker.check("get_current_epoch") {
+            return Err(anyhow::anyhow!("Circuit breaker: {}", reason));
         }
 
         // Connect to Go request socket if needed
@@ -1599,6 +1477,11 @@ impl ExecutorClient {
             return Err(anyhow::anyhow!("Executor client is not enabled"));
         }
 
+        // Circuit breaker check
+        if let Err(reason) = self.rpc_circuit_breaker.check("get_epoch_boundary_data") {
+            return Err(anyhow::anyhow!("Circuit breaker: {}", reason));
+        }
+
         // Connect to Go request socket if needed
         if let Err(e) = self.connect_request().await {
             return Err(anyhow::anyhow!("Failed to connect to Go request socket: {}", e));
@@ -1703,6 +1586,11 @@ impl ExecutorClient {
     pub async fn get_last_block_number(&self) -> Result<u64> {
         if !self.is_enabled() {
             return Err(anyhow::anyhow!("Executor client is not enabled"));
+        }
+
+        // Circuit breaker check
+        if let Err(reason) = self.rpc_circuit_breaker.check("get_last_block_number") {
+            return Err(anyhow::anyhow!("Circuit breaker: {}", reason));
         }
 
         // Connect to Go request socket if needed
@@ -2008,232 +1896,6 @@ impl ExecutorClient {
     }
 }
 
-/// Write uvarint to buffer (Go's binary.ReadUvarint format)
-fn write_uvarint(buf: &mut Vec<u8>, mut value: u64) -> Result<()> {
-    use std::io::Write;
-    loop {
-        let mut b = (value & 0x7F) as u8;
-        value >>= 7;
-        if value != 0 {
-            b |= 0x80;
-        }
-        Write::write_all(buf, &[b])?;
-        if value == 0 {
-            break;
-        }
-    }
-    Ok(())
-}
-
-// Note: Executor is now configured via executor_enabled field in node_X.toml
-// This function is kept for backward compatibility but is no longer used
-#[allow(dead_code)]
-pub fn is_executor_enabled(config_dir: &Path) -> bool {
-    let config_file = config_dir.join("enable_executor.toml");
-    config_file.exists()
-}
-
-// Persist last successfully sent index AND commit_index to file for crash recovery
-// Uses atomic write (temp file + rename) to prevent corruption
-pub async fn persist_last_sent_index(storage_path: &Path, index: u64, commit_index: u32) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-    
-    let persist_dir = storage_path.join("executor_state");
-    std::fs::create_dir_all(&persist_dir)?;
-    
-    let temp_path = persist_dir.join("last_sent_index.tmp");
-    let final_path = persist_dir.join("last_sent_index.bin");
-    
-    // Write to temp file
-    let mut file = tokio::fs::File::create(&temp_path).await?;
-    // Format: [global_exec_index: u64][commit_index: u32]
-    file.write_all(&index.to_le_bytes()).await?;
-    file.write_all(&commit_index.to_le_bytes()).await?;
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-    
-    // Atomic rename
-    std::fs::rename(&temp_path, &final_path)?;
-    
-    trace!("💾 [PERSIST] Saved last_sent_index={}, commit_index={} to {:?}", index, commit_index, final_path);
-    Ok(())
-}
-
-// Persist the last block number retrieved from Go for crash recovery
-pub async fn persist_last_block_number(storage_path: &Path, block_number: u64) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let persist_dir = storage_path.join("executor_state");
-    std::fs::create_dir_all(&persist_dir)?;
-    let temp_path = persist_dir.join("last_block_number.tmp");
-    let final_path = persist_dir.join("last_block_number.bin");
-    let mut file = tokio::fs::File::create(&temp_path).await?;
-    file.write_all(&block_number.to_le_bytes()).await?;
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-    std::fs::rename(&temp_path, &final_path)?;
-    trace!("💾 [PERSIST] Saved last_block_number={} to {:?}", block_number, final_path);
-    Ok(())
-}
-
-// Read persisted last block number, if any
-pub async fn read_last_block_number(storage_path: &Path) -> Result<u64> {
-    use tokio::io::AsyncReadExt;
-    let persist_dir = storage_path.join("executor_state");
-    let final_path = persist_dir.join("last_block_number.bin");
-    let mut file = tokio::fs::File::open(&final_path).await?;
-    let mut buf = [0u8; 8];
-    file.read_exact(&mut buf).await?;
-    Ok(u64::from_le_bytes(buf))
-}
-
-/// Load persisted last sent index from file
-/// Returns None if file doesn't exist or is corrupted
-/// Returns (global_exec_index, commit_index)
-pub fn load_persisted_last_index(storage_path: &Path) -> Option<(u64, u32)> {
-    let persist_path = storage_path.join("executor_state").join("last_sent_index.bin");
-    
-    if !persist_path.exists() {
-        return None;
-    }
-    
-    match std::fs::read(&persist_path) {
-        Ok(bytes) => {
-            if bytes.len() == 12 {
-                // New format: u64 + u32
-                let index = u64::from_le_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7],
-                ]);
-                let commit = u32::from_le_bytes([
-                    bytes[8], bytes[9], bytes[10], bytes[11],
-                ]);
-                info!("📂 [PERSIST] Loaded persisted last_sent_index={}, commit_index={} from {:?}", index, commit, persist_path);
-                Some((index, commit))
-            } else if bytes.len() == 8 {
-                // Legacy format: u64 only (commit_index assumed 0 or unknown)
-                let index = u64::from_le_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7],
-                ]);
-                warn!("⚠️ [PERSIST] Legacy format detected (only u64). Defaulting commit_index to 0.");
-                Some((index, 0))
-            } else {
-                warn!("⚠️ [PERSIST] Corrupted last_sent_index file: {} bytes (expected 8 or 12)", bytes.len());
-                None
-            }
-        }
-        Err(e) => {
-            warn!("⚠️ [PERSIST] Failed to read last_sent_index: {}", e);
-            None
-        }
-    }
-}
-
-// ============================================================================
-// Block Sync Methods
-// ============================================================================
-
-impl ExecutorClient {
-    /// Get a range of blocks from Go Master
-    /// Used by validators to serve blocks to SyncOnly nodes
-    pub async fn get_blocks_range(&self, from_block: u64, to_block: u64) -> Result<Vec<proto::BlockData>> {
-        if !self.is_enabled() {
-            return Err(anyhow::anyhow!("Executor client is not enabled"));
-        }
-
-        info!("📤 [BLOCK SYNC] Requesting blocks {} to {} from Go Master", from_block, to_block);
-
-        let request = proto::Request {
-            payload: Some(proto::request::Payload::GetBlocksRangeRequest(
-                proto::GetBlocksRangeRequest { from_block, to_block },
-            )),
-        };
-
-        let request_bytes = request.encode_to_vec();
-        
-        let mut stream = SocketStream::connect(&self.request_socket_address, 5).await?;
-
-        let len_bytes = (request_bytes.len() as u32).to_le_bytes();
-        stream.write_all(&len_bytes).await?;
-        stream.write_all(&request_bytes).await?;
-        stream.flush().await?;
-
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let response_len = u32::from_le_bytes(len_buf) as usize;
-        
-        let mut response_buf = vec![0u8; response_len];
-        stream.read_exact(&mut response_buf).await?;
-        
-        let response: proto::Response = proto::Response::decode(&*response_buf)?;
-        
-        match response.payload {
-            Some(proto::response::Payload::GetBlocksRangeResponse(resp)) => {
-                if !resp.error.is_empty() {
-                    return Err(anyhow::anyhow!("Go returned error: {}", resp.error));
-                }
-                info!("✅ [BLOCK SYNC] Received {} blocks from Go Master", resp.count);
-                Ok(resp.blocks)
-            }
-            Some(proto::response::Payload::Error(e)) => Err(anyhow::anyhow!("Go Master error: {}", e)),
-            _ => Err(anyhow::anyhow!("Unexpected response type from Go Master")),
-        }
-    }
-
-    /// Sync blocks to local Go Master
-    /// Used by SyncOnly nodes to write blocks received from peers
-    #[allow(dead_code)]  // API reserved for future SyncOnly block sync flow
-    pub async fn sync_blocks(&self, blocks: Vec<proto::BlockData>) -> Result<(u64, u64)> {
-        if !self.is_enabled() {
-            return Err(anyhow::anyhow!("Executor client is not enabled"));
-        }
-
-        if blocks.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let block_count = blocks.len();
-        let first_block = blocks.first().map(|b| b.block_number).unwrap_or(0);
-        let last_block = blocks.last().map(|b| b.block_number).unwrap_or(0);
-        
-        info!("📤 [BLOCK SYNC] Syncing {} blocks ({} to {}) to Go Master", block_count, first_block, last_block);
-
-        let request = proto::Request {
-            payload: Some(proto::request::Payload::SyncBlocksRequest(
-                proto::SyncBlocksRequest { blocks },
-            )),
-        };
-
-        let request_bytes = request.encode_to_vec();
-        
-        let mut stream = SocketStream::connect(&self.request_socket_address, 5).await?;
-
-        let len_bytes = (request_bytes.len() as u32).to_le_bytes();
-        stream.write_all(&len_bytes).await?;
-        stream.write_all(&request_bytes).await?;
-        stream.flush().await?;
-
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let response_len = u32::from_le_bytes(len_buf) as usize;
-        
-        let mut response_buf = vec![0u8; response_len];
-        stream.read_exact(&mut response_buf).await?;
-        
-        let response: proto::Response = proto::Response::decode(&*response_buf)?;
-        
-        match response.payload {
-            Some(proto::response::Payload::SyncBlocksResponse(resp)) => {
-                if !resp.error.is_empty() {
-                    return Err(anyhow::anyhow!("Go returned error: {}", resp.error));
-                }
-                info!("✅ [BLOCK SYNC] Synced {} blocks (last: {})", resp.synced_count, resp.last_synced_block);
-                Ok((resp.synced_count, resp.last_synced_block))
-            }
-            Some(proto::response::Payload::Error(e)) => Err(anyhow::anyhow!("Go Master error: {}", e)),
-            _ => Err(anyhow::anyhow!("Unexpected response type from Go Master")),
-        }
-    }
-}
+// Persistence functions are in persistence.rs
+// Block sync methods are in block_sync.rs
+// Socket abstraction is in socket_stream.rs

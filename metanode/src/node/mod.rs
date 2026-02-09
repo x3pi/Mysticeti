@@ -40,14 +40,20 @@ pub mod executor_client;
 pub mod notification_listener;
 pub mod notification_server;
 pub mod peer_go_client;
+pub mod peer_health;
 pub mod queue;
 pub mod recovery;
+pub mod rpc_circuit_breaker;
 pub mod rust_sync_node;
 pub mod startup;
 pub mod sync;
 pub mod sync_controller;
+pub mod sync_metrics;
 pub mod transition;
 pub mod tx_submitter;
+
+#[cfg(test)]
+mod epoch_transition_tests;
 
 /// Node operation modes
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1258,7 +1264,7 @@ impl ConsensusNode {
 
         let socket_path = std::path::PathBuf::from(&config.executor_receive_socket_path)
             .parent()
-            .unwrap()
+            .unwrap_or_else(|| std::path::Path::new("/tmp"))
             .join(format!("metanode-notification-{}.sock", config.node_id));
         let sender = self.epoch_transition_sender.clone();
 

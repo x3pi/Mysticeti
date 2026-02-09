@@ -454,8 +454,6 @@ impl CommitteeSource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn test_committee_source_local_only() {
         // Test with empty peer list - should use local
