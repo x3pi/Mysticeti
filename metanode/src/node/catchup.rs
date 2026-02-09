@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+use crate::network::peer_rpc::query_peer_epochs_network;
 use crate::node::executor_client::ExecutorClient;
 
 /// State of catchup process
@@ -42,8 +43,6 @@ pub struct SyncStatus {
     pub go_epoch: u64,
     /// Last executed block from Go
     pub go_last_block: u64,
-    /// Local epoch
-
     /// Whether epoch matches
     pub epoch_match: bool,
     /// Commit gap (how many commits behind)
@@ -60,10 +59,10 @@ pub struct SyncStatus {
 pub struct CatchupManager {
     /// Client to communicate with Go Master
     executor_client: Arc<ExecutorClient>,
-    /// List of peer Go Master sockets to query network state
-    peer_sockets: Vec<String>,
     /// Own Go Master socket (for fallback/identity)
-    own_socket: String,
+    _own_socket: String,
+    /// WAN peer RPC addresses (e.g., "192.168.1.100:19000")
+    peer_rpc_addresses: Vec<String>,
     /// Current catchup state
     state: RwLock<CatchupState>,
 }
@@ -75,13 +74,13 @@ impl CatchupManager {
     /// Create new catchup manager
     pub fn new(
         executor_client: Arc<ExecutorClient>,
-        peer_sockets: Vec<String>,
         own_socket: String,
+        peer_rpc_addresses: Vec<String>,
     ) -> Self {
         Self {
             executor_client,
-            peer_sockets,
-            own_socket,
+            _own_socket: own_socket,
+            peer_rpc_addresses,
             state: RwLock::new(CatchupState::Initializing),
         }
     }
@@ -109,14 +108,23 @@ impl CatchupManager {
             }
         };
 
-        // 2. Get Network State from Peers
-        // If we have peers, query them to find the true "tip" of the chain
-        let (network_epoch, network_block, _best_peer) = if !self.peer_sockets.is_empty() {
-            match query_peer_epochs(&self.peer_sockets, &self.own_socket).await {
-                Ok(res) => res,
+        // 2. Get Network State from Peers (TCP-based only)
+        let (network_epoch, network_block, _best_peer) = if !self.peer_rpc_addresses.is_empty() {
+            info!(
+                "🌐 [CATCHUP] Using WAN peer discovery ({} peers configured)",
+                self.peer_rpc_addresses.len()
+            );
+            match query_peer_epochs_network(&self.peer_rpc_addresses).await {
+                Ok(res) => {
+                    info!(
+                        "✅ [CATCHUP] WAN peer query success: epoch={}, block={}, peer={}",
+                        res.0, res.1, res.2
+                    );
+                    res
+                }
                 Err(e) => {
                     warn!(
-                        "⚠️ [CATCHUP] Failed to query peers, falling back to local state: {}",
+                        "⚠️ [CATCHUP] WAN peer query failed ({}), using local state",
                         e
                     );
                     (local_go_epoch, local_go_last_block, "local".to_string())
@@ -128,19 +136,10 @@ impl CatchupManager {
         };
 
         // 3. Compare States
-        // We use network_epoch because if we are behind, we want to catch up to THAT.
-        // If local_epoch != network_epoch, we are definitely not ready.
         let epoch_match = local_epoch == network_epoch;
 
         // Calculate gaps
-        let commit_gap = if epoch_match {
-            // We don't easily know "network commit index" here without more queries.
-            // But existing logic used local_go_last_block as "target" which was WRONG.
-            // Let's assume for now we care about BLOCKS.
-            0
-        } else {
-            u64::MAX
-        };
+        let commit_gap = if epoch_match { 0 } else { u64::MAX };
 
         let block_gap = if epoch_match {
             network_block.saturating_sub(local_go_last_block)
@@ -148,15 +147,12 @@ impl CatchupManager {
             u64::MAX
         };
 
-        // Ready condition:
-        // 1. Same Epoch
-        // 2. Block Gap is small (we have executed most blocks)
+        // Ready condition: Same Epoch + Block Gap is small
         let ready = epoch_match && block_gap <= BLOCK_CATCHUP_THRESHOLD;
 
         let status = SyncStatus {
-            go_epoch: network_epoch,            // Target is network epoch
-            go_last_block: local_go_last_block, // Local execution height
-
+            go_epoch: network_epoch,
+            go_last_block: local_go_last_block,
             epoch_match,
             commit_gap,
             block_gap,
@@ -180,7 +176,7 @@ impl CatchupManager {
             }
         } else if !ready {
             CatchupState::SyncingCommits {
-                target_commit: 0, // We rely on blocks now, commit target is vague
+                target_commit: 0,
                 current_commit: local_last_commit,
             }
         } else {
@@ -191,83 +187,4 @@ impl CatchupManager {
 
         Ok(status)
     }
-}
-
-/// Helper function to perform initial catchup at node startup
-/// Returns (synced_epoch, synced_last_block)
-
-/// Query multiple Go Master sockets and return the highest epoch found
-/// This is used when the local Go Master may have stale data (e.g., after restart)
-/// Returns (highest_epoch, last_block_for_that_epoch, socket_path_used)
-pub async fn query_peer_epochs(
-    peer_sockets: &[String],
-    own_socket: &str,
-) -> Result<(u64, u64, String)> {
-    info!(
-        "🔍 [PEER EPOCH] Querying {} peer Go Masters for epoch discovery...",
-        peer_sockets.len()
-    );
-
-    let mut best_epoch = 0u64;
-    let mut best_block = 0u64;
-    let mut best_socket = String::new(); // Don't default to own_socket
-
-    // Query each peer socket
-    for peer_socket in peer_sockets {
-        if peer_socket == own_socket {
-            continue; // Skip if same as own
-        }
-
-        let peer_client =
-            ExecutorClient::new(true, false, String::new(), peer_socket.clone(), None);
-        match peer_client.get_current_epoch().await {
-            Ok(epoch) => {
-                let block = peer_client.get_last_block_number().await.unwrap_or(0);
-                info!(
-                    "📊 [PEER EPOCH] Peer Go Master ({}): epoch={}, block={}",
-                    peer_socket, epoch, block
-                );
-
-                // Use this peer if:
-                // 1. It has higher epoch
-                // 2. Same epoch, but higher block
-                // 3. Same epoch/block (arbitrary, but ensures we pick a PEER)
-                if best_socket.is_empty()
-                    || epoch > best_epoch
-                    || (epoch == best_epoch && block > best_block)
-                {
-                    best_epoch = epoch;
-                    best_block = block;
-                    best_socket = peer_socket.clone();
-                    info!(
-                        "✅ [PEER EPOCH] New best peer candidate: epoch={} block={} from {}",
-                        epoch, block, peer_socket
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "⚠️ [PEER EPOCH] Failed to query peer Go Master ({}): {}",
-                    peer_socket, e
-                );
-            }
-        }
-    }
-
-    if best_socket.is_empty() {
-        // Fallback to local if no peers reachable
-        info!("⚠️ [PEER EPOCH] No reachable peers found. Falling back to local Go Master.");
-        let own_client =
-            ExecutorClient::new(true, false, String::new(), own_socket.to_string(), None);
-        let epoch = own_client.get_current_epoch().await?;
-        let block = own_client.get_last_block_number().await.unwrap_or(0);
-        return Ok((epoch, block, own_socket.to_string()));
-    }
-
-    info!(
-        "✅ [PEER EPOCH] Best peer found: {} (block={}) from {}",
-        best_epoch, best_block, best_socket
-    );
-
-    Ok((best_epoch, best_block, best_socket))
 }

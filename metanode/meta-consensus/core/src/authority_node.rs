@@ -5,16 +5,15 @@ use std::{sync::Arc, time::Instant};
 
 use consensus_config::{AuthorityIndex, Committee, NetworkKeyPair, Parameters, ProtocolKeyPair};
 use itertools::Itertools;
+use meta_protocol_config::ProtocolConfig;
 use mysten_metrics::spawn_logged_monitored_task;
 use parking_lot::RwLock;
 use prometheus::Registry;
-use meta_protocol_config::ProtocolConfig;
-use tokio::task::JoinHandle;
+use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::info;
 
 use crate::{
     adaptive_delay::AdaptiveDelayState,
-    CommitConsumerArgs,
     authority_service::AuthorityService,
     block_manager::BlockManager,
     block_verifier::SignedBlockVerifier,
@@ -27,8 +26,9 @@ use crate::{
     dag_state::DagState,
     leader_schedule::LeaderSchedule,
     leader_timeout::{LeaderTimeoutTask, LeaderTimeoutTaskHandle},
+    legacy_store::LegacyEpochStoreManager,
     metrics::initialise_metrics,
-    network::{NetworkManager, tonic_network::TonicManager},
+    network::{tonic_network::TonicManager, NetworkManager},
     proposed_block_handler::ProposedBlockHandler,
     round_prober::{RoundProber, RoundProberHandle},
     round_tracker::PeerRoundTracker,
@@ -38,19 +38,21 @@ use crate::{
     system_transaction_provider::SystemTransactionProvider,
     transaction::{TransactionClient, TransactionConsumer, TransactionVerifier},
     transaction_certifier::TransactionCertifier,
+    CommitConsumerArgs,
 };
 
 /// ConsensusAuthority is used by Sui to manage the lifetime of AuthorityNode.
 /// It hides the details of the implementation from the caller, MysticetiManager.
 #[allow(private_interfaces)]
 pub enum ConsensusAuthority {
-    WithTonic(AuthorityNode<TonicManager>),
+    WithTonic(Option<AuthorityNode<TonicManager>>),
 }
 
 impl ConsensusAuthority {
     pub async fn start(
         network_type: NetworkType,
         epoch_start_timestamp_ms: u64,
+        epoch_base_index: u64,
         own_index: AuthorityIndex,
         committee: Committee,
         parameters: Parameters,
@@ -67,11 +69,14 @@ impl ConsensusAuthority {
         // will initiate the process of amnesia recovery if that's enabled in the parameters.
         boot_counter: u64,
         system_transaction_provider: Option<Arc<dyn SystemTransactionProvider>>,
+        // Legacy store manager from ConsensusNode, to avoid re-opening locked RocksDB files
+        legacy_store_manager: Option<Arc<LegacyEpochStoreManager>>,
     ) -> Self {
         match network_type {
             NetworkType::Tonic => {
                 let authority = AuthorityNode::start(
                     epoch_start_timestamp_ms,
+                    epoch_base_index,
                     own_index,
                     committee,
                     parameters,
@@ -84,29 +89,72 @@ impl ConsensusAuthority {
                     registry,
                     boot_counter,
                     system_transaction_provider,
+                    legacy_store_manager,
                 )
                 .await;
-                Self::WithTonic(authority)
+                Self::WithTonic(Some(authority))
             }
         }
     }
 
-    pub async fn stop(self) {
-        match self {
-            Self::WithTonic(authority) => authority.stop().await,
+    pub async fn stop(mut self) {
+        match &mut self {
+            Self::WithTonic(authority_opt) => {
+                if let Some(authority) = authority_opt.take() {
+                    authority.stop().await;
+                }
+            }
         }
     }
 
     pub fn transaction_client(&self) -> Arc<TransactionClient> {
         match self {
-            Self::WithTonic(authority) => authority.transaction_client(),
+            Self::WithTonic(Some(authority)) => authority.transaction_client(),
+            Self::WithTonic(None) => panic!("Authority already stopped"),
         }
     }
 
     #[cfg(test)]
     fn context(&self) -> &Arc<Context> {
         match self {
-            Self::WithTonic(authority) => &authority.context,
+            Self::WithTonic(Some(authority)) => &authority.context,
+            Self::WithTonic(None) => panic!("Authority already stopped"),
+        }
+    }
+
+    /// Extract the store for use in LegacyEpochStoreManager.
+    /// This should be called before stop() to preserve the store for legacy sync.
+    pub fn take_store(&self) -> Arc<dyn crate::storage::Store> {
+        match self {
+            Self::WithTonic(Some(authority)) => authority.store.clone(),
+            Self::WithTonic(None) => panic!("Authority already stopped"),
+        }
+    }
+}
+
+// ============================================================================
+// DIAGNOSTIC: Drop implementation to track unexpected authority drops
+// ============================================================================
+impl Drop for ConsensusAuthority {
+    fn drop(&mut self) {
+        // Only log if authority is still present (unexpected drop)
+        // If stop() was called, it will be None
+        match self {
+            Self::WithTonic(Some(authority)) => {
+                let epoch = authority.context.committee.epoch();
+                tracing::warn!(
+                    "🔴 [CONSENSUS AUTHORITY DROP] Authority being dropped unexpectedly! epoch={}",
+                    epoch
+                );
+                // Capture backtrace to identify the source of the drop
+                let backtrace = std::backtrace::Backtrace::capture();
+                if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                    tracing::warn!("🔴 [CONSENSUS AUTHORITY DROP] Backtrace:\n{}", backtrace);
+                }
+            }
+            Self::WithTonic(None) => {
+                // Normal case - stop() was called
+            }
         }
     }
 }
@@ -124,6 +172,9 @@ where
     start_time: Instant,
     transaction_client: Arc<TransactionClient>,
     synchronizer: Arc<SynchronizerHandle>,
+    /// Store reference for potential extraction during epoch transition.
+    /// This allows the store to be kept open for legacy sync even after authority stops.
+    store: Arc<dyn crate::storage::Store>,
 
     commit_syncer_handle: CommitSyncerHandle,
     round_prober_handle: RoundProberHandle,
@@ -132,6 +183,11 @@ where
     core_thread_handle: CoreThreadHandle,
     subscriber: Subscriber<N::Client, AuthorityService<ChannelCoreThreadDispatcher>>,
     network_manager: N,
+    /// Keeper for broadcast sender to prevent channel from closing during async spawning.
+    /// This ensures the broadcast channel stays open until all components are fully initialized.
+    /// Without this, race conditions can cause ProposedBlockHandler to receive "channel closed" immediately.
+    #[allow(dead_code)]
+    broadcast_sender_keeper: broadcast::Sender<crate::block::ExtendedBlock>,
 }
 
 impl<N> AuthorityNode<N>
@@ -140,6 +196,7 @@ where
 {
     pub(crate) async fn start(
         epoch_start_timestamp_ms: u64,
+        epoch_base_index: u64,
         own_index: AuthorityIndex,
         committee: Committee,
         parameters: Parameters,
@@ -154,6 +211,9 @@ where
         registry: Registry,
         boot_counter: u64,
         system_transaction_provider: Option<Arc<dyn SystemTransactionProvider>>,
+        // Legacy store manager passed from ConsensusNode to avoid RocksDB lock conflicts
+        // during epoch transitions. If None, no legacy stores will be available.
+        existing_legacy_store_manager: Option<Arc<LegacyEpochStoreManager>>,
     ) -> Self {
         assert!(
             committee.is_valid_index(own_index),
@@ -180,10 +240,11 @@ where
         );
         info!("Consensus parameters: {:?}", parameters);
         info!("Consensus committee: {:?}", committee);
-        
+
         // Save min_round_delay before moving parameters into Context
         let min_round_delay_ms = parameters.min_round_delay.as_millis() as u64;
-        
+        let adaptive_delay_enabled = parameters.adaptive_delay_enabled;
+
         let context = Arc::new(Context::new(
             epoch_start_timestamp_ms,
             own_index,
@@ -212,6 +273,21 @@ where
 
         let (core_signals, signals_receivers) = CoreSignals::new(context.clone());
 
+        // CRITICAL FIX: Get the broadcast sender keeper IMMEDIATELY after CoreSignals creation
+        // and BEFORE any tasks are spawned. This prevents the broadcast channel from closing
+        // if Core is dropped before CoreThread starts, which would cause ProposedBlockHandler
+        // to exit immediately with "Broadcast channel CLOSED" error.
+        // The keeper must be obtained here because:
+        // 1. ProposedBlockHandler is spawned at line ~247 with signals_receivers.block_broadcast_receiver()
+        // 2. The receiver subscribes to the broadcast channel
+        // 3. If all strong senders are dropped before the task runs, the channel closes
+        // 4. Holding the keeper here ensures at least one strong sender survives
+        let broadcast_sender_keeper = signals_receivers.broadcast_sender_keeper();
+        info!(
+            "📡 [AUTHORITY NODE] Broadcast sender keeper obtained, receiver_count={}, total_senders_should_be=3",
+            broadcast_sender_keeper.receiver_count()
+        );
+
         let mut network_manager = N::new(context.clone(), network_keypair);
         let network_client = network_manager.client();
 
@@ -237,6 +313,10 @@ where
             transaction_certifier.clone(),
         );
 
+        info!(
+            "📡 [AUTHORITY NODE] About to spawn ProposedBlockHandler, keeper receiver_count={}",
+            broadcast_sender_keeper.receiver_count()
+        );
         let proposed_block_handler =
             spawn_logged_monitored_task!(proposed_block_handler.run(), "proposed_block_handler");
 
@@ -262,18 +342,21 @@ where
             dag_state.clone(),
             transaction_certifier.clone(),
             leader_schedule.clone(),
+            epoch_base_index,
         )
         .await;
 
         let round_tracker = Arc::new(RwLock::new(PeerRoundTracker::new(context.clone())));
 
-        // Create adaptive delay state (enabled by default with base delay from min_round_delay)
-        // TODO: Make this configurable from NodeConfig (currently using default: enabled, base_delay = min_round_delay)
+        // Create adaptive delay state
         let adaptive_delay_state = Arc::new(AdaptiveDelayState::new(
             min_round_delay_ms,
-            true, // enabled by default - can be configured via NodeConfig in the future
+            adaptive_delay_enabled,
         ));
-        info!("Adaptive delay enabled: base_delay={}ms", min_round_delay_ms);
+        info!(
+            "Adaptive delay enabled: base_delay={}ms",
+            min_round_delay_ms
+        );
 
         let core = Core::new(
             context.clone(),
@@ -332,6 +415,22 @@ where
         )
         .start();
 
+        // Use existing LegacyEpochStoreManager if passed, otherwise None.
+        // CRITICAL: Do NOT create new LegacyEpochStoreManager here during epoch transitions!
+        // The old epoch's RocksDB may still be locked by the same process.
+        // Instead, the LegacyEpochStoreManager is managed by ConsensusNode and stores are
+        // added during epoch transitions after the old authority is stopped.
+        let legacy_store_manager = if let Some(mgr) = existing_legacy_store_manager {
+            info!(
+                "✅ [AUTHORITY START] Using existing LegacyEpochStoreManager with {} epochs",
+                mgr.store_count()
+            );
+            Some(mgr)
+        } else {
+            info!("ℹ️ [AUTHORITY START] No existing LegacyEpochStoreManager provided");
+            None
+        };
+
         let network_service = Arc::new(AuthorityService::new(
             context.clone(),
             block_verifier,
@@ -342,8 +441,9 @@ where
             signals_receivers.block_broadcast_receiver(),
             transaction_certifier,
             dag_state.clone(),
-            store,
-            None,
+            store.clone(),
+            None,                 // epoch_change_processor
+            legacy_store_manager, // Pass initialized manager
         ));
 
         let subscriber = {
@@ -364,7 +464,7 @@ where
         network_manager.install_service(network_service).await;
 
         info!(
-            "Consensus authority started, took {:?}",
+            "✅ [AUTHORITY NODE] Consensus authority started, took {:?}",
             start_time.elapsed()
         );
 
@@ -373,6 +473,7 @@ where
             start_time,
             transaction_client: Arc::new(tx_client),
             synchronizer,
+            store,
             commit_syncer_handle,
             round_prober_handle,
             proposed_block_handler,
@@ -380,6 +481,7 @@ where
             core_thread_handle,
             subscriber,
             network_manager,
+            broadcast_sender_keeper,
         }
     }
 
@@ -396,10 +498,7 @@ where
             }
             // Cancellation can happen during an epoch transition where we intentionally abort in-flight tasks.
             // Keep it at DEBUG to avoid alarming operators.
-            tracing::debug!(
-                "Synchronizer stop returned error during shutdown: {:?}",
-                e
-            );
+            tracing::debug!("Synchronizer stop returned error during shutdown: {:?}", e);
         };
         self.commit_syncer_handle.stop().await;
         self.round_prober_handle.stop().await;
@@ -433,21 +532,21 @@ mod tests {
         time::Duration,
     };
 
-    use consensus_config::{Parameters, local_committee_and_keys};
-    use mysten_metrics::RegistryService;
+    use consensus_config::{local_committee_and_keys, Parameters};
+    use meta_protocol_config::ProtocolConfig;
     use mysten_metrics::monitored_mpsc::UnboundedReceiver;
+    use mysten_metrics::RegistryService;
     use prometheus::Registry;
     use rstest::rstest;
-    use meta_protocol_config::ProtocolConfig;
     use tempfile::TempDir;
     use tokio::time::{sleep, timeout};
     use typed_store::DBMetrics;
 
     use super::*;
     use crate::{
-        CommittedSubDag,
         block::{BlockAPI as _, CertifiedBlocksOutput, GENESIS_ROUND},
         transaction::NoopTransactionVerifier,
+        CommittedSubDag,
     };
 
     #[rstest]
@@ -474,6 +573,7 @@ mod tests {
         let authority = ConsensusAuthority::start(
             network_type,
             0,
+            0,
             own_index,
             committee,
             parameters,
@@ -485,6 +585,8 @@ mod tests {
             commit_consumer,
             registry,
             0,
+            None,
+            None, // legacy_store_manager
         )
         .await;
 
@@ -851,6 +953,7 @@ mod tests {
         let authority = ConsensusAuthority::start(
             network_type,
             0,
+            0,
             index,
             committee,
             parameters,
@@ -862,6 +965,8 @@ mod tests {
             commit_consumer,
             registry,
             boot_counter,
+            None,
+            None, // legacy_store_manager
         )
         .await;
 

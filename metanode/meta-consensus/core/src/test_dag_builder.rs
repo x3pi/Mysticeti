@@ -10,16 +10,16 @@ use std::{
 use consensus_config::AuthorityIndex;
 use consensus_types::block::{BlockDigest, BlockRef, BlockTimestampMs, Round, TransactionIndex};
 use parking_lot::RwLock;
-use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom, thread_rng};
+use rand::{rngs::StdRng, seq::SliceRandom, thread_rng, Rng, SeedableRng};
 
 use crate::{
-    CommitRef, CommittedSubDag, Transaction,
-    block::{BlockAPI, BlockTransactionVotes, Slot, TestBlock, VerifiedBlock, genesis_blocks},
+    block::{genesis_blocks, BlockAPI, BlockTransactionVotes, Slot, TestBlock, VerifiedBlock},
     commit::{CertifiedCommit, CommitDigest, TrustedCommit},
     context::Context,
     dag_state::DagState,
     leader_schedule::{LeaderSchedule, LeaderSwapTable},
     linearizer::{BlockStoreAPI, Linearizer},
+    CommitRef, CommittedSubDag, Transaction,
 };
 
 /// DagBuilder API
@@ -240,6 +240,7 @@ impl DagBuilder {
                     self.last_committed_rounds[block.author()].max(block.round());
             }
 
+            let global_exec_index = (last_commit_ref.index + 1) as u64;
             let commit = TrustedCommit::new_for_test(
                 last_commit_ref.index + 1,
                 last_commit_ref.digest,
@@ -249,6 +250,7 @@ impl DagBuilder {
                     .iter()
                     .map(|block| block.reference())
                     .collect::<Vec<_>>(),
+                global_exec_index,
             );
 
             last_commit_ref = commit.reference();
@@ -258,6 +260,7 @@ impl DagBuilder {
                 to_commit,
                 last_timestamp_ms,
                 commit.reference(),
+                global_exec_index,
             );
 
             self.committed_sub_dags.push((sub_dag, commit));

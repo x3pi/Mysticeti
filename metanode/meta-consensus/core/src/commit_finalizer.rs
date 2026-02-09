@@ -9,20 +9,20 @@ use std::{
 use consensus_config::Stake;
 use consensus_types::block::{BlockRef, Round, TransactionIndex};
 use mysten_metrics::{
-    monitored_mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    monitored_mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     monitored_scope, spawn_logged_monitored_task,
 };
 use parking_lot::RwLock;
 use tokio::task::JoinSet;
 
 use crate::{
-    BlockAPI, CommitIndex, CommittedSubDag, VerifiedBlock,
     commit::DEFAULT_WAVE_LENGTH,
     context::Context,
     dag_state::DagState,
     error::{ConsensusError, ConsensusResult},
     stake_aggregator::{QuorumThreshold, StakeAggregator},
     transaction_certifier::TransactionCertifier,
+    BlockAPI, CommitIndex, CommittedSubDag, VerifiedBlock,
 };
 
 /// For transaction T committed at leader round R, when a new leader at round >= R + INDIRECT_REJECT_DEPTH
@@ -78,6 +78,10 @@ pub struct CommitFinalizer {
     pending_commits: VecDeque<CommitState>,
     // Blocks in the pending commits.
     blocks: Arc<RwLock<BTreeMap<BlockRef, RwLock<BlockState>>>>,
+    // Keeper for internal channel sender to prevent race condition.
+    // This ensures the internal channel stays open as long as the CommitFinalizer task is running.
+    #[allow(dead_code)]
+    internal_sender_keeper: Option<UnboundedSender<CommittedSubDag>>,
 }
 
 impl CommitFinalizer {
@@ -95,6 +99,7 @@ impl CommitFinalizer {
             last_processed_commit: None,
             pending_commits: VecDeque::new(),
             blocks: Arc::new(RwLock::new(BTreeMap::new())),
+            internal_sender_keeper: None,
         }
     }
 
@@ -104,14 +109,18 @@ impl CommitFinalizer {
         transaction_certifier: TransactionCertifier,
         commit_sender: UnboundedSender<CommittedSubDag>,
     ) -> CommitFinalizerHandle {
-        let processor = Self::new(context, dag_state, transaction_certifier, commit_sender);
+        let mut processor = Self::new(context, dag_state, transaction_certifier, commit_sender);
         let (sender, receiver) = unbounded_channel("consensus_commit_finalizer");
+        // Clone the sender and store it in the processor to prevent race condition.
+        // This ensures the internal channel stays open until the task starts running.
+        processor.internal_sender_keeper = Some(sender.clone());
         let _handle =
             spawn_logged_monitored_task!(processor.run(receiver), "consensus_commit_finalizer");
         CommitFinalizerHandle { sender }
     }
 
     async fn run(mut self, mut receiver: UnboundedReceiver<CommittedSubDag>) {
+        tracing::info!("🚀 [COMMIT FINALIZER] RUN LOOP STARTED");
         while let Some(committed_sub_dag) = receiver.recv().await {
             let already_finalized = !self.context.protocol_config.mysticeti_fastpath()
                 || committed_sub_dag.recovered_rejected_transactions;
@@ -150,6 +159,7 @@ impl CommitFinalizer {
                 }
             }
         }
+        tracing::info!("❌ [COMMIT FINALIZER] RUN LOOP ENDED (Receiver closed)");
     }
 
     pub async fn process_commit(
@@ -891,9 +901,9 @@ mod tests {
     use parking_lot::RwLock;
 
     use crate::{
-        TestBlock, VerifiedBlock, block::BlockTransactionVotes, block_verifier::NoopBlockVerifier,
-        dag_state::DagState, linearizer::Linearizer, storage::mem_store::MemStore,
-        test_dag_builder::DagBuilder,
+        block::BlockTransactionVotes, block_verifier::NoopBlockVerifier, dag_state::DagState,
+        linearizer::Linearizer, storage::mem_store::MemStore, test_dag_builder::DagBuilder,
+        TestBlock, VerifiedBlock,
     };
 
     use super::*;

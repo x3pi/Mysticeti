@@ -9,28 +9,31 @@ use std::{
 use bytes::Bytes;
 use consensus_config::AuthorityIndex;
 use consensus_types::block::{BlockRef, Round};
-use futures::{StreamExt as _, stream::FuturesUnordered};
+use futures::{stream::FuturesUnordered, StreamExt as _};
 use itertools::Itertools as _;
+use meta_macros::fail_point_async;
 use mysten_common::debug_fatal;
 use mysten_metrics::{
     monitored_future,
-    monitored_mpsc::{Receiver, Sender, channel},
+    monitored_mpsc::{channel, Receiver, Sender},
     monitored_scope,
 };
 use parking_lot::{Mutex, RwLock};
 use rand::{prelude::SliceRandom as _, rngs::ThreadRng};
-use meta_macros::fail_point_async;
 use tap::TapFallible;
 use tokio::{
     runtime::Handle,
     sync::{mpsc::error::TrySendError, oneshot},
     task::{JoinError, JoinSet},
-    time::{Instant, sleep, sleep_until, timeout},
+    time::{sleep, sleep_until, timeout, Instant},
 };
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    BlockAPI,
+    authority_service::COMMIT_LAG_MULTIPLIER, core_thread::CoreThreadDispatcher,
+    transaction_certifier::TransactionCertifier,
+};
+use crate::{
     block::{SignedBlock, VerifiedBlock},
     block_verifier::BlockVerifier,
     commit_vote_monitor::CommitVoteMonitor,
@@ -38,10 +41,7 @@ use crate::{
     dag_state::DagState,
     error::{ConsensusError, ConsensusResult},
     network::NetworkClient,
-};
-use crate::{
-    authority_service::COMMIT_LAG_MULTIPLIER, core_thread::CoreThreadDispatcher,
-    transaction_certifier::TransactionCertifier,
+    BlockAPI,
 };
 
 /// The number of concurrent fetch blocks requests per authority
@@ -1181,7 +1181,10 @@ mod tests {
 
     use crate::commit::{CommitVote, TrustedCommit};
     use crate::{
-        CommitDigest, CommitIndex,
+        authority_service::COMMIT_LAG_MULTIPLIER, core_thread::MockCoreThreadDispatcher,
+        transaction_certifier::TransactionCertifier,
+    };
+    use crate::{
         block::{TestBlock, VerifiedBlock},
         block_verifier::NoopBlockVerifier,
         commit::CommitRange,
@@ -1193,12 +1196,9 @@ mod tests {
         network::{BlockStream, NetworkClient},
         storage::mem_store::MemStore,
         synchronizer::{
-            FETCH_BLOCKS_CONCURRENCY, FETCH_REQUEST_TIMEOUT, InflightBlocksMap, Synchronizer,
+            InflightBlocksMap, Synchronizer, FETCH_BLOCKS_CONCURRENCY, FETCH_REQUEST_TIMEOUT,
         },
-    };
-    use crate::{
-        authority_service::COMMIT_LAG_MULTIPLIER, core_thread::MockCoreThreadDispatcher,
-        transaction_certifier::TransactionCertifier,
+        CommitDigest, CommitIndex,
     };
 
     type FetchRequestKey = (Vec<BlockRef>, AuthorityIndex);
@@ -1611,13 +1611,11 @@ mod tests {
         assert_eq!(added_blocks, expected_blocks);
 
         // AND missing blocks should have been consumed by the stub
-        assert!(
-            core_dispatcher
-                .get_missing_blocks()
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(core_dispatcher
+            .get_missing_blocks()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1721,8 +1719,14 @@ mod tests {
         {
             let mut d = dag_state.write();
             for index in 1..=commit_index {
-                let commit =
-                    TrustedCommit::new_for_test(index, CommitDigest::MIN, 0, BlockRef::MIN, vec![]);
+                let commit = TrustedCommit::new_for_test(
+                    index,
+                    CommitDigest::MIN,
+                    0,
+                    BlockRef::MIN,
+                    vec![],
+                    index as u64,
+                );
 
                 d.add_commit(commit);
             }

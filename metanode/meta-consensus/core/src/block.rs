@@ -421,7 +421,7 @@ impl fmt::Debug for Slot {
 /// Note: `BlockDigest` is computed over this struct, so any added field (without `#[serde(skip)]`)
 /// will affect the values of `BlockDigest` and `BlockRef`.
 #[derive(Deserialize, Serialize)]
-pub(crate) struct SignedBlock {
+pub struct SignedBlock {
     inner: Block,
     signature: Bytes,
 }
@@ -545,7 +545,7 @@ pub struct VerifiedBlock {
 
 impl VerifiedBlock {
     /// Creates VerifiedBlock from a verified SignedBlock and its serialized bytes.
-    pub(crate) fn new_verified(signed_block: SignedBlock, serialized: Bytes) -> Self {
+    pub fn new_verified(signed_block: SignedBlock, serialized: Bytes) -> Self {
         let digest = Self::compute_digest(&serialized);
         VerifiedBlock {
             block: Arc::new(signed_block),
@@ -646,23 +646,38 @@ pub(crate) struct ExtendedBlock {
 /// Generates the genesis blocks for the current Committee.
 /// The blocks are returned in authority index order.
 pub(crate) fn genesis_blocks(context: &Context) -> Vec<VerifiedBlock> {
-    context
-        .committee
-        .authorities()
-        .map(|(authority_index, _)| {
-            let block = if context.protocol_config.mysticeti_fastpath() {
-                Block::V2(BlockV2::genesis_block(context, authority_index))
-            } else {
-                Block::V1(BlockV1::genesis_block(context, authority_index))
-            };
-            let signed_block = SignedBlock::new_genesis(block);
-            let serialized = signed_block
-                .serialize()
-                .expect("Genesis block serialization failed.");
-            // Unnecessary to verify genesis blocks.
-            VerifiedBlock::new_verified(signed_block, serialized)
-        })
-        .collect::<Vec<VerifiedBlock>>()
+    tracing::info!(
+        "🛠️ [GENESIS DEBUG] Generating genesis blocks for epoch {} with timestamp {}ms. Committee size: {}",
+        context.committee.epoch(),
+        context.epoch_start_timestamp_ms,
+        context.committee.size()
+    );
+
+    let mut blocks = Vec::with_capacity(context.committee.size());
+    for (authority_index, authority) in context.committee.authorities() {
+        let block = if context.protocol_config.mysticeti_fastpath() {
+            Block::V2(BlockV2::genesis_block(context, authority_index))
+        } else {
+            Block::V1(BlockV1::genesis_block(context, authority_index))
+        };
+        let signed_block = SignedBlock::new_genesis(block);
+        let serialized = signed_block
+            .serialize()
+            .expect("Genesis block serialization failed.");
+
+        let verified_block = VerifiedBlock::new_verified(signed_block, serialized);
+
+        // Log authority key prefix for comparison
+        tracing::info!(
+            "🛠️ [GENESIS DEBUG] Generated B0 for Auth {:?} (KeyPrefix: {:?}): Hash={:?}, Timestamp={}ms",
+            authority_index,
+            &authority.authority_key.to_bytes()[..4],
+            verified_block.reference().digest,
+            context.epoch_start_timestamp_ms
+        );
+        blocks.push(verified_block);
+    }
+    blocks
 }
 
 /// A block certified by consensus for fast path execution.
@@ -772,7 +787,7 @@ mod tests {
     use fastcrypto::error::FastCryptoError;
 
     use crate::{
-        block::{BlockAPI, SignedBlock, TestBlock, genesis_blocks},
+        block::{genesis_blocks, BlockAPI, SignedBlock, TestBlock},
         context::Context,
         error::ConsensusError,
     };

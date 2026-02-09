@@ -6,14 +6,14 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::{
-    CommitIndex,
     block::{BlockAPI as _, VerifiedBlock},
     commit::GENESIS_COMMIT_INDEX,
     context::Context,
+    CommitIndex,
 };
 
 /// Monitors the progress of consensus commits across the network.
-pub(crate) struct CommitVoteMonitor {
+pub struct CommitVoteMonitor {
     context: Arc<Context>,
     // Highest commit index voted by each authority.
     highest_voted_commits: Mutex<Vec<CommitIndex>>,

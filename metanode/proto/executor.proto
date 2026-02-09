@@ -33,5 +33,13 @@ message CommittedEpochData {
     // Go Master MUST use this timestamp for BlockHeader instead of time.Now()
     // Unit: milliseconds since Unix epoch
     uint64 commit_timestamp_ms = 5;
+    // CRITICAL FORK-SAFETY: Leader authority index in committee (0-based)
+    // Go Master MUST lookup validator address from committee using this index for BlockHeader.LeaderAddress
+    // This ensures all nodes create blocks with same leader = same block hash
+    uint32 leader_author_index = 6;
+    // CRITICAL FORK-SAFETY: Leader validator address (20 bytes Ethereum address)
+    // Sent directly from Rust to ensure deterministic leader assignment
+    // Go MUST use this address directly instead of lookup when present
+    bytes leader_address = 7;
 }
 

@@ -11,7 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use consensus_config::{AuthorityIndex, DIGEST_LENGTH, DefaultHashFunction};
+use consensus_config::{AuthorityIndex, DefaultHashFunction, DIGEST_LENGTH};
 use consensus_types::block::{BlockRef, BlockTimestampMs, Round, TransactionIndex};
 use enum_dispatch::enum_dispatch;
 use fastcrypto::hash::{Digest, HashFunction as _};
@@ -22,7 +22,7 @@ use crate::{
     block::{BlockAPI, Slot, VerifiedBlock},
     leader_scoring::ReputationScores,
     storage::Store,
-    system_transaction::{SystemTransaction, extract_system_transaction},
+    system_transaction::{extract_system_transaction, SystemTransaction},
 };
 
 /// Index of a commit among all consensus commits.
@@ -70,6 +70,7 @@ impl Commit {
         timestamp_ms: BlockTimestampMs,
         leader: BlockRef,
         blocks: Vec<BlockRef>,
+        global_exec_index: u64,
     ) -> Self {
         Commit::V1(CommitV1 {
             index,
@@ -77,6 +78,7 @@ impl Commit {
             timestamp_ms,
             leader,
             blocks,
+            global_exec_index,
         })
     }
 
@@ -95,6 +97,8 @@ pub trait CommitAPI {
     fn timestamp_ms(&self) -> BlockTimestampMs;
     fn leader(&self) -> BlockRef;
     fn blocks(&self) -> &[BlockRef];
+    /// Global execution index - agreed upon by consensus to prevent fork
+    fn global_exec_index(&self) -> u64;
 }
 
 /// Specifies one consensus commit.
@@ -113,6 +117,9 @@ pub struct CommitV1 {
     leader: BlockRef,
     /// Refs to committed blocks, in the commit order.
     blocks: Vec<BlockRef>,
+    /// Global execution index - the execution layer block number.
+    /// This is agreed upon by consensus to prevent forks.
+    global_exec_index: u64,
 }
 
 impl CommitAPI for CommitV1 {
@@ -138,6 +145,10 @@ impl CommitAPI for CommitV1 {
 
     fn blocks(&self) -> &[BlockRef] {
         &self.blocks
+    }
+
+    fn global_exec_index(&self) -> u64 {
+        self.global_exec_index
     }
 }
 
@@ -171,8 +182,16 @@ impl TrustedCommit {
         timestamp_ms: BlockTimestampMs,
         leader: BlockRef,
         blocks: Vec<BlockRef>,
+        global_exec_index: u64,
     ) -> Self {
-        let commit = Commit::new(index, previous_digest, timestamp_ms, leader, blocks);
+        let commit = Commit::new(
+            index,
+            previous_digest,
+            timestamp_ms,
+            leader,
+            blocks,
+            global_exec_index,
+        );
         let serialized = commit.serialize().unwrap();
         Self::new_trusted(commit, serialized)
     }
@@ -181,6 +200,8 @@ impl TrustedCommit {
         CommitRef {
             index: self.index(),
             digest: self.digest(),
+            global_exec_index: self.global_exec_index(), // NEW: propagate from Commit
+            epoch: 0, // Epoch not stored in Commit struct - will be set by caller if needed
         }
     }
 
@@ -307,27 +328,77 @@ impl fmt::Debug for CommitDigest {
 }
 
 /// Uniquely identifies a commit with its index and digest.
+/// Extended with global_exec_index and epoch for cross-epoch querying.
 #[derive(Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CommitRef {
+    /// Epoch-local commit index (within a single epoch)
     pub index: CommitIndex,
+    /// Commit digest for integrity verification
     pub digest: CommitDigest,
+    /// Global execution index - unique across all epochs
+    /// Corresponds to the execution layer block number
+    #[serde(default)]
+    pub global_exec_index: u64,
+    /// Epoch number this commit belongs to
+    #[serde(default)]
+    pub epoch: u32,
 }
 
 impl CommitRef {
+    /// Legacy constructor - creates CommitRef without global context
+    /// Used for backward compatibility
     pub fn new(index: CommitIndex, digest: CommitDigest) -> Self {
-        Self { index, digest }
+        Self {
+            index,
+            digest,
+            global_exec_index: 0,
+            epoch: 0,
+        }
+    }
+
+    /// Full constructor with global execution index and epoch
+    /// Recommended for new code - enables cross-epoch querying
+    pub fn new_with_global(
+        index: CommitIndex,
+        digest: CommitDigest,
+        global_exec_index: u64,
+        epoch: u32,
+    ) -> Self {
+        Self {
+            index,
+            digest,
+            global_exec_index,
+            epoch,
+        }
+    }
+
+    /// Check if this CommitRef has global context (non-zero global_exec_index)
+    pub fn has_global_context(&self) -> bool {
+        self.global_exec_index > 0
     }
 }
 
 impl fmt::Display for CommitRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "C{}({})", self.index, self.digest)
+        if self.global_exec_index > 0 {
+            write!(
+                f,
+                "C{}@G{}({})",
+                self.index, self.global_exec_index, self.digest
+            )
+        } else {
+            write!(f, "C{}({})", self.index, self.digest)
+        }
     }
 }
 
 impl fmt::Debug for CommitRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "C{}({:?})", self.index, self.digest)
+        write!(
+            f,
+            "C{}[E{},G{}]({:?})",
+            self.index, self.epoch, self.global_exec_index, self.digest
+        )
     }
 }
 
@@ -354,6 +425,9 @@ pub struct CommittedSubDag {
     /// First commit after genesis has a index of 1, then every next commit has a
     /// index incremented by 1.
     pub commit_ref: CommitRef,
+    /// Global execution index - agreed upon by consensus.
+    /// This is the execution layer block number and MUST NOT be recalculated locally.
+    pub global_exec_index: u64,
 
     /// Set by CommitObserver.
     ///
@@ -389,12 +463,14 @@ impl CommittedSubDag {
         blocks: Vec<VerifiedBlock>,
         timestamp_ms: BlockTimestampMs,
         commit_ref: CommitRef,
+        global_exec_index: u64,
     ) -> Self {
         Self {
             leader,
             blocks,
             timestamp_ms,
             commit_ref,
+            global_exec_index,
             decided_with_local_blocks: true,
             recovered_rejected_transactions: false,
             reputation_scores_desc: vec![],
@@ -406,7 +482,7 @@ impl CommittedSubDag {
     /// Returns a vector of (block_ref, system_transaction) tuples
     pub fn extract_system_transactions(&self) -> Vec<(BlockRef, SystemTransaction)> {
         let mut system_txs = Vec::new();
-        
+
         for block in &self.blocks {
             for tx in block.transactions() {
                 if let Some(system_tx) = extract_system_transaction(tx.data()) {
@@ -414,7 +490,7 @@ impl CommittedSubDag {
                 }
             }
         }
-        
+
         system_txs
     }
 
@@ -519,6 +595,7 @@ pub fn load_committed_subdag_from_store(
         blocks,
         commit.timestamp_ms(),
         commit.reference(),
+        commit.global_exec_index(),
     );
 
     subdag.reputation_scores_desc = reputation_scores_desc;
@@ -738,7 +815,7 @@ mod tests {
     use crate::{
         block::TestBlock,
         context::Context,
-        storage::{WriteBatch, mem_store::MemStore},
+        storage::{mem_store::MemStore, WriteBatch},
     };
 
     #[tokio::test]
@@ -803,6 +880,7 @@ mod tests {
             leader_block.timestamp_ms(),
             leader_ref,
             blocks.clone(),
+            commit_index as u64, // global_exec_index for test
         );
         let subdag = load_committed_subdag_from_store(store.as_ref(), commit.clone(), vec![]);
         assert_eq!(subdag.leader, leader_ref);

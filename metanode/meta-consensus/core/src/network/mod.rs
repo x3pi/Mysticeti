@@ -43,13 +43,13 @@ mod network_tests;
 #[cfg(test)]
 pub(crate) mod test_network;
 #[cfg(not(msim))]
-pub(crate) mod tonic_network;
+pub mod tonic_network;
 #[cfg(msim)]
 pub mod tonic_network;
 mod tonic_tls;
 
 /// A stream of serialized filtered blocks returned over the network.
-pub(crate) type BlockStream = Pin<Box<dyn Stream<Item = ExtendedSerializedBlock> + Send>>;
+pub type BlockStream = Pin<Box<dyn Stream<Item = ExtendedSerializedBlock> + Send>>;
 
 /// Network client for communicating with peers.
 ///
@@ -57,7 +57,7 @@ pub(crate) type BlockStream = Pin<Box<dyn Stream<Item = ExtendedSerializedBlock>
 /// But it is up to the server implementation if the timeout is honored.
 /// - To bound server resources, server should implement own timeout for incoming requests.
 #[async_trait]
-pub(crate) trait NetworkClient: Send + Sync + Sized + 'static {
+pub trait NetworkClient: Send + Sync + Sized + 'static {
     /// Subscribes to blocks from a peer after last_received round.
     async fn subscribe_blocks(
         &self,
@@ -89,6 +89,17 @@ pub(crate) trait NetworkClient: Send + Sync + Sized + 'static {
         commit_range: CommitRange,
         timeout: Duration,
     ) -> ConsensusResult<(Vec<Bytes>, Vec<Bytes>)>;
+
+    /// Fetches commits by global execution index range.
+    /// This is epoch-agnostic and will return commits across multiple epochs.
+    /// Returns commits with their global execution indices and epoch metadata.
+    async fn fetch_commits_by_global_range(
+        &self,
+        peer: AuthorityIndex,
+        start_global_index: u64,
+        end_global_index: u64,
+        timeout: Duration,
+    ) -> ConsensusResult<Vec<crate::network::tonic_network::GlobalCommitInfo>>;
 
     /// Fetches the latest block from `peer` for the requested `authorities`. The latest blocks
     /// are returned in the serialised format of `SignedBlocks`. The method can return multiple
@@ -175,6 +186,15 @@ pub(crate) trait NetworkService: Send + Sync + 'static {
         commit_range: CommitRange,
     ) -> ConsensusResult<(Vec<TrustedCommit>, Vec<VerifiedBlock>)>;
 
+    /// Handles the request to fetch commits by global execution index range.
+    /// Searches across all epochs to find commits in the requested global range.
+    async fn handle_fetch_commits_by_global_range(
+        &self,
+        peer: AuthorityIndex,
+        start_global_index: u64,
+        end_global_index: u64,
+    ) -> ConsensusResult<Vec<crate::network::tonic_network::GlobalCommitInfo>>;
+
     /// Handles the request to fetch the latest block for the provided `authorities`.
     async fn handle_fetch_latest_blocks(
         &self,
@@ -226,10 +246,10 @@ where
 
 /// Serialized block with extended information from the proposing authority.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct ExtendedSerializedBlock {
-    pub(crate) block: Bytes,
+pub struct ExtendedSerializedBlock {
+    pub block: Bytes,
     // Serialized BlockRefs that are excluded from the blocks ancestors.
-    pub(crate) excluded_ancestors: Vec<Vec<u8>>,
+    pub excluded_ancestors: Vec<Vec<u8>>,
 }
 
 impl From<ExtendedBlock> for ExtendedSerializedBlock {

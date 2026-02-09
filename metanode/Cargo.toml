@@ -1,6 +1,6 @@
 [package]
 name = "metanode-consensus"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 authors = ["MetaNode Team"]
 license = "Apache-2.0"
@@ -14,6 +14,7 @@ consensus-types = { path = "meta-consensus/types" }
 # Async runtime
 tokio = "=1.47.1"
 tokio-stream = { version = "0.1.14", features = ["sync", "net"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 
 # Serialization
 serde = { version = "1.0.144", features = ["derive", "rc"] }
@@ -55,6 +56,9 @@ hostname = "0.3.1"
 async-trait = "0.1.80"
 prost = "0.14.1"
 sha3 = "0.10.6"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+socket2 = "0.5"  # For TCP socket keepalive support
+
 
 # CLI
 clap = { version = "4.4", features = ["derive", "wrap_help"] }

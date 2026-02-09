@@ -18,16 +18,16 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, trace};
 
 use crate::{
-    CommittedSubDag,
-    block::{BlockAPI, GENESIS_ROUND, Slot, VerifiedBlock, genesis_blocks},
+    block::{genesis_blocks, BlockAPI, Slot, VerifiedBlock, GENESIS_ROUND},
     commit::{
-        CommitAPI as _, CommitDigest, CommitIndex, CommitInfo, CommitRef, CommitVote,
-        GENESIS_COMMIT_INDEX, TrustedCommit, load_committed_subdag_from_store,
+        load_committed_subdag_from_store, CommitAPI as _, CommitDigest, CommitIndex, CommitInfo,
+        CommitRef, CommitVote, TrustedCommit, GENESIS_COMMIT_INDEX,
     },
     context::Context,
     leader_scoring::{ReputationScores, ScoringSubdag},
     storage::{Store, WriteBatch},
     threshold_clock::ThresholdClock,
+    CommittedSubDag,
 };
 
 /// DagState provides the API to write and read accepted blocks from the DAG.
@@ -117,19 +117,23 @@ impl DagState {
         let num_authorities = context.committee.size();
 
         // Try to load persisted genesis block refs first, fallback to generating
-        let genesis = if let Some(stored_genesis_refs) = store.read_genesis_blocks(context.committee.epoch())
+        let genesis = if let Some(stored_genesis_refs) = store
+            .read_genesis_blocks(context.committee.epoch())
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed to read genesis block refs from storage: {:?}", e);
                 None
             }) {
-            tracing::info!("✅ Loaded {} genesis block refs from storage for epoch {}", stored_genesis_refs.len(), context.committee.epoch());
+            tracing::info!(
+                "✅ Loaded {} genesis block refs from storage for epoch {}",
+                stored_genesis_refs.len(),
+                context.committee.epoch()
+            );
 
             // Load actual blocks from storage using the refs
-            let full_blocks = store.read_blocks(&stored_genesis_refs)
-                .unwrap_or_else(|e| {
-                    tracing::warn!("Failed to read full genesis blocks from storage: {:?}", e);
-                    vec![]
-                });
+            let full_blocks = store.read_blocks(&stored_genesis_refs).unwrap_or_else(|e| {
+                tracing::warn!("Failed to read full genesis blocks from storage: {:?}", e);
+                vec![]
+            });
 
             // Create map from refs to blocks, using available blocks
             let mut genesis_map = BTreeMap::new();
@@ -143,26 +147,39 @@ impl DagState {
 
             // If we have incomplete genesis blocks, regenerate them
             if genesis_map.len() != context.committee.size() {
-                tracing::warn!("Incomplete genesis blocks in storage ({} vs {}), regenerating",
-                    genesis_map.len(), context.committee.size());
+                tracing::warn!(
+                    "Incomplete genesis blocks in storage ({} vs {}), regenerating",
+                    genesis_map.len(),
+                    context.committee.size()
+                );
                 let generated_genesis = genesis_blocks(context.as_ref());
-                generated_genesis.into_iter().map(|block| (block.reference(), block)).collect()
+                generated_genesis
+                    .into_iter()
+                    .map(|block| (block.reference(), block))
+                    .collect()
             } else {
                 genesis_map
             }
         } else {
             // Generate and persist genesis blocks
             let generated_genesis = genesis_blocks(context.as_ref());
-            tracing::info!("🔄 Generated {} genesis blocks for epoch {} - persisting to storage",
-                generated_genesis.len(), context.committee.epoch());
+            tracing::info!(
+                "🔄 Generated {} genesis blocks for epoch {} - persisting to storage",
+                generated_genesis.len(),
+                context.committee.epoch()
+            );
 
             // Persist block refs, not full blocks (to avoid serialization issues)
-            let genesis_refs: Vec<BlockRef> = generated_genesis.iter().map(|b| b.reference()).collect();
+            let genesis_refs: Vec<BlockRef> =
+                generated_genesis.iter().map(|b| b.reference()).collect();
             if let Err(e) = store.write_genesis_blocks(context.committee.epoch(), genesis_refs) {
                 tracing::warn!("Failed to persist genesis block refs: {:?}", e);
             }
 
-            generated_genesis.into_iter().map(|block| (block.reference(), block)).collect()
+            generated_genesis
+                .into_iter()
+                .map(|block| (block.reference(), block))
+                .collect()
         };
 
         let threshold_clock = ThresholdClock::new(1, context.clone());
@@ -1318,7 +1335,7 @@ mod test {
     use super::*;
     use crate::{
         block::{TestBlock, VerifiedBlock},
-        storage::{WriteBatch, mem_store::MemStore},
+        storage::{mem_store::MemStore, WriteBatch},
         test_dag_builder::DagBuilder,
         test_dag_parser::parse_dag,
     };
@@ -1365,15 +1382,13 @@ mod test {
 
         // Check uncommitted blocks that do not exist.
         let last_ref = blocks.keys().last().unwrap();
-        assert!(
-            dag_state
-                .get_block(&BlockRef::new(
-                    last_ref.round,
-                    last_ref.author,
-                    BlockDigest::MIN
-                ))
-                .is_none()
-        );
+        assert!(dag_state
+            .get_block(&BlockRef::new(
+                last_ref.round,
+                last_ref.author,
+                BlockDigest::MIN
+            ))
+            .is_none());
 
         // Check slots with uncommitted blocks.
         for round in 1..=num_rounds {
@@ -1426,11 +1441,9 @@ mod test {
         }
 
         // Check rounds without uncommitted blocks.
-        assert!(
-            dag_state
-                .get_uncommitted_blocks_at_round(non_existent_round)
-                .is_empty()
-        );
+        assert!(dag_state
+            .get_uncommitted_blocks_at_round(non_existent_round)
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1663,6 +1676,7 @@ mod test {
             context.clock.timestamp_utc_ms(),
             round_6_block.reference(),
             vec![],
+            6, // global_exec_index for test
         );
         dag_state.set_last_commit(last_commit);
         assert_eq!(
@@ -1867,6 +1881,7 @@ mod test {
             0,
             dag_builder.leader_block(5).unwrap().reference(),
             vec![],
+            1, // global_exec_index for test
         ));
         // Flush the DAG state to storage.
         dag_state.flush();
@@ -1887,12 +1902,8 @@ mod test {
         }
 
         for round in 1..=3 {
-            assert!(
-                dag_state.contains_cached_block_at_slot(Slot::new(
-                    round,
-                    AuthorityIndex::new_for_test(0)
-                ))
-            );
+            assert!(dag_state
+                .contains_cached_block_at_slot(Slot::new(round, AuthorityIndex::new_for_test(0))));
         }
 
         // When trying to request for authority 1 at block slot 3 it should panic, as anything
@@ -2119,19 +2130,15 @@ mod test {
             if authority_index == AuthorityIndex::new_for_test(0) {
                 assert_eq!(blocks.len(), 4);
                 assert_eq!(dag_state.evicted_rounds[authority_index.value()], 6);
-                assert!(
-                    blocks
-                        .into_iter()
-                        .all(|block| block.round() >= 7 && block.round() <= 12)
-                );
+                assert!(blocks
+                    .into_iter()
+                    .all(|block| block.round() >= 7 && block.round() <= 12));
             } else {
                 assert_eq!(blocks.len(), 6);
                 assert_eq!(dag_state.evicted_rounds[authority_index.value()], 6);
-                assert!(
-                    blocks
-                        .into_iter()
-                        .all(|block| block.round() >= 7 && block.round() <= 12)
-                );
+                assert!(blocks
+                    .into_iter()
+                    .all(|block| block.round() >= 7 && block.round() <= 12));
             }
         }
 
@@ -2388,6 +2395,7 @@ mod test {
             context.clock.timestamp_utc_ms(),
             dag_builder.leader_block(3).unwrap().reference(),
             vec![],
+            1, // global_exec_index for test
         ));
 
         // WHEN search for the latest blocks
@@ -2524,6 +2532,7 @@ mod test {
             0,
             dag_builder.leader_block(3).unwrap().reference(),
             vec![],
+            1, // global_exec_index for test
         ));
 
         // Flush the store so we update the evict rounds

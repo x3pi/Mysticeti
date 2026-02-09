@@ -5,15 +5,15 @@ use std::{
     collections::BTreeSet,
     fmt::Debug,
     sync::{
-        Arc,
         atomic::{AtomicU32, Ordering},
+        Arc,
     },
 };
 
 use async_trait::async_trait;
 use consensus_types::block::{BlockRef, Round};
 use mysten_metrics::{
-    monitored_mpsc::{Receiver, Sender, WeakSender, channel},
+    monitored_mpsc::{channel, Receiver, Sender, WeakSender},
     monitored_scope, spawn_logged_monitored_task,
 };
 use parking_lot::RwLock;
@@ -22,7 +22,6 @@ use tokio::sync::{oneshot, watch};
 use tracing::warn;
 
 use crate::{
-    BlockAPI as _,
     block::VerifiedBlock,
     commit::CertifiedCommits,
     context::Context,
@@ -30,6 +29,7 @@ use crate::{
     core_thread::CoreError::Shutdown,
     dag_state::DagState,
     error::{ConsensusError, ConsensusResult},
+    BlockAPI as _,
 };
 
 const CORE_THREAD_COMMANDS_CHANNEL_SIZE: usize = 2000;
@@ -62,7 +62,7 @@ pub enum CoreError {
 #[async_trait]
 pub trait CoreThreadDispatcher: Sync + Send + 'static {
     async fn add_blocks(&self, blocks: Vec<VerifiedBlock>)
-    -> Result<BTreeSet<BlockRef>, CoreError>;
+        -> Result<BTreeSet<BlockRef>, CoreError>;
 
     async fn check_block_refs(
         &self,
@@ -89,15 +89,41 @@ pub trait CoreThreadDispatcher: Sync + Send + 'static {
 }
 
 pub(crate) struct CoreThreadHandle {
-    sender: Sender<CoreThreadCommand>,
-    join_handle: tokio::task::JoinHandle<()>,
+    sender: Option<Sender<CoreThreadCommand>>,
+    join_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CoreThreadHandle {
-    pub async fn stop(self) {
-        // drop the sender, that will force all the other weak senders to not able to upgrade.
-        drop(self.sender);
-        self.join_handle.await.ok();
+    pub async fn stop(mut self) {
+        // Take the sender, that will force all the other weak senders to not able to upgrade.
+        if let Some(sender) = self.sender.take() {
+            drop(sender);
+        }
+        if let Some(join_handle) = self.join_handle.take() {
+            join_handle.await.ok();
+        }
+    }
+}
+
+// ============================================================================
+// DIAGNOSTIC: Drop implementation to track when CoreThreadHandle is dropped
+// ============================================================================
+impl Drop for CoreThreadHandle {
+    fn drop(&mut self) {
+        // Only log if sender/handle are still present (unexpected drop)
+        // If stop() was called, both will be None
+        if self.sender.is_some() || self.join_handle.is_some() {
+            tracing::warn!(
+                "🔴 [CORE THREAD HANDLE DROP] Handle being dropped unexpectedly! sender={}, join_handle={}",
+                self.sender.is_some(),
+                self.join_handle.is_some()
+            );
+            // Capture backtrace to identify the source of the drop
+            let backtrace = std::backtrace::Backtrace::capture();
+            if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                tracing::warn!("🔴 [CORE THREAD HANDLE DROP] Backtrace:\n{}", backtrace);
+            }
+        }
     }
 }
 
@@ -111,12 +137,20 @@ struct CoreThread {
 
 impl CoreThread {
     pub async fn run(mut self) -> ConsensusResult<()> {
-        tracing::debug!("Started core thread");
+        tracing::info!("🚀 [CORE THREAD] Started core thread");
 
         loop {
             tokio::select! {
                 command = self.receiver.recv() => {
                     let Some(command) = command else {
+                        tracing::warn!("🔴 [CORE THREAD] Command receiver CLOSED - sender was dropped!");
+                        // Capture backtrace to identify where the drop occurred
+                        let backtrace = std::backtrace::Backtrace::capture();
+                        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                            tracing::warn!("🔴 [CORE THREAD] Backtrace at receiver close:\n{}", backtrace);
+                        } else {
+                            tracing::warn!("🔴 [CORE THREAD] Backtrace not available (set RUST_BACKTRACE=1)");
+                        }
                         break;
                     };
                     self.context.metrics.node_metrics.core_lock_dequeued.inc();
@@ -236,8 +270,8 @@ impl ChannelCoreThreadDispatcher {
             highest_received_rounds: Arc::new(highest_received_rounds),
         };
         let handle = CoreThreadHandle {
-            join_handle,
-            sender,
+            join_handle: Some(join_handle),
+            sender: Some(sender),
         };
         (dispatcher, handle)
     }
@@ -426,7 +460,6 @@ mod test {
 
     use super::*;
     use crate::{
-        CommitConsumerArgs,
         block_manager::BlockManager,
         block_verifier::NoopBlockVerifier,
         commit_observer::CommitObserver,
@@ -438,6 +471,7 @@ mod test {
         storage::mem_store::MemStore,
         transaction::{TransactionClient, TransactionConsumer},
         transaction_certifier::TransactionCertifier,
+        CommitConsumerArgs,
     };
 
     #[tokio::test]

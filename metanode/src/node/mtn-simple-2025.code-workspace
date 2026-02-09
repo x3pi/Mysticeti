@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../../../../mtn-simple-2025"
+		},
+		{
+			"path": "../../.."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"iostream": "cpp",
+			"sstream": "cpp"
+		}
+	}
+}

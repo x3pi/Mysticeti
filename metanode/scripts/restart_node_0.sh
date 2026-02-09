@@ -79,7 +79,7 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     print_info "✅ Rust Consensus Node $NODE_ID đã khởi động lại thành công!"
     print_info "📺 Xem logs: tmux attach -t $TMUX_SESSION"
     print_info "📄 Log file: $LOG_FILE"
-    print_info "🔧 LVM Snapshot: $(grep -q 'enable_lvm_snapshot = true' $CONFIG_FILE && echo 'ENABLED' || echo 'disabled')"
+
 else
     print_error "❌ Lỗi khởi động Node $NODE_ID. Kiểm tra logs: $LOG_FILE"
     exit 1

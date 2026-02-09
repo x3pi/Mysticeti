@@ -117,17 +117,7 @@ pub struct NodeConfig {
     /// This is used as base when calculating adaptive delay when node is ahead of network
     #[serde(default = "default_adaptive_delay_ms")]
     pub adaptive_delay_ms: u64,
-    /// Enable LVM snapshot creation after epoch transition (default: false)
-    /// Only nodes with this enabled will create snapshots
-    #[serde(default)]
-    pub enable_lvm_snapshot: bool,
-    /// Path to lvm-snap-rsync binary (required if enable_lvm_snapshot = true)
-    #[serde(default)]
-    pub lvm_snapshot_bin_path: Option<PathBuf>,
-    /// Delay in seconds before creating snapshot after epoch transition (default: 120 = 2 minutes)
-    /// This delay allows Go executor to finish processing and stabilize before snapshot
-    #[serde(default = "default_lvm_snapshot_delay_seconds")]
-    pub lvm_snapshot_delay_seconds: u64,
+
     /// Epoch transition optimization level (default: "balanced")
     /// Options: "fast" (minimal waits, faster transitions), "balanced" (reasonable waits), "safe" (conservative waits)
     #[serde(default = "default_epoch_transition_optimization")]
@@ -136,9 +126,9 @@ pub struct NodeConfig {
     /// When enabled, transactions are rejected gradually before authority shutdown
     #[serde(default = "default_enable_gradual_shutdown")]
     pub enable_gradual_shutdown: bool,
-    /// Initial node operation mode (default: SyncOnly)
-    /// Node can be configured to start as SyncOnly or Validator
-    /// During runtime, node will automatically switch modes based on committee membership
+    /// DEPRECATED: This field is ignored. Node mode is determined dynamically by committee membership.
+    /// Kept for backward compatibility with existing config files.
+    /// If node is in committee → Validator mode, otherwise → SyncOnly mode.
     #[serde(default = "default_node_mode")]
     pub initial_node_mode: NodeMode,
     /// Seconds to wait for user certificates to drain during gradual shutdown (default: 2)
@@ -150,11 +140,42 @@ pub struct NodeConfig {
     /// Seconds to wait for final transaction drain during gradual shutdown (default: 1)
     #[serde(default = "default_gradual_shutdown_final_drain_secs")]
     pub gradual_shutdown_final_drain_secs: Option<u64>,
-    /// Peer Go Master socket paths for epoch discovery (fallback if own Go Master is stale)
-    /// When node restarts and its own Go Master has stale epoch, it can query these peer masters
-    /// to get the correct network epoch. Format: ["/tmp/rust-go-standard-master.sock"]
+    /// Poll interval in seconds for epoch monitor in SyncOnly mode (default: 5)
+    #[serde(default = "default_epoch_monitor_poll_interval_secs")]
+    pub epoch_monitor_poll_interval_secs: Option<u64>,
+    /// Port for Peer RPC server (for WAN-based epoch/block queries, default: 19000 + node_id)
+    /// Set to 0 to disable Peer RPC server
     #[serde(default)]
-    pub peer_go_master_sockets: Vec<String>,
+    pub peer_rpc_port: Option<u16>,
+
+    /// Fetch interval in seconds (default: 2)
+    #[serde(default = "default_fetch_interval_secs")]
+    pub fetch_interval_secs: u64,
+
+    /// Turbo fetch interval in milliseconds (default: 200)
+    #[serde(default = "default_turbo_fetch_interval_ms")]
+    pub turbo_fetch_interval_ms: u64,
+
+    /// Fetch timeout in seconds (default: 10)
+    #[serde(default = "default_fetch_timeout_secs")]
+    pub fetch_timeout_secs: u64,
+
+    /// Peer RPC addresses for WAN-based epoch discovery (IP:Port format)
+    /// When node is behind and local Go Master is stale, it can query these peers over network
+    /// Format: ["192.168.1.100:19000", "192.168.1.101:19000"]
+    #[serde(default)]
+    pub peer_rpc_addresses: Vec<String>,
+    /// Enable dynamic peer discovery from Validator smart contract (default: false)
+    /// When enabled, peer_rpc_addresses will be automatically discovered from chain state
+    #[serde(default)]
+    pub enable_peer_discovery: bool,
+    /// Go RPC URL for peer discovery (e.g., "http://127.0.0.1:8545")
+    /// Required when enable_peer_discovery is true
+    #[serde(default)]
+    pub go_rpc_url: Option<String>,
+    /// Refresh interval for peer discovery in seconds (default: 300 = 5 minutes)
+    #[serde(default = "default_peer_discovery_refresh_secs")]
+    pub peer_discovery_refresh_secs: u64,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -193,10 +214,6 @@ fn default_adaptive_delay_ms() -> u64 {
     50 // Default base delay: 50ms
 }
 
-fn default_lvm_snapshot_delay_seconds() -> u64 {
-    5 // Default delay: 5 seconds
-}
-
 fn default_epoch_transition_optimization() -> String {
     "balanced".to_string()
 }
@@ -215,6 +232,26 @@ fn default_gradual_shutdown_consensus_cert_drain_secs() -> Option<u64> {
 
 fn default_gradual_shutdown_final_drain_secs() -> Option<u64> {
     Some(1)
+}
+
+fn default_epoch_monitor_poll_interval_secs() -> Option<u64> {
+    Some(5) // Poll every 5 seconds by default
+}
+
+fn default_peer_discovery_refresh_secs() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_fetch_interval_secs() -> u64 {
+    2
+}
+
+fn default_turbo_fetch_interval_ms() -> u64 {
+    200
+}
+
+fn default_fetch_timeout_secs() -> u64 {
+    10
 }
 
 impl NodeConfig {
@@ -283,9 +320,7 @@ impl NodeConfig {
                 commit_sync_batches_ahead: default_commit_sync_batches_ahead(),
                 adaptive_catchup_enabled: default_adaptive_catchup(),
                 adaptive_delay_enabled: default_adaptive_delay(),
-                enable_lvm_snapshot: false,
-                lvm_snapshot_bin_path: None,
-                lvm_snapshot_delay_seconds: 20,
+
                 epoch_transition_optimization: "balanced".to_string(),
                 enable_gradual_shutdown: true,
                 initial_node_mode: default_node_mode(),
@@ -293,7 +328,15 @@ impl NodeConfig {
                 gradual_shutdown_consensus_cert_drain_secs: Some(1),
                 gradual_shutdown_final_drain_secs: Some(1),
                 adaptive_delay_ms: default_adaptive_delay_ms(),
-                peer_go_master_sockets: vec!["/tmp/rust-go-standard-master.sock".to_string()], // Fallback to main Go Master
+                epoch_monitor_poll_interval_secs: default_epoch_monitor_poll_interval_secs(),
+                peer_rpc_port: Some(19000 + idx as u16), // Default: 19000 + node_id for WAN sync
+                fetch_interval_secs: default_fetch_interval_secs(),
+                turbo_fetch_interval_ms: default_turbo_fetch_interval_ms(),
+                fetch_timeout_secs: default_fetch_timeout_secs(),
+                peer_rpc_addresses: vec![], // Empty by default, configure for WAN sync
+                enable_peer_discovery: false, // Disabled by default
+                go_rpc_url: None,           // Configure when enable_peer_discovery is true
+                peer_discovery_refresh_secs: default_peer_discovery_refresh_secs(),
             };
 
             // Save keys - use private_key_bytes and public key bytes

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use mysten_metrics::monitored_scope;
 use tokio::sync::broadcast;
-use tracing::{trace, warn};
+use tracing::warn;
 
 use crate::{block::ExtendedBlock, context::Context, transaction_certifier::TransactionCertifier};
 
@@ -33,11 +33,14 @@ impl ProposedBlockHandler {
     }
 
     pub(crate) async fn run(&mut self) {
+        tracing::info!("🚀 [PROPOSED BLOCK HANDLER] RUN LOOP STARTED");
         loop {
             match self.rx_block_broadcast.recv().await {
                 Ok(extended_block) => self.handle_proposed_block(extended_block),
                 Err(broadcast::error::RecvError::Closed) => {
-                    trace!("Handler is shutting down!");
+                    tracing::info!(
+                        "❌ [PROPOSED BLOCK HANDLER] Broadcast channel CLOSED - shutting down"
+                    );
                     return;
                 }
                 Err(broadcast::error::RecvError::Lagged(e)) => {

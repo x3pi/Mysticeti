@@ -5,18 +5,41 @@ use consensus_config::Epoch;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Validator info for epoch boundary (serializable)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EpochValidatorInfo {
+    pub name: String,
+    pub address: String, // Multiaddr format
+    pub stake: u64,
+    pub authority_key: Vec<u8>, // BLS public key bytes
+    pub protocol_key: Vec<u8>,  // Ed25519 protocol key bytes
+    pub network_key: Vec<u8>,   // Ed25519 network key bytes
+}
+
 /// System transaction types (similar to Sui's EndOfEpochTransactionKind)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SystemTransactionKind {
     /// End of epoch transaction - triggers epoch transition
     /// This replaces the Proposal/Vote/Quorum mechanism
+    /// SIMPLIFIED: Timestamp is NOT stored here - derive from boundary_block's block header
     EndOfEpoch {
         /// New epoch number
         new_epoch: Epoch,
-        /// New epoch start timestamp in milliseconds
-        new_epoch_timestamp_ms: u64,
-        /// Commit index when this transaction was created (for fork-safety)
-        commit_index: u32,
+        /// Boundary block (last block of previous epoch) - used to derive timestamp
+        /// All nodes query block header at this index to get deterministic timestamp
+        boundary_block: u64,
+    },
+    /// Epoch boundary data - included in genesis block of each new epoch
+    /// Allows late-joining nodes to recover boundary data by syncing blocks
+    EpochBoundary {
+        /// Epoch number this boundary data is for
+        epoch: Epoch,
+        /// Epoch start timestamp in milliseconds (for genesis hash consistency)
+        epoch_start_timestamp_ms: u64,
+        /// Last block of previous epoch (boundary point)
+        boundary_block: u64,
+        /// Validators active in this epoch
+        validators: Vec<EpochValidatorInfo>,
     },
 }
 
@@ -29,16 +52,29 @@ pub struct SystemTransaction {
 
 impl SystemTransaction {
     /// Create a new EndOfEpoch system transaction
-    pub fn end_of_epoch(
-        new_epoch: Epoch,
-        new_epoch_timestamp_ms: u64,
-        commit_index: u32,
-    ) -> Self {
+    /// Timestamp is NOT stored - derive from boundary_block's block header when needed
+    pub fn end_of_epoch(new_epoch: Epoch, boundary_block: u64) -> Self {
         Self {
             kind: SystemTransactionKind::EndOfEpoch {
                 new_epoch,
-                new_epoch_timestamp_ms,
-                commit_index,
+                boundary_block,
+            },
+        }
+    }
+
+    /// Create a new EpochBoundary system transaction
+    pub fn epoch_boundary(
+        epoch: Epoch,
+        epoch_start_timestamp_ms: u64,
+        boundary_block: u64,
+        validators: Vec<EpochValidatorInfo>,
+    ) -> Self {
+        Self {
+            kind: SystemTransactionKind::EpochBoundary {
+                epoch,
+                epoch_start_timestamp_ms,
+                boundary_block,
+                validators,
             },
         }
     }
@@ -58,14 +94,38 @@ impl SystemTransaction {
         matches!(self.kind, SystemTransactionKind::EndOfEpoch { .. })
     }
 
+    /// Check if this is an EpochBoundary transaction
+    pub fn is_epoch_boundary(&self) -> bool {
+        matches!(self.kind, SystemTransactionKind::EpochBoundary { .. })
+    }
+
     /// Extract EndOfEpoch data if this is an EndOfEpoch transaction
-    pub fn as_end_of_epoch(&self) -> Option<(Epoch, u64, u32)> {
+    /// Returns (new_epoch, boundary_block)
+    pub fn as_end_of_epoch(&self) -> Option<(Epoch, u64)> {
         match &self.kind {
             SystemTransactionKind::EndOfEpoch {
                 new_epoch,
-                new_epoch_timestamp_ms,
-                commit_index,
-            } => Some((*new_epoch, *new_epoch_timestamp_ms, *commit_index)),
+                boundary_block,
+            } => Some((*new_epoch, *boundary_block)),
+            _ => None,
+        }
+    }
+
+    /// Extract EpochBoundary data if this is an EpochBoundary transaction
+    pub fn as_epoch_boundary(&self) -> Option<(Epoch, u64, u64, &Vec<EpochValidatorInfo>)> {
+        match &self.kind {
+            SystemTransactionKind::EpochBoundary {
+                epoch,
+                epoch_start_timestamp_ms,
+                boundary_block,
+                validators,
+            } => Some((
+                *epoch,
+                *epoch_start_timestamp_ms,
+                *boundary_block,
+                validators,
+            )),
+            _ => None,
         }
     }
 }
@@ -75,12 +135,24 @@ impl fmt::Display for SystemTransaction {
         match &self.kind {
             SystemTransactionKind::EndOfEpoch {
                 new_epoch,
-                new_epoch_timestamp_ms,
-                commit_index,
+                boundary_block,
             } => write!(
                 f,
-                "EndOfEpoch(new_epoch={}, timestamp_ms={}, commit_index={})",
-                new_epoch, new_epoch_timestamp_ms, commit_index
+                "EndOfEpoch(new_epoch={}, boundary_block={})",
+                new_epoch, boundary_block
+            ),
+            SystemTransactionKind::EpochBoundary {
+                epoch,
+                epoch_start_timestamp_ms,
+                boundary_block,
+                validators,
+            } => write!(
+                f,
+                "EpochBoundary(epoch={}, timestamp_ms={}, boundary_block={}, validators={})",
+                epoch,
+                epoch_start_timestamp_ms,
+                boundary_block,
+                validators.len()
             ),
         }
     }

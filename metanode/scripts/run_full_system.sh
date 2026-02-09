@@ -77,12 +77,6 @@ print_step() {
     echo -e "${BLUE}📋 $1${NC}"
 }
 
-# Step 0: Check sudo permissions for LVM snapshot (if enabled) - SKIPPED
-print_step "Bước 0: Kiểm tra quyền sudo cho lệnh snapshot... (SKIPPED)"
-
-# SKIPPED: Check sudo permissions for LVM snapshot
-print_info "ℹ️  Bỏ qua kiểm tra sudo cho LVM snapshot"
-
 # Step 1: Clean up old data (CRITICAL: Must be done before starting any nodes)
 print_step "Bước 1: Xóa dữ liệu cũ (QUAN TRỌNG: Phải xóa trước khi khởi động nodes)..."
 
@@ -93,28 +87,6 @@ rm -f /tmp/executor*.sock 2>/dev/null || true
 rm -f /tmp/rust-go.sock_* 2>/dev/null || true
 rm -f /tmp/rust-go.sock_1 /tmp/rust-go.sock_2 2>/dev/null || true
 print_info "  ✅ Đã cleanup sockets /tmp"
-
-# Clean old LVM snapshots (xóa tất cả snapshot cũ trước khi khởi động mới)
-print_info "🧹 Xóa LVM snapshots cũ (tránh conflict với data cũ)..."
-LVM_SNAPSHOT_BASE_PATH="/mnt/lvm_public"
-if [ -d "$LVM_SNAPSHOT_BASE_PATH" ]; then
-    print_info "  - Xóa tất cả snapshots trong: $LVM_SNAPSHOT_BASE_PATH"
-
-    # Xóa thư mục latest symlink trước
-    if [ -L "$LVM_SNAPSHOT_BASE_PATH/latest" ]; then
-        print_info "    🗑️  Xóa symlink latest..."
-        rm -f "$LVM_SNAPSHOT_BASE_PATH/latest" 2>/dev/null || true
-    fi
-
-    # Xóa tất cả thư mục snapshot có pattern snap_id_* (skip if problematic)
-    print_info "    ℹ️  Skip xóa snapshots cũ để tránh stuck (có thể xóa thủ công nếu cần)"
-    # SNAPSHOT_DIRS=$(ls -d "$LVM_SNAPSHOT_BASE_PATH"/snap_id_* 2>/dev/null || true)
-    # ... rest of cleanup code ...
-
-    print_info "  ✅ Đã skip cleanup LVM snapshots cũ (để tránh stuck)"
-else
-    print_info "  ℹ️  Thư mục LVM snapshot không tồn tại: $LVM_SNAPSHOT_BASE_PATH"
-fi
 
 # Clean Go sample data (bao gồm cả logs và tất cả dữ liệu)
 # CRITICAL: Phải xóa HOÀN TOÀN để đảm bảo Go init genesis block mới
@@ -543,150 +515,6 @@ else
     print_warn "⚠️  Genesis.json chưa tồn tại, bỏ qua cập nhật epoch_timestamp_ms"
 fi
 
-# Step 4.0.5: Configure LVM snapshot - chỉ node 0 tạo snapshot, các node khác không tạo
-print_info "📸 Cấu hình LVM snapshot: chỉ node 0 tạo snapshot, các node khác không tạo..."
-
-# Enable snapshot cho node 0
-NODE_0_CONFIG="$METANODE_ROOT/config/node_0.toml"
-LVM_SNAPSHOT_BIN_PATH="$METANODE_ROOT/bin/lvm-snap-rsync"
-LVM_SNAPSHOT_REAL_BIN="$MYSTICETI_ROOT/lvm-manager/target/release/lvm-snap-rsync"
-
-# Build LVM snapshot binary mới nhất (luôn clean build để đảm bảo code mới nhất)
-print_info "🔨 Build LVM snapshot binary mới nhất từ source (clean build)..."
-
-# Xóa symlink cũ nếu có
-if [ -L "$LVM_SNAPSHOT_BIN_PATH" ]; then
-    print_info "  🗑️  Xóa symlink cũ: $LVM_SNAPSHOT_BIN_PATH"
-    rm -f "$LVM_SNAPSHOT_BIN_PATH"
-fi
-
-# Xóa binary cũ nếu có
-if [ -f "$LVM_SNAPSHOT_BIN_PATH" ]; then
-    print_info "  🗑️  Xóa binary cũ: $LVM_SNAPSHOT_BIN_PATH"
-    rm -f "$LVM_SNAPSHOT_BIN_PATH"
-fi
-
-# Tạo thư mục bin nếu chưa có
-mkdir -p "$METANODE_ROOT/bin"
-
-# Build LVM manager từ source với clean build
-print_info "  📦 Clean build lvm-manager từ: $MYSTICETI_ROOT/lvm-manager"
-
-cd "$MYSTICETI_ROOT/lvm-manager" || {
-    print_error "❌ Không thể chuyển đến thư mục lvm-manager"
-    exit 1
-}
-
-# Clean build để đảm bảo code mới nhất
-print_info "  🧹 Clean build (cargo clean + cargo build --release)..."
-if cargo clean && cargo build --release; then
-    print_info "  ✅ Clean build lvm-manager thành công"
-
-    # Verify binary exists and is executable
-    if [ -f "$LVM_SNAPSHOT_REAL_BIN" ] && [ -x "$LVM_SNAPSHOT_REAL_BIN" ]; then
-        # Get binary info for verification
-        BINARY_SIZE=$(stat -c%s "$LVM_SNAPSHOT_REAL_BIN" 2>/dev/null || stat -f%z "$LVM_SNAPSHOT_REAL_BIN" 2>/dev/null || echo "unknown")
-        BINARY_MODTIME=$(stat -c%Y "$LVM_SNAPSHOT_REAL_BIN" 2>/dev/null || stat -f%m "$LVM_SNAPSHOT_REAL_BIN" 2>/dev/null || echo "unknown")
-
-        print_info "  📋 Binary info: size=${BINARY_SIZE} bytes, modified=$(date -d "@$BINARY_MODTIME" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'unknown')"
-
-        # Copy binary mới vào metanode/bin
-        print_info "  📋 Copy binary mới nhất vào: $LVM_SNAPSHOT_BIN_PATH"
-        cp "$LVM_SNAPSHOT_REAL_BIN" "$LVM_SNAPSHOT_BIN_PATH"
-        chmod +x "$LVM_SNAPSHOT_BIN_PATH"
-
-        # Verify copy was successful
-        if [ -f "$LVM_SNAPSHOT_BIN_PATH" ] && [ -x "$LVM_SNAPSHOT_BIN_PATH" ]; then
-            COPIED_SIZE=$(stat -c%s "$LVM_SNAPSHOT_BIN_PATH" 2>/dev/null || stat -f%z "$LVM_SNAPSHOT_BIN_PATH" 2>/dev/null || echo "unknown")
-            print_info "  ✅ Đã tạo binary LVM snapshot mới tại: $LVM_SNAPSHOT_BIN_PATH (size: ${COPIED_SIZE} bytes)"
-
-            # Test binary với --help để verify nó hoạt động
-            if "$LVM_SNAPSHOT_BIN_PATH" --help >/dev/null 2>&1; then
-                print_info "  ✅ Binary verification passed (--help works)"
-            else
-                print_warn "  ⚠️  Binary verification failed (--help test), nhưng sẽ tiếp tục..."
-            fi
-        else
-            print_error "❌ Copy binary thất bại: $LVM_SNAPSHOT_BIN_PATH"
-            exit 1
-        fi
-
-        # Copy config.toml từ lvm-manager vào metanode/bin
-        LVM_CONFIG_SRC="$MYSTICETI_ROOT/lvm-manager/config.toml"
-        LVM_CONFIG_DST="$METANODE_ROOT/bin/config.toml"
-        if [ -f "$LVM_CONFIG_SRC" ]; then
-            print_info "  📋 Copy config mới nhất vào: $LVM_CONFIG_DST"
-            cp "$LVM_CONFIG_SRC" "$LVM_CONFIG_DST"
-            print_info "  ✅ Đã update config.toml"
-        else
-            print_warn "  ⚠️  Không tìm thấy config source: $LVM_CONFIG_SRC"
-        fi
-    else
-        print_error "❌ Binary không tồn tại hoặc không executable sau khi build: $LVM_SNAPSHOT_REAL_BIN"
-        exit 1
-    fi
-else
-    print_error "❌ Clean build lvm-manager thất bại"
-    exit 1
-fi
-
-# Quay về thư mục metanode
-cd "$METANODE_ROOT" || exit 1
-
-if [ -f "$NODE_0_CONFIG" ]; then
-    # Check if snapshot config already exists
-    if ! grep -q "^enable_lvm_snapshot" "$NODE_0_CONFIG" 2>/dev/null; then
-        # Add snapshot config to node_0.toml
-        print_info "  📝 Thêm cấu hình snapshot vào node_0.toml..."
-        cat >> "$NODE_0_CONFIG" << EOF
-
-# LVM Snapshot Configuration
-# Enable snapshot creation after epoch transition (only for nodes that should create snapshots)
-enable_lvm_snapshot = true
-# Path to lvm-snap-rsync binary
-lvm_snapshot_bin_path = "$LVM_SNAPSHOT_BIN_PATH"
-# Delay in seconds before creating snapshot after epoch transition (default: 20 seconds)
-# This delay allows Go executor to finish processing and stabilize before snapshot
-lvm_snapshot_delay_seconds = 120
-EOF
-        print_info "  ✅ Đã thêm cấu hình snapshot vào node_0.toml"
-    else
-        # Update existing config
-        print_info "  📝 Cập nhật cấu hình snapshot trong node_0.toml..."
-        # Enable snapshot
-        sed -i 's/^enable_lvm_snapshot = false/enable_lvm_snapshot = true/' "$NODE_0_CONFIG" 2>/dev/null || true
-        # Add or update bin path
-        if ! grep -q "^lvm_snapshot_bin_path" "$NODE_0_CONFIG" 2>/dev/null; then
-            sed -i "/^enable_lvm_snapshot = true/a lvm_snapshot_bin_path = \"$LVM_SNAPSHOT_BIN_PATH\"" "$NODE_0_CONFIG" 2>/dev/null || true
-        else
-            sed -i "s|^lvm_snapshot_bin_path = .*|lvm_snapshot_bin_path = \"$LVM_SNAPSHOT_BIN_PATH\"|" "$NODE_0_CONFIG" 2>/dev/null || true
-        fi
-        print_info "  ✅ Đã cập nhật cấu hình snapshot trong node_0.toml"
-    fi
-else
-    print_warn "  ⚠️  Không tìm thấy node_0.toml, bỏ qua cấu hình snapshot"
-fi
-
-# Đảm bảo các node khác (1, 2, 3) KHÔNG tạo snapshot
-for i in 1 2 3; do
-    NODE_CONFIG="$METANODE_ROOT/config/node_${i}.toml"
-    if [ -f "$NODE_CONFIG" ]; then
-        # Disable snapshot nếu có
-        if grep -q "^enable_lvm_snapshot = true" "$NODE_CONFIG" 2>/dev/null; then
-            print_info "  📝 Tắt snapshot cho node_${i}.toml..."
-            sed -i 's/^enable_lvm_snapshot = true/enable_lvm_snapshot = false/' "$NODE_CONFIG" 2>/dev/null || true
-            print_info "  ✅ Đã tắt snapshot cho node_${i}.toml"
-        fi
-        # Xóa bin path nếu có (không cần thiết cho nodes không tạo snapshot)
-        if grep -q "^lvm_snapshot_bin_path" "$NODE_CONFIG" 2>/dev/null; then
-            print_info "  📝 Xóa lvm_snapshot_bin_path khỏi node_${i}.toml..."
-            sed -i '/^lvm_snapshot_bin_path/d' "$NODE_CONFIG" 2>/dev/null || true
-            print_info "  ✅ Đã xóa lvm_snapshot_bin_path khỏi node_${i}.toml"
-        fi
-    fi
-done
-
-print_info "✅ Đã cấu hình snapshot: node 0 = enabled, nodes 1-3 = disabled"
 
 # Step 4.1: Kiểm tra genesis.json có validators
 print_step "Bước 4.1: Kiểm tra genesis.json có validators..."

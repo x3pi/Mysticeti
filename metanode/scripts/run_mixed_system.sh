@@ -2,7 +2,12 @@
 
 # Script để chạy Mixed System:
 # - Standard System: Nodes 0, 2, 3, 4 (Go Master/Sub standard, Rust Nodes standard)
+#   - Node 4 chạy như Full Node (sync-only nếu không trong committee)
 # - Special Node 1:  Node 1 Separate (Go Master/Sub separate, Rust Node separate ports)
+#
+# NodeMode được xác định tự động dựa trên committee membership:
+# - Nếu node nằm trong committee -> Validator
+# - Nếu node không trong committee -> SyncOnly (Full Node)
 #
 # Mục đích: Test khả năng tương tác giữa node chạy port riêng (Node 1) với hệ thống chuẩn.
 
@@ -32,45 +37,6 @@ print_warn() { echo -e "${YELLOW}⚠️  $1${NC}"; }
 print_error() { echo -e "${RED}❌ $1${NC}"; }
 print_step() { echo -e "${BLUE}📋 $1${NC}"; }
 
-# Function to apply custom node configurations
-apply_custom_node_configs() {
-    print_info "🔧 Applying custom node configurations..."
-    
-    # Node 0: Primary node with 10s block delay
-    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' config/node_0.toml
-    sed -i 's|enable_lvm_snapshot = false|enable_lvm_snapshot = true|g' config/node_0.toml
-    
-    # Node 1: Separate node with 10s block delay
-    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' config/node_1.toml
-    
-    # Node 2 & 3: Same 10s block delay for consistency
-    for id in 2 3; do
-        sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
-    done
-    
-    # Apply global settings to all nodes
-    for id in 0 1 2 3; do
-        sed -i 's|adaptive_delay_enabled = false|adaptive_delay_enabled = true|g' "config/node_$id.toml"
-        sed -i 's|commit_sync_batch_size = 200|commit_sync_batch_size = 50|g' "config/node_$id.toml"
-    done
-    
-    # CRITICAL: Set actual block timing parameters
-    # min_round_delay_ms = minimum time between rounds (THIS controls block interval!)
-    # leader_timeout_ms = max wait for leader before proposing (must be > min_round_delay)
-    for id in 0 1 2 3; do
-        if ! grep -q "min_round_delay_ms" "config/node_$id.toml"; then
-            echo "min_round_delay_ms = 10000" >> "config/node_$id.toml"
-        fi
-        if ! grep -q "leader_timeout_ms" "config/node_$id.toml"; then
-            echo "leader_timeout_ms = 15000" >> "config/node_$id.toml"
-        fi
-    done
-    
-    print_info "✅ Custom node configurations applied (10s block delay)"
-    print_info "   - min_round_delay_ms = 10000 (10s min between rounds)"
-    print_info "   - leader_timeout_ms = 15000 (15s max wait for leader)"
-}
-
 if [ ! -d "$GO_PROJECT_ROOT" ]; then
     print_error "Cannot find Go project at $GO_PROJECT_ROOT"
     exit 1
@@ -81,7 +47,6 @@ fi
 # ==============================================================================
 print_step "Bước 1: Cleanup dữ liệu toàn bộ hệ thống..."
 
-####
 # 1.1 Clean Standard Data (Logic from run_full_system.sh)
 print_info "🧹 Cleaning Standard Data..."
 mkdir -p "$LOG_DIR"
@@ -135,7 +100,7 @@ pkill -9 -f "metanode run" 2>/dev/null || true
 # Standard ports
 # NO CHANGE NEEDED for Go Code here, as Go communicates via Sockets.
 # However, I should kill port 9001 explicitly in cleanup.
-kill_port 9000; kill_port 9001; kill_port 9002; kill_port 9003; # kill_port 9004
+kill_port 9000; kill_port 9001; kill_port 9002; kill_port 9003; kill_port 9004
 # Node 1 Separate ports
 kill_port 9011
 kill_port 10747; kill_port 10000; kill_port 6201; kill_port 9081
@@ -161,31 +126,23 @@ fi
 BINARY="$METANODE_ROOT/target/release/metanode"
 
 # 3.2 Update Committee & Genesis (Standard Logic)
-# Clean old configs
-rm -f "$METANODE_ROOT/config/committee.json"
-rm -f "$METANODE_ROOT/config/node_*.toml"
-rm -f "$METANODE_ROOT/config/node_*_protocol_key.json"
-rm -f "$METANODE_ROOT/config/node_*_network_key.json"
+if [ -z "$KEEP_KEYS" ]; then
+    # Clean old configs
+    rm -f "$METANODE_ROOT/config/committee.json"
+    rm -f "$METANODE_ROOT/config/node_*.toml"
+    rm -f "$METANODE_ROOT/config/node_*_protocol_key.json"
+    rm -f "$METANODE_ROOT/config/node_*_network_key.json"
 
-# Generate keys for 4 nodes (0, 1, 2, 3) + 1 (node 4 not used in this script but standard generates 5 usually? Script says --nodes 4 which means 4 nodes: 0,1,2,3)
-# The original script said --nodes 4.
-print_info "Generating keys for 4 nodes..."
-"$BINARY" generate --nodes 4 --output config
-
-# OPTIONAL: Use template configs instead of patching (uncomment if you have templates)
-# if [ -d "$SCRIPT_DIR/config_templates" ]; then
-#     print_info "🔧 Using template configs instead of patches..."
-#     cp "$SCRIPT_DIR/config_templates/node_0_template.toml" config/node_0.toml
-#     cp "$SCRIPT_DIR/config_templates/node_1_template.toml" config/node_1.toml
-#     cp "$SCRIPT_DIR/config_templates/node_2_template.toml" config/node_2.toml
-#     cp "$SCRIPT_DIR/config_templates/node_3_template.toml" config/node_3.toml
-# fi
+    # Generate keys for 5 nodes (0, 1, 2, 3, 4)
+    # Node 4 chạy như full node (mode được xác định bởi committee membership)
+    print_info "Generating keys for 5 nodes..."
+    "$BINARY" generate --nodes 5 --output config
+else
+    print_info "🔑 Skipping key generation (KEEP_KEYS set)..."
+fi
 
 # DO NOT Restore old backup. Instead, PATCH node_1.toml directly.
 # This ensures it has the exact same structure/params as standard nodes.
-
-# Apply custom configurations first
-# apply_custom_node_configs
 
 # Patch node_1.toml for custom ports/sockets/paths
 # 1. Update Network Port (9001 -> 9011)
@@ -201,9 +158,9 @@ sed -i 's|executor_send_socket_path = ".*"|executor_send_socket_path = "/tmp/exe
 # Fix RECEIVE socket (Rust connects to Go here) - MUST match Go Master 1
 sed -i 's|executor_receive_socket_path = ".*"|executor_receive_socket_path = "/tmp/rust-go-node1-master.sock"|g' config/node_1.toml
 
-# 4b. Update Socket Paths (Standard Nodes 0, 2, 3)
-# Updates 0, 2, 3 to connect to Standard Go Master
-for id in 0 2 3; do
+# 4b. Update Socket Paths (Standard Nodes 0, 2, 3, 4)
+# Updates 0, 2, 3, 4 to connect to Standard Go Master
+for id in 0 2 3 4; do
     sed -i 's|executor_receive_socket_path = ".*"|executor_receive_socket_path = "/tmp/rust-go-standard-master.sock"|g' "config/node_$id.toml"
 done
 
@@ -213,32 +170,7 @@ sed -i 's|executor_commit_enabled = false|executor_commit_enabled = true|g' conf
 # Ensure read enabled too
 sed -i 's|executor_read_enabled = false|executor_read_enabled = true|g' config/node_1.toml
 
-# 6. CUSTOM: Apply adaptive delay settings to all nodes (10s delay)
-print_info "🔧 Applying 10s block delay settings..."
-for id in 0 1 2 3; do
-    # Set adaptive delay to 10000ms (10 seconds) for very slow consensus
-    sed -i 's|adaptive_delay_ms = 50|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
-    sed -i 's|adaptive_delay_ms = 300|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
-    sed -i 's|adaptive_delay_ms = 500|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
-    sed -i 's|adaptive_delay_ms = 200|adaptive_delay_ms = 10000|g' "config/node_$id.toml"
-    
-    # Enable adaptive delay if not already enabled
-    sed -i 's|adaptive_delay_enabled = false|adaptive_delay_enabled = true|g' "config/node_$id.toml"
-    
-    # Reduce commit batch size for slower processing
-    sed -i 's|commit_sync_batch_size = 200|commit_sync_batch_size = 50|g' "config/node_$id.toml"
-    sed -i 's|commit_sync_batch_size = 100|commit_sync_batch_size = 50|g' "config/node_$id.toml"
-done
 
-# 6. CRITICAL: Enable LVM Snapshot for Node 0 (Primary node creates epoch snapshots)
-print_info "🔧 Enabling LVM Snapshot for Node 0..."
-sed -i 's|enable_lvm_snapshot = false|enable_lvm_snapshot = true|g' config/node_0.toml
-# Add snapshot binary path if not present
-if ! grep -q "lvm_snapshot_bin_path" config/node_0.toml; then
-    sed -i '/enable_lvm_snapshot = true/a lvm_snapshot_bin_path = "/home/abc/nhat/consensus-chain/Mysticeti/lvm-manager/target/release/lvm-snap-rsync"' config/node_0.toml
-else
-    sed -i 's|lvm_snapshot_bin_path = .*|lvm_snapshot_bin_path = "/home/abc/nhat/consensus-chain/Mysticeti/lvm-manager/target/release/lvm-snap-rsync"|g' config/node_0.toml
-fi
 
 if [ -f "scripts/update_committee_from_genesis.py" ]; then
     if python3 "scripts/update_committee_from_genesis.py"; then
@@ -331,13 +263,18 @@ else:
 # 4.1 Start Standard Go Master
 print_info "🚀 Starting Standard Go Master (go-master)..."
 tmux new-session -d -s go-master -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data/data/xapian_node' && go run . -config=config-master.json  2>&1 | tee \"$LOG_DIR/go-master.log\""
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data/data/xapian_node' && go run . -config=config-master.json 2>&1 | tee \"$LOG_DIR/go-master.log\""
 sleep 5
 
 # 4.2 Start Standard Go Sub
-# print_info "🚀 Starting Standard Go Sub (go-sub)..."
+print_info "🚀 Starting Standard Go Sub (go-sub)..."
+
+# Standard sockets are already configured in config-master.json and node_0.toml (via generation template or default)
+# We assume node_0.toml points to go-master sockets by default generation logic or previous manual edits.
+
+
 tmux new-session -d -s go-sub -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data-write/data/xapian_node' && go run . -config=config-sub-write.json  2>&1 | tee \"$LOG_DIR/go-sub.log\""
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data-write/data/xapian_node' && go run . -config=config-sub-write.json 2>&1 | tee \"$LOG_DIR/go-sub.log\""
 sleep 5
 
 # 4.3 Start Node 1 Go Master
@@ -349,13 +286,13 @@ sed -i 's|"/tmp/rust-go.sock_1"|"/tmp/executor1-sep.sock"|g' "$GO_PROJECT_ROOT/c
 
 print_info "🚀 Starting Node 1 Go Master (go-master-1)..."
 tmux new-session -d -s go-master-1 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data/data/xapian_node' && go run . -config=config-master-node1.json   2>&1 | tee \"$LOG_DIR/go-master-1.log\""
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data/data/xapian_node' && go run . -config=config-master-node1.json 2>&1 | tee \"$LOG_DIR/go-master-1.log\""
 sleep 5
 
-# # 4.4 Start Node 1 Go Sub
-# print_info "🚀 Starting Node 1 Go Sub (go-sub-1)..."
+# 4.4 Start Node 1 Go Sub
+print_info "🚀 Starting Node 1 Go Sub (go-sub-1)..."
 tmux new-session -d -s go-sub-1 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data-write/data/xapian_node' && go run . -config=config-sub-node1.json  2>&1 | tee \"$LOG_DIR/go-sub-1.log\""
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data-write/data/xapian_node' && go run . -config=config-sub-node1.json 2>&1 | tee \"$LOG_DIR/go-sub-1.log\""
 sleep 5
 
 print_info "⏳ Waiting for Go nodes to stabilize (10s)..."
@@ -368,7 +305,8 @@ print_step "Bước 5: Start Rust Consensus Nodes..."
 cd "$METANODE_ROOT"
 
 # 5.1 Start Standard Nodes (0, 2, 3, 4)
-for id in 0 2 3; do
+# Node 4 là full node - mode (Validator/SyncOnly) được xác định tự động bởi committee
+for id in 0 2 3 4; do
     print_info "🚀 Starting Rust Node $id (Standard)..."
     tmux new-session -d -s "metanode-$id" -c "$METANODE_ROOT" \
         "export RUST_LOG=info,consensus_core=debug; $BINARY start --config config/node_$id.toml 2>&1 | tee \"$LOG_DIR/metanode-$id.log\""
@@ -385,60 +323,161 @@ print_info "⏳ Waiting for Rust nodes to start..."
 sleep 5
 
 # ==============================================================================
-# Step 6: Deploy Cross-Chain Contract
+# Step 5.5: Update add_validator_node4 config with new keys
 # ==============================================================================
-# print_step "Bước 6: Deploy Cross-Chain Gateway Contract..."
+print_step "Bước 5.5: Update add_validator_node4 config..."
 
-# print_info "⏳ Waiting for blockchain to stabilize (10s)..."
-# sleep 10
+ADD_VALIDATOR_TOOL_DIR="$GO_PROJECT_ROOT/cmd/tool/add_validator_node4"
+if [ -d "$ADD_VALIDATOR_TOOL_DIR" ]; then
+    print_info "🔧 Updating add_validator_node4 config from new committee.json..."
+    
+    # Read chain_id from genesis
+    CHAIN_ID=$(python3 -c "import json; print(json.load(open('$GENESIS_OUTPUT'))['config']['chainId'])" 2>/dev/null || echo "991")
+    
+    # Extract node-4 info from committee.json and update config
+    python3 << PYTHON_EOF
+import json
+import re
+import os
 
-# # Deploy Cross-Chain Gateway with sourceNationId=1, destNationId=2
-# DEPLOY_SCRIPT="$METANODE_ROOT/scripts/deployContract/deploy_crosschain.sh"
-# if [ -f "$DEPLOY_SCRIPT" ]; then
-#     print_info "🔨 Deploying Cross-Chain Gateway (Source: 1, Dest: 2)..."
-#     cd "$METANODE_ROOT/scripts/deployContract"
+committee_path = "$METANODE_ROOT/config/committee.json"
+tool_dir = "$ADD_VALIDATOR_TOOL_DIR"
+chain_id = $CHAIN_ID
+
+with open(committee_path, 'r') as f:
+    committee = json.load(f)
+
+# Find node-4 in authorities (by port 9004 or hostname)
+node4 = None
+for auth in committee['authorities']:
+    hostname = auth.get('hostname', '')
+    address = auth.get('address', '')
+    if 'node-4' in hostname or 'node_4' in hostname or address.endswith(':9004'):
+        node4 = auth
+        break
+
+if node4:
+    print(f"   Found node-4 in committee.json: {node4.get('hostname')}")
     
-#     # Ensure .env file has correct RPC URL
-#     if [ ! -f ".env.crosschain" ]; then
-#         print_info "📝 Creating .env.crosschain for deployment..."
-#         cat > .env.crosschain << EOF
-# RPC_URL="http://192.168.1.234:8545"
-# PRIVATE_KEY="05cd9f0d166ed8f34880428d4a6cab265736bc6ff2094692047b2fa2736648eb"
-# SOURCE_NATION_ID="1"
-# DEST_NATION_ID="2"
-# EOF
-#     fi
+    # Update main.go with new keys
+    main_go_path = os.path.join(tool_dir, "main.go")
+    if os.path.exists(main_go_path):
+        with open(main_go_path, 'r') as f:
+            content = f.read()
+        
+        # Replace node4Info struct values
+        content = re.sub(r'Address:\s*"[^"]*"', f'Address:      "{node4.get("address", "/ip4/127.0.0.1/tcp/9004")}"', content)
+        content = re.sub(r'Hostname:\s*"[^"]*"', f'Hostname:     "{node4.get("hostname", "node-4")}"', content)
+        content = re.sub(r'AuthorityKey:\s*"[^"]*"', f'AuthorityKey: "{node4.get("authority_key", "")}"', content)
+        content = re.sub(r'ProtocolKey:\s*"[^"]*"', f'ProtocolKey:  "{node4.get("protocol_key", "")}"', content)
+        content = re.sub(r'NetworkKey:\s*"[^"]*"', f'NetworkKey:   "{node4.get("network_key", "")}"', content)
+        
+        with open(main_go_path, 'w') as f:
+            f.write(content)
+        print("   ✅ Updated main.go with node-4 keys")
     
-#     # Run deployment
-#     if bash deploy_crosschain.sh 1 2; then
-#         print_info "✅ Cross-Chain Gateway deployed successfully!"
-#     else
-#         print_warn "⚠️  Cross-Chain Gateway deployment failed (continuing anyway)"
-#     fi
+    # Create config.json with a unique BLS key for node-4
+    # HARDCODED VALID KEY AND ADDRESS to avoid SIGSEGV and dependency issues
+    node4_bls_key = "6c8489f6f86fea58b26e34c8c37e13e5993651f09f5f96739d9febf65aded718"
+    node4_eth_address = "a87c6FD018Da82a52158B0328D61BAc29b556e86".lower()
     
-#     cd "$METANODE_ROOT"
-# else
-#     print_warn "⚠️  Deployment script not found at $DEPLOY_SCRIPT"
-# fi
+    config = {
+        "private_key": node4_bls_key,
+        "version": "0.0.1.0",
+        "parent_address": "0x0000000000000000000000000000000000000000",
+        "parent_connection_address": "127.0.0.1:4200",
+        "parent_connection_type": "TCP_CONNECTION",
+        "chain_id": chain_id
+    }
+    
+    config_path = os.path.join(tool_dir, "config.json")
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"   ✅ Created config.json with HARDCODED valid key")
+    print(f"   Chain ID: {chain_id}")
+    
+    # CRITICAL: Add node-4 address to genesis.json alloc with balance
+    try:
+        # Add to genesis.json alloc
+        genesis_path = "$GENESIS_OUTPUT"
+        with open(genesis_path, 'r') as f:
+            genesis = json.load(f)
+        
+        # Add node-4 address with balance
+        node4_balance = "2000000000000000000000000000000"  # Same as other validators
+        node4_bls_pub = "0x86d5de6f7c9c13cc0d959a553cc0e4853ba5faae45a28da9bddc8ef8e104eb5d3dece8dfaa24f11b4243ec27537e3184"
+        
+        # HARDCODED OLD ADDR TO REMOVE
+        old_node4_addr = "c98223c939f0313d5b5dace9c3c3759af4de663a".lower()
+
+        # Check if alloc exists or is list
+        if 'alloc' not in genesis:
+             genesis['alloc'] = []
+             
+        # Filter out OLD incorrect address FIRST if it exists
+        genesis['alloc'] = [entry for entry in genesis['alloc'] if entry.get('address','').lower().replace('0x','') != old_node4_addr]
+             
+        # Check if new address present
+        found = False
+        for entry in genesis['alloc']:
+             if entry['address'].lower().replace('0x','') == node4_eth_address:
+                 entry['balance'] = node4_balance
+                 entry['publicKeyBls'] = node4_bls_pub
+                 found = True
+                 break
+        
+        if not found:
+             genesis['alloc'].append({
+                 "address": "0x" + node4_eth_address,
+                 "balance": node4_balance,
+                 "pending_balance": "0",
+                 "last_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                 "device_key": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                 "publicKeyBls": node4_bls_pub
+             })
+        
+        with open(genesis_path, 'w') as f:
+            json.dump(genesis, f, indent=2)
+        
+        print(f"   ✅ Removed old node-4 ({old_node4_addr}) if existed")
+        print(f"   ✅ Added/Updated node-4 address 0x{node4_eth_address} to genesis.json with balance")
+    except Exception as e:
+        print(f"   ⚠️  Could not add node-4 to genesis: {e}")
+else:
+    print("   ⚠️  node-4 not found in committee.json")
+PYTHON_EOF
+
+    # Rebuild the tool
+    print_info "🔨 Rebuilding add_validator_node4..."
+    cd "$ADD_VALIDATOR_TOOL_DIR"
+    go build -o add_validator_node4 . 2>&1 && print_info "   ✅ Tool rebuilt successfully" || print_warn "   Build failed, manual rebuild needed"
+    cd "$METANODE_ROOT"
+fi
 
 # ==============================================================================
-# Step 7: Summary
+# Step 6: Summary
 # ==============================================================================
+
 echo ""
 print_info "=========================================="
 print_info "🎉 MIXED SYSTEM STARTED SUCCESSFULLY!"
 print_info "=========================================="
 echo ""
 print_info "📊 Standard System (Nodes 0, 2, 3, 4):"
-print_info "  - Rust: tmux attach -t metanode-0 (etc)"
-print_info "  - Go:   tmux attach -t go-master / go-sub"
+print_info "  - Rust Node 0: tmux attach -t metanode-0"
+print_info "  - Rust Node 2: tmux attach -t metanode-2"
+print_info "  - Rust Node 3: tmux attach -t metanode-3"
+print_info "  - Rust Node 4: tmux attach -t metanode-4 (Full Node)"
+print_info "  - Go Master:   tmux attach -t go-master"
+print_info "  - Go Sub:      tmux attach -t go-sub"
 print_info ""
 print_info "📊 Node 1 Separate System (Node 1):"
 print_info "  - Rust: tmux attach -t metanode-1-sep"
 print_info "  - Go:   tmux attach -t go-master-1 / go-sub-1"
 echo ""
-print_info "📋 Cross-Chain Gateway deployed with:"
-print_info "  - Source Nation ID: 1"
-print_info "  - Dest Nation ID: 2"
-echo ""
 print_info "Log files in $LOG_DIR/*.log"
+echo ""
+print_info "📝 To register Node-4 as validator:"
+print_info "  cd $GO_PROJECT_ROOT/cmd/tool/add_validator_node4"
+print_info "  ./add_validator_node4 config.json"
+echo ""

@@ -95,6 +95,10 @@ pub struct Parameters {
     /// Tonic network settings.
     #[serde(default = "TonicParameters::default")]
     pub tonic: TonicParameters,
+
+    /// Enable adaptive delay mechanism (default: true).
+    #[serde(default = "Parameters::default_adaptive_delay_enabled")]
+    pub adaptive_delay_enabled: bool,
 }
 
 impl Parameters {
@@ -149,16 +153,28 @@ impl Parameters {
     }
 
     pub(crate) fn default_round_prober_interval_ms() -> u64 {
-        if cfg!(msim) { 1000 } else { 5000 }
+        if cfg!(msim) {
+            1000
+        } else {
+            5000
+        }
     }
 
     pub(crate) fn default_round_prober_request_timeout_ms() -> u64 {
-        if cfg!(msim) { 800 } else { 4000 }
+        if cfg!(msim) {
+            800
+        } else {
+            4000
+        }
     }
 
     pub(crate) fn default_propagation_delay_stop_proposal_threshold() -> u32 {
         // Propagation delay is usually 0 round in production.
-        if cfg!(msim) { 2 } else { 5 }
+        if cfg!(msim) {
+            2
+        } else {
+            5
+        }
     }
 
     pub(crate) fn default_dag_state_cached_rounds() -> u32 {
@@ -188,6 +204,10 @@ impl Parameters {
         // while keeping the total number of inflight fetches and unprocessed fetched commits limited.
         32
     }
+
+    pub(crate) fn default_adaptive_delay_enabled() -> bool {
+        true
+    }
 }
 
 impl Default for Parameters {
@@ -210,6 +230,7 @@ impl Default for Parameters {
             commit_sync_batch_size: Parameters::default_commit_sync_batch_size(),
             commit_sync_batches_ahead: Parameters::default_commit_sync_batches_ahead(),
             tonic: TonicParameters::default(),
+            adaptive_delay_enabled: Parameters::default_adaptive_delay_enabled(),
         }
     }
 }

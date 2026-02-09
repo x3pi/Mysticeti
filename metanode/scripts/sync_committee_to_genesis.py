@@ -145,18 +145,21 @@ def sync_committee_to_genesis(committee_path: str, genesis_path: str):
         final_genesis['config'] = {}
     
     existing_timestamp = final_genesis['config'].get('epoch_timestamp_ms')
+    # Get epoch_duration from config, default to 600s (10 minutes)
+    epoch_duration_seconds = final_genesis['config'].get('epoch_duration_seconds', 600)
+    
     if existing_timestamp is None:
         # Chưa có timestamp - set current time
         final_genesis['config']['epoch_timestamp_ms'] = current_timestamp_ms
         print(f"  📅 Set epoch_timestamp_ms: {current_timestamp_ms} (was not set)")
     else:
-        # Có timestamp - check nếu quá cũ (hơn 1 giờ)
+        # Có timestamp - check nếu quá cũ (hơn epoch_duration)
         elapsed_seconds = (current_timestamp_ms - existing_timestamp) / 1000
-        if elapsed_seconds > 3600:  # Hơn 1 giờ
-            print(f"  ⚠️  Existing epoch_timestamp_ms is {elapsed_seconds:.0f}s old, updating to current time")
+        if elapsed_seconds > epoch_duration_seconds:  # Hơn epoch_duration -> reset để tránh instant epoch advance
+            print(f"  ⚠️  Existing epoch_timestamp_ms is {elapsed_seconds:.0f}s old (> {epoch_duration_seconds}s epoch), resetting to current time")
             final_genesis['config']['epoch_timestamp_ms'] = current_timestamp_ms
         else:
-            print(f"  📅 Keeping existing epoch_timestamp_ms: {existing_timestamp} (elapsed: {elapsed_seconds:.0f}s)")
+            print(f"  📅 Keeping existing epoch_timestamp_ms: {existing_timestamp} (elapsed: {elapsed_seconds:.0f}s < {epoch_duration_seconds}s)")
     
     # ĐẢM BẢO các trường khác được giữ nguyên
     # alloc, config, etc. đã được copy từ genesis gốc

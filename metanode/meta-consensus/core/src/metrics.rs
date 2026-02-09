@@ -4,10 +4,11 @@
 use std::sync::Arc;
 
 use prometheus::{
-    Gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry,
-    exponential_buckets, register_gauge_with_registry, register_histogram_vec_with_registry, register_histogram_with_registry,
-    register_int_counter_vec_with_registry, register_int_counter_with_registry,
-    register_int_gauge_vec_with_registry, register_int_gauge_with_registry, Error as PrometheusError,
+    exponential_buckets, register_gauge_with_registry, register_histogram_vec_with_registry,
+    register_histogram_with_registry, register_int_counter_vec_with_registry,
+    register_int_counter_with_registry, register_int_gauge_vec_with_registry,
+    register_int_gauge_with_registry, Error as PrometheusError, Gauge, Histogram, HistogramVec,
+    IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry,
 };
 
 use crate::network::metrics::NetworkMetrics;
@@ -32,11 +33,7 @@ fn register_or_replace_int_gauge_vec(
     }
 }
 
-fn register_or_replace_int_gauge(
-    name: &str,
-    help: &str,
-    registry: &Registry,
-) -> IntGauge {
+fn register_or_replace_int_gauge(name: &str, help: &str, registry: &Registry) -> IntGauge {
     match register_int_gauge_with_registry!(name, help, registry) {
         Ok(metric) => metric,
         Err(PrometheusError::AlreadyReg) => {
@@ -47,11 +44,7 @@ fn register_or_replace_int_gauge(
     }
 }
 
-fn register_or_replace_gauge(
-    name: &str,
-    help: &str,
-    registry: &Registry,
-) -> Gauge {
+fn register_or_replace_gauge(name: &str, help: &str, registry: &Registry) -> Gauge {
     match register_gauge_with_registry!(name, help, registry) {
         Ok(metric) => metric,
         Err(PrometheusError::AlreadyReg) => {
@@ -111,11 +104,7 @@ fn register_or_replace_int_counter_vec(
     }
 }
 
-fn register_or_replace_int_counter(
-    name: &str,
-    help: &str,
-    registry: &Registry,
-) -> IntCounter {
+fn register_or_replace_int_counter(name: &str, help: &str, registry: &Registry) -> IntCounter {
     match register_int_counter_with_registry!(name, help, registry) {
         Ok(metric) => metric,
         Err(PrometheusError::AlreadyReg) => {
@@ -198,7 +187,7 @@ pub struct Metrics {
     pub(crate) network_metrics: NetworkMetrics,
 }
 
-pub(crate) fn initialise_metrics(registry: Registry) -> Arc<Metrics> {
+pub fn initialise_metrics(registry: Registry) -> Arc<Metrics> {
     let node_metrics = NodeMetrics::new(&registry);
     let network_metrics = NetworkMetrics::new(&registry);
 
@@ -208,7 +197,7 @@ pub(crate) fn initialise_metrics(registry: Registry) -> Arc<Metrics> {
     })
 }
 
-pub(crate) fn test_metrics() -> Arc<Metrics> {
+pub fn test_metrics() -> Arc<Metrics> {
     initialise_metrics(Registry::new())
 }
 

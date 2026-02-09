@@ -13,6 +13,7 @@ use tokio::time::sleep; // [Added] Import sleep for retry mechanism
 use tracing::{error, info, trace, warn};
 
 use crate::consensus::checkpoint::calculate_global_exec_index;
+use crate::node::block_coordinator::BlockCoordinator;
 use crate::node::executor_client::ExecutorClient;
 use crate::types::tx_hash::calculate_transaction_hash_hex;
 
@@ -41,7 +42,12 @@ pub struct CommitProcessor {
     /// Optional callback to handle EndOfEpoch system transactions
     /// Called immediately when an EndOfEpoch system transaction is detected in a committed sub-dag
     /// Uses commit finalization approach (like Sui) - no buffer needed as commits are processed sequentially
-    epoch_transition_callback: Option<Arc<dyn Fn(u64, u64, u32) -> Result<()> + Send + Sync>>,
+    epoch_transition_callback: Option<Arc<dyn Fn(u64, u64, u64) -> Result<()> + Send + Sync>>, // CHANGED: u32 -> u64
+    /// Multi-epoch committee cache: ETH addresses keyed by epoch
+    /// Supports looking up leaders from previous epochs during transitions
+    epoch_eth_addresses: Arc<tokio::sync::Mutex<std::collections::HashMap<u64, Vec<Vec<u8>>>>>,
+    /// Block Coordinator for dual-stream block production (optional)
+    block_coordinator: Option<Arc<BlockCoordinator>>,
 }
 
 impl CommitProcessor {
@@ -59,6 +65,10 @@ impl CommitProcessor {
             is_transitioning: None,
             pending_transactions_queue: None,
             epoch_transition_callback: None,
+            epoch_eth_addresses: Arc::new(
+                tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            block_coordinator: None,
         }
     }
 
@@ -130,9 +140,42 @@ impl CommitProcessor {
     /// Set callback to handle EndOfEpoch system transactions
     pub fn with_epoch_transition_callback<F>(mut self, callback: F) -> Self
     where
-        F: Fn(u64, u64, u32) -> Result<()> + Send + Sync + 'static,
+        F: Fn(u64, u64, u64) -> Result<()> + Send + Sync + 'static, // CHANGED: u32 -> u64
     {
         self.epoch_transition_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Set epoch ETH addresses HashMap for multi-epoch leader lookup
+    /// Accepts a shared reference to the node's epoch_eth_addresses
+    pub fn with_epoch_eth_addresses(
+        mut self,
+        epoch_eth_addresses: Arc<tokio::sync::Mutex<std::collections::HashMap<u64, Vec<Vec<u8>>>>>,
+    ) -> Self {
+        self.epoch_eth_addresses = epoch_eth_addresses;
+        self
+    }
+
+    /// Legacy method for backward compatibility - creates HashMap with epoch 0
+    #[allow(dead_code)]
+    pub fn with_validator_eth_addresses(mut self, eth_addresses: Vec<Vec<u8>>) -> Self {
+        let mut map = std::collections::HashMap::new();
+        map.insert(self.current_epoch, eth_addresses);
+        self.epoch_eth_addresses = Arc::new(tokio::sync::Mutex::new(map));
+        self
+    }
+
+    /// Get a clone of the Arc to epoch_eth_addresses for external updates
+    #[allow(dead_code)]
+    pub fn get_epoch_eth_addresses_arc(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<std::collections::HashMap<u64, Vec<Vec<u8>>>>> {
+        self.epoch_eth_addresses.clone()
+    }
+
+    /// Set block coordinator for dual-stream block production
+    pub fn with_block_coordinator(mut self, coordinator: Arc<BlockCoordinator>) -> Self {
+        self.block_coordinator = Some(coordinator);
         self
     }
 
@@ -147,50 +190,25 @@ impl CommitProcessor {
         let pending_transactions_queue = self.pending_transactions_queue;
         let epoch_transition_callback = self.epoch_transition_callback;
 
-        // --- [FORK SAFETY FIX] ---
-        // Initialize local tracker. We read from shared state ONLY ONCE at startup.
-        // This ensures sequential consistency within the loop, preventing race conditions
-        // where we might read a stale index from the shared mutex.
-        let mut tracked_last_global_exec_index =
-            if let Some(ref shared_index) = self.shared_last_global_exec_index {
-                let index_guard = shared_index.lock().await;
-                *index_guard
+        // --- [FORK SAFETY FIX v2] ---
+        // CRITICAL: epoch_base_index is set ONCE at epoch start and never changes during epoch.
+        // This is the last_global_exec_index at the END of previous epoch (or 0 for epoch 0).
+        // All nodes receive this same value from Go via GetEpochBoundaryData API.
+        // Formula: global_exec_index = epoch_base_index + commit_index
+        // Since commit_index is consensus-agreed (from Mysticeti), all nodes compute same result.
+        let epoch_base_index = if let Some(ref shared_index) = self.shared_last_global_exec_index {
+            let index_guard = shared_index.lock().await;
+            *index_guard
+        } else {
+            // Fallback: try callback if shared index not available
+            if let Some(ref callback) = self.get_last_global_exec_index {
+                callback()
             } else {
-                // Fallback: try callback if shared index not available
-                if let Some(ref callback) = self.get_last_global_exec_index {
-                    callback()
-                } else {
-                    0
-                }
-            };
-
-        // #region agent log
-        {
-            use std::io::Write;
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap();
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/home/abc/chain-n/mtn-simple-2025/.cursor/debug.log")
-            {
-                let _ = writeln!(
-                    f,
-                    r#"{{"id":"log_{}_{}","timestamp":{},"location":"commit_processor.rs:124","message":"COMMIT PROCESSOR STARTED","data":{{"current_epoch":{},"last_global_exec_index":{},"next_expected_index":{},"hypothesisId":"A"}},"sessionId":"debug-session","runId":"run1"}}"#,
-                    ts.as_secs(),
-                    ts.as_nanos() % 1000000,
-                    ts.as_millis(),
-                    current_epoch,
-                    tracked_last_global_exec_index,
-                    next_expected_index
-                );
+                0
             }
-        }
-        // #endregion
-
-        info!("🚀 [COMMIT PROCESSOR] Started processing commits for epoch {} (last_global_exec_index={}, next_expected_index={})",
-            current_epoch, tracked_last_global_exec_index, next_expected_index);
+        };
+        info!("🚀 [COMMIT PROCESSOR] Started processing commits for epoch {} (epoch_base_index={}, next_expected_index={})",
+            current_epoch, epoch_base_index, next_expected_index);
 
         let mut last_heartbeat_commit = 0u32;
         let mut last_heartbeat_time = std::time::Instant::now();
@@ -239,19 +257,19 @@ impl CommitProcessor {
                     }
 
                     if commit_index == next_expected_index {
-                        // --- [FORK SAFETY IMPLEMENTATION] ---
-                        // Use the LOCAL tracker for calculation.
-                        // This guarantees deterministic increment: Index(N) = Index(N-1) + Blocks(N-1)
-                        let current_last_global_exec_index = tracked_last_global_exec_index;
-
+                        // --- [FORK SAFETY v2: CONSENSUS-BASED FORMULA] ---
+                        // global_exec_index = epoch_base_index + commit_index
+                        // - epoch_base_index: Fixed at epoch start, same for all nodes
+                        // - commit_index: From Mysticeti consensus, same for all nodes
+                        // Result: Deterministic across all nodes, even late joiners!
                         let global_exec_index = calculate_global_exec_index(
                             current_epoch,
                             commit_index,
-                            current_last_global_exec_index,
+                            epoch_base_index,
                         );
 
-                        info!("📊 [GLOBAL_EXEC_INDEX] Calculated: global_exec_index={}, epoch={}, commit_index={}, current_last_global_exec_index={}",
-                            global_exec_index, current_epoch, commit_index, current_last_global_exec_index);
+                        info!("📊 [GLOBAL_EXEC_INDEX] Calculated: global_exec_index={}, epoch={}, commit_index={}, epoch_base_index={}",
+                            global_exec_index, current_epoch, commit_index, epoch_base_index);
 
                         let total_txs_in_commit = subdag
                             .blocks
@@ -268,12 +286,13 @@ impl CommitProcessor {
                             executor_client.clone(),
                             pending_transactions_queue.clone(),
                             self.shared_last_global_exec_index.clone(),
+                            self.epoch_eth_addresses.clone(), // Multi-epoch committee cache
                         )
                         .await?;
 
-                        // Update local tracker immediately after successful processing.
-                        // The next iteration is GUARANTEED to see this updated value.
-                        tracked_last_global_exec_index = global_exec_index;
+                        // NOTE: epoch_base_index is NOT updated after each commit.
+                        // It remains constant throughout the epoch.
+                        // The shared_last_global_exec_index is updated for monitoring/visibility only.
 
                         if let Some(ref callback) = self.global_exec_index_callback {
                             callback(global_exec_index);
@@ -289,15 +308,12 @@ impl CommitProcessor {
                         if let Some((_block_ref, system_tx)) =
                             subdag.extract_end_of_epoch_transaction()
                         {
-                            if let Some((
-                                new_epoch,
-                                new_epoch_timestamp_ms,
-                                _commit_index_from_tx,
-                            )) = system_tx.as_end_of_epoch()
-                            {
+                            // SIMPLIFIED: as_end_of_epoch now returns (new_epoch, boundary_block)
+                            // Timestamp is derived from block header at boundary_block (by Go/Rust later)
+                            if let Some((new_epoch, boundary_block)) = system_tx.as_end_of_epoch() {
                                 info!(
-                                    "🎯 [SYSTEM TX] EndOfEpoch transaction detected in commit {}: epoch {} -> {}, total_txs_in_commit={}",
-                                    commit_index, current_epoch, new_epoch, total_txs_in_commit
+                                    "🎯 [SYSTEM TX] EndOfEpoch transaction detected in commit {}: epoch {} -> {}, boundary_block={}, total_txs_in_commit={}",
+                                    commit_index, current_epoch, new_epoch, boundary_block, total_txs_in_commit
                                 );
 
                                 if let Some(ref callback) = epoch_transition_callback {
@@ -306,9 +322,13 @@ impl CommitProcessor {
                                         commit_index, new_epoch, global_exec_index
                                     );
 
-                                    if let Err(e) =
-                                        callback(new_epoch, new_epoch_timestamp_ms, commit_index)
-                                    {
+                                    // CHANGED: Pass boundary_block instead of timestamp_ms
+                                    // Timestamp will be derived from boundary_block's block header
+                                    if let Err(e) = callback(
+                                        new_epoch,
+                                        boundary_block, // boundary_block (was timestamp_ms)
+                                        global_exec_index, // actual global_exec_index from commit
+                                    ) {
                                         warn!("❌ Failed to trigger epoch transition from system transaction: {}", e);
                                     }
                                 }
@@ -319,13 +339,11 @@ impl CommitProcessor {
                         while let Some(pending) = pending_commits.remove(&next_expected_index) {
                             let pending_commit_index = next_expected_index;
 
-                            // Use LOCAL tracker for pending commits as well
-                            let current_last_global_exec_index = tracked_last_global_exec_index;
-
+                            // Use epoch_base_index for pending commits as well (same formula)
                             let global_exec_index = calculate_global_exec_index(
                                 current_epoch,
                                 pending_commit_index,
-                                current_last_global_exec_index,
+                                epoch_base_index,
                             );
 
                             Self::process_commit(
@@ -335,11 +353,11 @@ impl CommitProcessor {
                                 executor_client.clone(),
                                 pending_transactions_queue.clone(),
                                 self.shared_last_global_exec_index.clone(),
+                                self.epoch_eth_addresses.clone(), // Multi-epoch committee cache
                             )
                             .await?;
 
-                            // Update local tracker
-                            tracked_last_global_exec_index = global_exec_index;
+                            // epoch_base_index is NOT updated (it's constant per epoch)
 
                             if let Some(ref callback) = commit_index_callback {
                                 callback(pending_commit_index);
@@ -433,6 +451,9 @@ impl CommitProcessor {
         executor_client: Option<Arc<ExecutorClient>>,
         pending_transactions_queue: Option<Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>>,
         shared_last_global_exec_index: Option<Arc<tokio::sync::Mutex<u64>>>,
+        validator_eth_addresses: Arc<
+            tokio::sync::Mutex<std::collections::HashMap<u64, Vec<Vec<u8>>>>,
+        >, // Multi-epoch committee cache
     ) -> Result<()> {
         let commit_index = subdag.commit_ref.index;
         let mut total_transactions = 0;
@@ -459,6 +480,189 @@ impl CommitProcessor {
 
         let has_system_tx = subdag.extract_end_of_epoch_transaction().is_some();
 
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // 🛡️ RUST-DRIVEN LEADER SELECTION (Critical Fork-Safety)
+        // Calculate leader_address for ALL commits (empty or not)
+        // NEVER send None - if we can't determine leader, BLOCK/PANIC
+        // ═══════════════════════════════════════════════════════════════════════════════
+        let leader_address: Option<Vec<u8>> = if executor_client.is_some() {
+            let leader_author_index = subdag.leader.author.value() as usize;
+
+            // STEP 1: Validate committee data exists (with retry for startup race condition)
+            let mut retry_attempts = 0;
+            let max_retries = 10; // 10 * 200ms = 2 seconds max wait
+
+            let resolved_address = loop {
+                let epoch_addresses = validator_eth_addresses.lock().await;
+
+                // Check if committee HashMap is loaded
+                if epoch_addresses.is_empty() {
+                    drop(epoch_addresses);
+                    retry_attempts += 1;
+                    if retry_attempts > max_retries {
+                        error!("🚨 [FATAL] epoch_eth_addresses STILL EMPTY after {} retries! Committee not loaded.", max_retries);
+                        error!("🚨 [FATAL] Cannot process commit #{} (global_exec_index={}) without valid committee data!", 
+                            commit_index, global_exec_index);
+                        panic!(
+                            "FORK-SAFETY: Committee data not loaded - refusing to process commits"
+                        );
+                    }
+                    warn!(
+                        "⏳ [LEADER] epoch_eth_addresses empty, waiting for committee... retry {}/{}",
+                        retry_attempts, max_retries
+                    );
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+
+                // Try to get committee for commit's epoch, with fallback to current or previous epoch
+                let eth_addresses = if let Some(addrs) = epoch_addresses.get(&epoch) {
+                    addrs
+                } else if epoch > 0 {
+                    // Try previous epoch (common during transition)
+                    if let Some(addrs) = epoch_addresses.get(&(epoch - 1)) {
+                        warn!("⚠️ [LEADER] Using epoch {} committee for commit from epoch {} (during transition)",
+                            epoch - 1, epoch);
+                        addrs
+                    } else {
+                        // Last resort: use any available epoch
+                        if let Some((available_epoch, addrs)) = epoch_addresses.iter().next() {
+                            warn!("⚠️ [LEADER] Using epoch {} committee for commit from epoch {} (only available)",
+                                available_epoch, epoch);
+                            addrs
+                        } else {
+                            error!("🚨 [FATAL] No committees available in cache!");
+                            panic!("FORK-SAFETY: No committee data in cache");
+                        }
+                    }
+                } else {
+                    // epoch == 0 but not found - use any available
+                    if let Some((available_epoch, addrs)) = epoch_addresses.iter().next() {
+                        warn!(
+                            "⚠️ [LEADER] Using epoch {} committee for commit from epoch 0",
+                            available_epoch
+                        );
+                        addrs
+                    } else {
+                        error!("🚨 [FATAL] No committees available in cache!");
+                        panic!("FORK-SAFETY: No committee data in cache");
+                    }
+                };
+
+                // STEP 2: Validate leader index is in range
+                let committee_size = eth_addresses.len();
+                if leader_author_index >= committee_size {
+                    // SELF-RECOVERY: Instead of panic, try to refresh the cache
+                    drop(epoch_addresses); // Release lock before refresh
+
+                    retry_attempts += 1;
+                    if retry_attempts > max_retries {
+                        error!(
+                            "🚨 [FATAL] leader_author_index {} >= committee_size {} after {} retries!",
+                            leader_author_index, committee_size, max_retries
+                        );
+                        error!("🚨 [FATAL] Committee size mismatch - expected at least {} validators but have {}!",
+                            leader_author_index + 1, committee_size);
+                        panic!("FORK-SAFETY: Leader index out of range - committee data inconsistent after all retries");
+                    }
+
+                    warn!(
+                        "⚠️ [LEADER] leader_index {} >= committee_size {} for epoch {}. Refreshing cache... retry {}/{}",
+                        leader_author_index, committee_size, epoch, retry_attempts, max_retries
+                    );
+
+                    // Try to refresh epoch_eth_addresses from Go
+                    if let Some(ref client) = executor_client {
+                        match client.get_epoch_boundary_data(epoch).await {
+                            Ok((returned_epoch, _ts, _boundary, validators))
+                                if returned_epoch == epoch =>
+                            {
+                                // Sort validators same way as committee builder
+                                let mut sorted_validators: Vec<_> =
+                                    validators.into_iter().collect();
+                                sorted_validators
+                                    .sort_by(|a, b| a.authority_key.cmp(&b.authority_key));
+
+                                let mut new_eth_addresses = Vec::new();
+                                for validator in &sorted_validators {
+                                    let eth_addr_bytes = if validator.address.starts_with("0x")
+                                        && validator.address.len() == 42
+                                    {
+                                        match hex::decode(&validator.address[2..]) {
+                                            Ok(bytes) if bytes.len() == 20 => bytes,
+                                            _ => vec![],
+                                        }
+                                    } else {
+                                        vec![]
+                                    };
+                                    new_eth_addresses.push(eth_addr_bytes);
+                                }
+
+                                // Update the cache
+                                let mut cache = validator_eth_addresses.lock().await;
+                                cache.insert(epoch, new_eth_addresses);
+                                info!(
+                                    "🔄 [LEADER] Refreshed epoch_eth_addresses for epoch {}: now have {} validators (cache size: {})",
+                                    epoch, sorted_validators.len(), cache.len()
+                                );
+                            }
+                            Ok((returned_epoch, _, _, _)) => {
+                                warn!(
+                                    "⚠️ [LEADER] Go returned epoch {} but requested epoch {}. Retrying...",
+                                    returned_epoch, epoch
+                                );
+                            }
+                            Err(e) => {
+                                warn!("⚠️ [LEADER] Failed to refresh epoch_eth_addresses: {}. Retrying...", e);
+                            }
+                        }
+                    }
+
+                    sleep(Duration::from_millis(500)).await;
+                    continue; // Retry the whole loop
+                }
+
+                // STEP 3: Validate ETH address is valid (20 bytes)
+                let addr = eth_addresses[leader_author_index].clone();
+                if addr.len() != 20 {
+                    // SELF-RECOVERY: Try to refresh for invalid address too
+                    drop(epoch_addresses);
+
+                    retry_attempts += 1;
+                    if retry_attempts > max_retries {
+                        error!(
+                            "🚨 [FATAL] eth_address at index {} has invalid length {} (expected 20) after {} retries!",
+                            leader_author_index, addr.len(), max_retries
+                        );
+                        panic!("FORK-SAFETY: Invalid ETH address in committee - cannot determine leader safely");
+                    }
+
+                    warn!(
+                        "⚠️ [LEADER] Invalid eth_address length at index {}. Refreshing cache... retry {}/{}",
+                        leader_author_index, retry_attempts, max_retries
+                    );
+                    sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+
+                // SUCCESS: Valid leader address found
+                if total_transactions > 0 || has_system_tx {
+                    info!(
+                        "✅ [LEADER] Resolved leader for commit #{} (epoch {}): index={} -> 0x{}",
+                        commit_index,
+                        epoch,
+                        leader_author_index,
+                        hex::encode(&addr)
+                    );
+                }
+                break Some(addr);
+            };
+
+            resolved_address
+        } else {
+            None // No executor client = no need for leader address
+        };
+
         if total_transactions > 0 || has_system_tx {
             info!(
                 "🔷 [Global Index: {}] Executing commit #{} (epoch={}): {} blocks, {} txs, has_system_tx={}",
@@ -466,10 +670,17 @@ impl CommitProcessor {
             );
 
             if let Some(ref client) = executor_client {
+                // leader_address already calculated and validated above
+
                 let mut retry_count = 0;
                 loop {
                     match client
-                        .send_committed_subdag(subdag, epoch, global_exec_index)
+                        .send_committed_subdag(
+                            subdag,
+                            epoch,
+                            global_exec_index,
+                            leader_address.clone(),
+                        )
                         .await
                     {
                         Ok(_) => {
@@ -485,9 +696,22 @@ impl CommitProcessor {
 
                             // Track committed transaction hashes to prevent duplicates during epoch transitions
                             // CRITICAL: Only track when commit is actually processed, not just submitted
+                            //
+                            // FIX 2026-02-06: Use try_lock() to avoid deadlock with transition handler
+                            // The transition handler may hold the node lock while waiting for Go to sync.
+                            // If we block here, CommitProcessor stalls and Go never gets more commits = DEADLOCK.
+                            // If lock is unavailable, skip tracking - next commit will retry.
                             if let Some(node_arc) = crate::node::get_transition_handler_node().await
                             {
-                                let node_guard = node_arc.lock().await;
+                                // Use try_lock() instead of lock().await to avoid blocking
+                                let node_guard = match node_arc.try_lock() {
+                                    Ok(guard) => guard,
+                                    Err(_) => {
+                                        // Lock held by transition handler - skip TX tracking to avoid deadlock
+                                        trace!("⏭️ [TX TRACKING] Skipping tracking for commit {} - node lock held by transition handler", commit_index);
+                                        break; // Exit the retry loop, commit was sent successfully
+                                    }
+                                };
                                 let mut hashes_guard =
                                     node_guard.committed_transaction_hashes.lock().await;
 
@@ -569,9 +793,10 @@ impl CommitProcessor {
             }
         } else {
             // Empty commit handling (heartbeat/tick)
+            // CRITICAL FIX: Use calculated leader_address, NOT None!
             if let Some(ref client) = executor_client {
                 match client
-                    .send_committed_subdag(subdag, epoch, global_exec_index)
+                    .send_committed_subdag(subdag, epoch, global_exec_index, leader_address.clone())
                     .await
                 {
                     Ok(_) => {
