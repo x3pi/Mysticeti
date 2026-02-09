@@ -176,6 +176,10 @@ pub struct NodeConfig {
     /// Refresh interval for peer discovery in seconds (default: 300 = 5 minutes)
     #[serde(default = "default_peer_discovery_refresh_secs")]
     pub peer_discovery_refresh_secs: u64,
+    /// Number of epochs to keep: 0 = archive mode (keep all), 3 = default
+    /// Controls legacy epoch store retention and startup epoch cleanup
+    #[serde(default = "default_epochs_to_keep")]
+    pub epochs_to_keep: usize,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -252,6 +256,10 @@ fn default_turbo_fetch_interval_ms() -> u64 {
 
 fn default_fetch_timeout_secs() -> u64 {
     10
+}
+
+fn default_epochs_to_keep() -> usize {
+    3 // Default: keep 3 most recent epochs
 }
 
 impl NodeConfig {
@@ -336,6 +344,7 @@ impl NodeConfig {
                 peer_rpc_addresses: vec![], // Empty by default, configure for WAN sync
                 enable_peer_discovery: false, // Disabled by default
                 go_rpc_url: None,           // Configure when enable_peer_discovery is true
+                epochs_to_keep: default_epochs_to_keep(),
                 peer_discovery_refresh_secs: default_peer_discovery_refresh_secs(),
             };
 
