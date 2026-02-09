@@ -1,0 +1,103 @@
+// Copyright (c) MetaNode Team
+// SPDX-License-Identifier: Apache-2.0
+
+//! Epoch storage helpers — local epoch detection and legacy store loading.
+//!
+//! These are free functions used during startup to detect local epoch state
+//! and optionally load previous-epoch RocksDB stores for historical sync.
+
+use consensus_core::storage::rocksdb_store::RocksDBStore;
+use tracing::{info, warn};
+
+/// Detect the highest epoch stored locally
+/// Returns 0 if no epoch data found
+pub(super) fn detect_local_epoch(storage_path: &std::path::Path) -> u64 {
+    let epochs_dir = storage_path.join("epochs");
+    if !epochs_dir.exists() {
+        return 0;
+    }
+
+    let mut max_epoch = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&epochs_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(epoch_str) = name.strip_prefix("epoch_") {
+                    if let Ok(epoch) = epoch_str.parse::<u64>() {
+                        max_epoch = max_epoch.max(epoch);
+                    }
+                }
+            }
+        }
+    }
+
+    max_epoch
+}
+
+/// Load previous epoch RocksDB stores into LegacyEpochStoreManager
+/// This enables nodes to serve historical commits when starting directly in a later epoch
+#[allow(dead_code)]
+pub(super) fn load_legacy_epoch_stores(
+    legacy_manager: &std::sync::Arc<consensus_core::LegacyEpochStoreManager>,
+    storage_path: &std::path::Path,
+    current_epoch: u64,
+) {
+    if current_epoch == 0 {
+        // No previous epochs to load
+        return;
+    }
+
+    let epochs_dir = storage_path.join("epochs");
+    if !epochs_dir.exists() {
+        info!("📦 [LEGACY STORE] No epochs directory found, skipping legacy store loading");
+        return;
+    }
+
+    // Load previous epochs (up to max_epochs in LegacyEpochStoreManager)
+    let mut loaded_count = 0;
+    for epoch in (0..current_epoch).rev() {
+        let epoch_db_path = epochs_dir
+            .join(format!("epoch_{}", epoch))
+            .join("consensus_db");
+
+        if epoch_db_path.exists() {
+            info!(
+                "📦 [LEGACY STORE] Found previous epoch {} database at {:?}",
+                epoch, epoch_db_path
+            );
+
+            // Create read-write store for the legacy epoch
+            // Note: RocksDB supports concurrent access from the same process
+            let legacy_store =
+                std::sync::Arc::new(RocksDBStore::new(epoch_db_path.to_str().unwrap_or("")));
+
+            legacy_manager.add_store(epoch, legacy_store);
+            loaded_count += 1;
+
+            info!(
+                "✅ [LEGACY STORE] Loaded epoch {} store for historical sync",
+                epoch
+            );
+
+            // Only load max_epochs number of stores
+            if loaded_count >= 1 {
+                break;
+            }
+        } else {
+            info!(
+                "⚠️ [LEGACY STORE] Epoch {} database not found at {:?}",
+                epoch, epoch_db_path
+            );
+        }
+    }
+
+    if loaded_count > 0 {
+        info!(
+            "📦 [LEGACY STORE] Successfully loaded {} previous epoch store(s) for sync",
+            loaded_count
+        );
+    } else {
+        warn!(
+            "⚠️ [LEGACY STORE] No previous epoch stores found. SyncOnly nodes may not be able to fetch historical commits."
+        );
+    }
+}
