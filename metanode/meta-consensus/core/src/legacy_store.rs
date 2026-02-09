@@ -49,7 +49,8 @@ impl LegacyEpochStoreManager {
         stores.insert(epoch, store);
 
         // Cleanup: keep only the most recent max_epochs
-        if stores.len() > self.max_epochs {
+        // max_epochs == 0: archive mode — keep all stores
+        if self.max_epochs > 0 && stores.len() > self.max_epochs {
             let oldest_epoch = *stores.keys().min().unwrap();
             stores.remove(&oldest_epoch);
             info!(

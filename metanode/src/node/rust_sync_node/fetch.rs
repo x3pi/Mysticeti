@@ -8,8 +8,8 @@ use super::RustSyncNode;
 use anyhow::Result;
 use consensus_config::{AuthorityIndex, Committee};
 use consensus_core::{
-    Commit, CommitAPI, CommitRange, GlobalCommitInfo, NetworkClient, SignedBlock, TonicClient,
-    VerifiedBlock,
+    BlockAPI, Commit, CommitAPI, CommitRange, GlobalCommitInfo, NetworkClient, SignedBlock,
+    TonicClient, VerifiedBlock,
 };
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -425,10 +425,24 @@ impl RustSyncNode {
                 }
 
                 // Push to queue - it will deduplicate and sort automatically
+                // CRITICAL FIX: Derive epoch from consensus blocks, NOT sync node's current_epoch.
+                // Each VerifiedBlock carries the epoch it was created in during consensus.
+                // This prevents epoch mismatch when syncing blocks across epoch boundaries
+                // (e.g., blocks committed in epoch 0 being incorrectly stamped as epoch 1).
+                let block_epoch = commit_blocks
+                    .first()
+                    .map(|b| b.epoch() as u64)
+                    .unwrap_or(current_epoch);
+                if block_epoch != current_epoch {
+                    info!(
+                        "🔄 [EPOCH-FIX] Using block epoch {} (from consensus) instead of current_epoch {} for commit global_exec_index={}",
+                        block_epoch, current_epoch, global_idx
+                    );
+                }
                 queue.push(CommitData {
                     commit,
                     blocks: commit_blocks,
-                    epoch: current_epoch,
+                    epoch: block_epoch,
                 });
                 pushed += 1;
             }

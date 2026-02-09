@@ -122,15 +122,19 @@ impl ConsensusNode {
                 local_epoch, go_epoch, go_epoch
             );
 
-            // Clear old epoch data that is stale
-            for epoch in local_epoch..go_epoch {
-                let epoch_path = storage_path.join("epochs").join(format!("epoch_{}", epoch));
-                if epoch_path.exists() {
-                    info!("🗑️ [CATCHUP] Clearing stale epoch {} data", epoch);
-                    if let Err(e) = std::fs::remove_dir_all(&epoch_path) {
-                        warn!("⚠️ [CATCHUP] Failed to clear epoch {} data: {}", epoch, e);
+            // Clear old epoch data that is stale (unless archive mode)
+            if config.epochs_to_keep > 0 {
+                for epoch in local_epoch..go_epoch {
+                    let epoch_path = storage_path.join("epochs").join(format!("epoch_{}", epoch));
+                    if epoch_path.exists() {
+                        info!("🗑️ [CATCHUP] Clearing stale epoch {} data", epoch);
+                        if let Err(e) = std::fs::remove_dir_all(&epoch_path) {
+                            warn!("⚠️ [CATCHUP] Failed to clear epoch {} data: {}", epoch, e);
+                        }
                     }
                 }
+            } else {
+                info!("📦 [CATCHUP] Archive mode (epochs_to_keep=0): keeping all epoch data");
             }
 
             go_epoch
@@ -683,7 +687,9 @@ impl ConsensusNode {
 
         let mut node = Self {
             authority,
-            legacy_store_manager: Arc::new(consensus_core::LegacyEpochStoreManager::new(2)), // Keep 2 previous epochs for cross-epoch sync
+            legacy_store_manager: Arc::new(consensus_core::LegacyEpochStoreManager::new(
+                config.epochs_to_keep,
+            )), // 0 = archive (keep all), N = keep N epochs
             node_mode: if is_in_committee {
                 NodeMode::Validator
             } else {
