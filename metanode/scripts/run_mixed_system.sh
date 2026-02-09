@@ -457,6 +457,8 @@ fi
 # ==============================================================================
 # Step 6: Summary
 # ==============================================================================
+cd "$GO_PROJECT_ROOT/Mysticeti/metanode/scripts/deployContract/deployCrossChain.go"
+./deploy_crosschain.sh
 
 echo ""
 print_info "=========================================="

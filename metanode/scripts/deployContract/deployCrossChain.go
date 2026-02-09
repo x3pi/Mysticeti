@@ -107,52 +107,19 @@ func main() {
 	}
 	globalAuth = deployerAuth
 
-	log.Printf("🚀 Starting Cross-Chain Gateway Deployment...")
+	log.Printf("🚀 Starting Cross-Chain Gateway Tool...")
 	log.Printf("📍 Deployer Address: %s", deployerAuth.From.Hex())
 	log.Printf("🌐 RPC URL: %s", config.RPCUrl)
 	log.Printf("🔗 Source Nation ID: %s", config.SourceNationID.String())
 	log.Printf("🔗 Dest Nation ID: %s", config.DestNationID.String())
 	log.Println("=====================================")
 
-	// Step 1: Deploy CrossChainGateway contract
-	log.Println("\n[1/2] Deploying CrossChainGateway contract...")
-	contractAddress, err := deployCrossChainGateway(client, deployerAuth, config.SourceNationID, config.DestNationID)
-	if err != nil {
-		log.Fatalf("Failed to deploy CrossChainGateway: %v", err)
-	}
-	globalContractAddress = contractAddress
-	log.Printf("✅ CrossChainGateway deployed at: %s", contractAddress.Hex())
-
-	// Step 2: Verify deployment by checking nation IDs
-	log.Println("\n[2/2] Verifying deployment...")
-	if err := verifyDeployment(client, contractAddress); err != nil {
-		log.Printf("⚠️  Warning: Verification failed: %v", err)
-	} else {
-		log.Println("✅ Deployment verified successfully")
-	}
-
-	log.Println("\n=====================================")
-	log.Println("🎉 Cross-Chain Gateway Deployment Completed!")
-	log.Println("=====================================")
-
-	// Save deployment info to file
-	deploymentInfo := map[string]interface{}{
-		"crossChainGateway": contractAddress.Hex(),
-		"sourceNationID":    config.SourceNationID.String(),
-		"destNationID":      config.DestNationID.String(),
-		"deployer":          deployerAuth.From.Hex(),
-		"rpcUrl":            config.RPCUrl,
-		"timestamp":         time.Now().Format(time.RFC3339),
-	}
-
-	saveDeploymentInfo(deploymentInfo)
-
 	// Interactive menu
-	showInteractiveMenu(client, deployerAuth, contractAddress)
+	showInteractiveMenu(client, deployerAuth, config)
 }
 
 // showInteractiveMenu displays interactive menu for contract interactions
-func showInteractiveMenu(client *ethclient.Client, auth *bind.TransactOpts, contractAddress common.Address) {
+func showInteractiveMenu(client *ethclient.Client, auth *bind.TransactOpts, config *Config) {
 	// Load ABI
 	abiData, err := os.ReadFile("crossChainAbi.json")
 	if err != nil {
@@ -173,9 +140,9 @@ func showInteractiveMenu(client *ethclient.Client, auth *bind.TransactOpts, cont
 		fmt.Println("\n=====================================")
 		fmt.Println("📋 Cross-Chain Gateway Menu")
 		fmt.Println("=====================================")
-		fmt.Println("1. Lock and Bridge (1 ETH to 0xbF2b4B9b9dFB6d23F7F0FC46981c2eC89f94A9F2)")
-		fmt.Println("2. Check Balance")
-		fmt.Println("3. Get Config")
+		fmt.Println("1. Deploy CrossChainGateway Contract")
+		fmt.Println("2. Lock and Bridge (1 ETH)")
+		fmt.Println("3. Check Balance")
 		fmt.Println("0. Exit")
 		fmt.Print("\nEnter your choice: ")
 
@@ -187,14 +154,39 @@ func showInteractiveMenu(client *ethclient.Client, auth *bind.TransactOpts, cont
 
 		switch choice {
 		case "1":
-			callLockAndBridge(client, auth, contractAddress, parsedABI)
+			contractAddress, err := deployCrossChainGateway(client, auth, config.SourceNationID, config.DestNationID)
+			if err != nil {
+				fmt.Printf("❌ Deployment failed: %v\n", err)
+				break
+			}
+			globalContractAddress = contractAddress
+			fmt.Printf("✅ CrossChainGateway deployed at: %s\n", contractAddress.Hex())
+			
+			// Save deployment info
+			deploymentInfo := map[string]interface{}{
+				"crossChainGateway": contractAddress.Hex(),
+				"sourceNationID":    config.SourceNationID.String(),
+				"destNationID":      config.DestNationID.String(),
+				"deployer":          auth.From.Hex(),
+				"rpcUrl":            config.RPCUrl,
+				"timestamp":         time.Now().Format(time.RFC3339),
+			}
+			saveDeploymentInfo(deploymentInfo)
+
 		case "2":
-			checkBalance(client, auth.From)
+			if globalContractAddress == (common.Address{}) {
+				fmt.Println("❌ Contract not deployed yet. Please deploy first (Option 1)")
+				break
+			}
+			callLockAndBridge(client, auth, globalContractAddress, parsedABI)
+
 		case "3":
-			getConfig(client, contractAddress, parsedABI)
+			checkBalance(client, auth.From)
+
 		case "0":
 			fmt.Println("\n👋 Goodbye!")
 			return
+
 		default:
 			fmt.Println("❌ Invalid choice. Please try again.")
 		}
@@ -284,32 +276,6 @@ func checkBalance(client *ethclient.Client, address common.Address) {
 	fmt.Printf("   Balance: %s ETH\n", ethBalance.String())
 }
 
-// getConfig gets the contract configuration
-func getConfig(client *ethclient.Client, contractAddress common.Address, parsedABI abi.ABI) {
-	fmt.Println("\n⚙️  Getting Contract Config...")
-
-	contract := bind.NewBoundContract(contractAddress, parsedABI, client, client, client)
-
-	var result []interface{}
-	callOpts := &bind.CallOpts{
-		Pending: false,
-		Context: context.Background(),
-	}
-
-	err := contract.Call(callOpts, &result, "getConfig")
-	if err != nil {
-		log.Printf("❌ Failed to call getConfig: %v", err)
-		return
-	}
-
-	if len(result) >= 2 {
-		sourceID := result[0].(*big.Int)
-		destID := result[1].(*big.Int)
-		fmt.Printf("   Source Nation ID: %s\n", sourceID.String())
-		fmt.Printf("   Dest Nation ID: %s\n", destID.String())
-	}
-}
-
 // deployCrossChainGateway deploys the CrossChainGateway contract
 func deployCrossChainGateway(client *ethclient.Client, auth *bind.TransactOpts, sourceNationID, destNationID *big.Int) (common.Address, error) {
 	log.Println("Deploying CrossChainGateway contract...")
@@ -384,42 +350,6 @@ func deployCrossChainGateway(client *ethclient.Client, auth *bind.TransactOpts, 
 	return receipt.ContractAddress, nil
 }
 
-// verifyDeployment verifies the deployed contract
-func verifyDeployment(client *ethclient.Client, contractAddress common.Address) error {
-	// Load ABI
-	abiData, err := os.ReadFile("crossChainAbi.json")
-	if err != nil {
-		return fmt.Errorf("failed to read ABI file: %w", err)
-	}
-
-	parsedABI, err := abi.JSON(strings.NewReader(string(abiData)))
-	if err != nil {
-		return fmt.Errorf("failed to parse ABI: %w", err)
-	}
-
-	// Create contract instance
-	contract := bind.NewBoundContract(contractAddress, parsedABI, client, client, client)
-
-	// Call getConfig function to verify
-	var result []interface{}
-	callOpts := &bind.CallOpts{
-		Pending: false,
-		Context: context.Background(),
-	}
-
-	err = contract.Call(callOpts, &result, "getConfig")
-	if err != nil {
-		return fmt.Errorf("failed to call getConfig: %w", err)
-	}
-
-	if len(result) >= 2 {
-		sourceID := result[0].(*big.Int)
-		destID := result[1].(*big.Int)
-		log.Printf("✅ Contract Config - Source Nation ID: %s, Dest Nation ID: %s", sourceID.String(), destID.String())
-	}
-
-	return nil
-}
 
 // getDeployerAuth creates a transaction auth from private key
 func getDeployerAuth(client *ethclient.Client, privateKeyHex string) (*bind.TransactOpts, error) {
