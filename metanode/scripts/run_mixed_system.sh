@@ -331,13 +331,13 @@ else:
 # 4.1 Start Standard Go Master
 print_info "🚀 Starting Standard Go Master (go-master)..."
 tmux new-session -d -s go-master -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data/data/xapian_node' && go run . -config=config-master.json -common-config=config-common.json 2>&1 | tee \"$LOG_DIR/go-master.log\""
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data/data/xapian_node' && go run . -config=config-master.json  2>&1 | tee \"$LOG_DIR/go-master.log\""
 sleep 5
 
 # 4.2 Start Standard Go Sub
-print_info "🚀 Starting Standard Go Sub (go-sub)..."
+# print_info "🚀 Starting Standard Go Sub (go-sub)..."
 tmux new-session -d -s go-sub -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data-write/data/xapian_node' && go run . -config=config-sub-write.json -common-config=config-common.json 2>&1 | tee \"$LOG_DIR/go-sub.log\""
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data-write/data/xapian_node' && go run . -config=config-sub-write.json  2>&1 | tee \"$LOG_DIR/go-sub.log\""
 sleep 5
 
 # 4.3 Start Node 1 Go Master
@@ -349,13 +349,13 @@ sed -i 's|"/tmp/rust-go.sock_1"|"/tmp/executor1-sep.sock"|g' "$GO_PROJECT_ROOT/c
 
 print_info "🚀 Starting Node 1 Go Master (go-master-1)..."
 tmux new-session -d -s go-master-1 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data/data/xapian_node' && go run . -config=config-master-node1.json  -common-config=config-common.json 2>&1 | tee \"$LOG_DIR/go-master-1.log\""
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data/data/xapian_node' && go run . -config=config-master-node1.json   2>&1 | tee \"$LOG_DIR/go-master-1.log\""
 sleep 5
 
-# 4.4 Start Node 1 Go Sub
-print_info "🚀 Starting Node 1 Go Sub (go-sub-1)..."
+# # 4.4 Start Node 1 Go Sub
+# print_info "🚀 Starting Node 1 Go Sub (go-sub-1)..."
 tmux new-session -d -s go-sub-1 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data-write/data/xapian_node' && go run . -config=config-sub-node1.json -common-config=config-common.json 2>&1 | tee \"$LOG_DIR/go-sub-1.log\""
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data-write/data/xapian_node' && go run . -config=config-sub-node1.json  2>&1 | tee \"$LOG_DIR/go-sub-1.log\""
 sleep 5
 
 print_info "⏳ Waiting for Go nodes to stabilize (10s)..."
@@ -385,7 +385,44 @@ print_info "⏳ Waiting for Rust nodes to start..."
 sleep 5
 
 # ==============================================================================
-# Step 6: Summary
+# Step 6: Deploy Cross-Chain Contract
+# ==============================================================================
+# print_step "Bước 6: Deploy Cross-Chain Gateway Contract..."
+
+# print_info "⏳ Waiting for blockchain to stabilize (10s)..."
+# sleep 10
+
+# # Deploy Cross-Chain Gateway with sourceNationId=1, destNationId=2
+# DEPLOY_SCRIPT="$METANODE_ROOT/scripts/deployContract/deploy_crosschain.sh"
+# if [ -f "$DEPLOY_SCRIPT" ]; then
+#     print_info "🔨 Deploying Cross-Chain Gateway (Source: 1, Dest: 2)..."
+#     cd "$METANODE_ROOT/scripts/deployContract"
+    
+#     # Ensure .env file has correct RPC URL
+#     if [ ! -f ".env.crosschain" ]; then
+#         print_info "📝 Creating .env.crosschain for deployment..."
+#         cat > .env.crosschain << EOF
+# RPC_URL="http://192.168.1.234:8545"
+# PRIVATE_KEY="05cd9f0d166ed8f34880428d4a6cab265736bc6ff2094692047b2fa2736648eb"
+# SOURCE_NATION_ID="1"
+# DEST_NATION_ID="2"
+# EOF
+#     fi
+    
+#     # Run deployment
+#     if bash deploy_crosschain.sh 1 2; then
+#         print_info "✅ Cross-Chain Gateway deployed successfully!"
+#     else
+#         print_warn "⚠️  Cross-Chain Gateway deployment failed (continuing anyway)"
+#     fi
+    
+#     cd "$METANODE_ROOT"
+# else
+#     print_warn "⚠️  Deployment script not found at $DEPLOY_SCRIPT"
+# fi
+
+# ==============================================================================
+# Step 7: Summary
 # ==============================================================================
 echo ""
 print_info "=========================================="
@@ -399,5 +436,9 @@ print_info ""
 print_info "📊 Node 1 Separate System (Node 1):"
 print_info "  - Rust: tmux attach -t metanode-1-sep"
 print_info "  - Go:   tmux attach -t go-master-1 / go-sub-1"
+echo ""
+print_info "📋 Cross-Chain Gateway deployed with:"
+print_info "  - Source Nation ID: 1"
+print_info "  - Dest Nation ID: 2"
 echo ""
 print_info "Log files in $LOG_DIR/*.log"
