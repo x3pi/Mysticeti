@@ -19,6 +19,13 @@ mod sync_loop;
 // Re-export public API
 pub use start::start_rust_sync_task_with_network;
 
+#[cfg(test)]
+mod epoch_recovery_tests;
+#[cfg(test)]
+mod fetch_tests;
+#[cfg(test)]
+mod sync_loop_tests;
+
 use crate::node::executor_client::ExecutorClient;
 use crate::node::peer_health::PeerHealthTracker;
 use crate::node::sync_metrics::SyncMetrics;

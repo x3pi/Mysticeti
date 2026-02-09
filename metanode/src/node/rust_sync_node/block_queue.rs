@@ -325,4 +325,69 @@ mod tests {
         assert_eq!(q.next_expected(), 50);
         assert_eq!(q.pending_count(), 2);
     }
+
+    /// Large gap (e.g., 1000 blocks) → drain_ready does NOT skip/jump
+    #[test]
+    fn test_blockqueue_large_gap_no_skip() {
+        let mut q = BlockQueue::new(1);
+
+        // Push block 1 and block 1001 (huge gap)
+        q.push(make_commit_data(1));
+        q.push(make_commit_data(1001));
+
+        // Only block 1 should drain; the gap prevents block 1001
+        let ready = q.drain_ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(q.next_expected(), 2);
+        assert_eq!(q.pending_count(), 1); // 1001 still waiting
+    }
+
+    /// Multiple interleaved push/drain cycles work correctly
+    #[test]
+    fn test_blockqueue_mixed_push_drain_push() {
+        let mut q = BlockQueue::new(1);
+
+        // Cycle 1: push [1, 2], drain
+        q.push(make_commit_data(1));
+        q.push(make_commit_data(2));
+        let ready = q.drain_ready();
+        assert_eq!(ready.len(), 2);
+        assert_eq!(q.next_expected(), 3);
+
+        // Cycle 2: push [3, 5] (gap at 4), drain
+        q.push(make_commit_data(3));
+        q.push(make_commit_data(5));
+        let ready = q.drain_ready();
+        assert_eq!(ready.len(), 1); // only 3
+        assert_eq!(q.next_expected(), 4);
+
+        // Fill gap and push more
+        q.push(make_commit_data(4));
+        q.push(make_commit_data(6));
+        let ready = q.drain_ready();
+        assert_eq!(ready.len(), 3); // 4, 5, 6
+        assert_eq!(q.next_expected(), 7);
+    }
+
+    /// sync_with_go clears old pending, then drain gets remaining
+    #[test]
+    fn test_blockqueue_go_sync_then_drain() {
+        let mut q = BlockQueue::new(1);
+
+        // Push a range of commits
+        for i in 1..=10 {
+            q.push(make_commit_data(i));
+        }
+        assert_eq!(q.pending_count(), 10);
+
+        // Go jumps to block 5 — clear blocks 1-5
+        q.sync_with_go(5);
+        assert_eq!(q.next_expected(), 6);
+
+        // Remaining blocks 6-10 should drain
+        let ready = q.drain_ready();
+        assert_eq!(ready.len(), 5);
+        assert_eq!(q.next_expected(), 11);
+        assert_eq!(q.pending_count(), 0);
+    }
 }
