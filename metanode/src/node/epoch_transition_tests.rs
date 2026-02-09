@@ -626,6 +626,19 @@ fn test_sync_metrics_creation() {
 
     metrics.current_epoch.set(5.0);
     assert_eq!(metrics.current_epoch.get(), 5.0);
+
+    // Verify new profiling metrics register and work
+    assert_eq!(metrics.blocks_per_second.get(), 0.0);
+    metrics.blocks_per_second.set(42.0);
+    assert_eq!(metrics.blocks_per_second.get(), 42.0);
+
+    // Histograms should be observable
+    metrics.go_state_query_seconds.observe(0.005);
+    metrics.deserialize_duration_seconds.observe(0.001);
+    metrics.process_queue_total_seconds.observe(0.05);
+    metrics.queue_drain_duration_seconds.observe(0.0001);
+    metrics.leader_resolve_duration_seconds.observe(0.002);
+    metrics.go_send_per_commit_seconds.observe(0.003);
 }
 
 // ============================================================================

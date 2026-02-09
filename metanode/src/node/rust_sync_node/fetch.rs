@@ -15,7 +15,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::bytes::Bytes;
 use tracing::{debug, info, trace, warn};
 
@@ -257,6 +257,7 @@ impl RustSyncNode {
         let mut all_block_refs = Vec::new();
         let mut temp_commits = Vec::new();
 
+        let deser_start = Instant::now();
         for serialized in &serialized_commits {
             match bcs::from_bytes::<Commit>(serialized) {
                 Ok(commit) => {
@@ -271,6 +272,9 @@ impl RustSyncNode {
                 }
             }
         }
+        self.metrics
+            .deserialize_duration_seconds
+            .observe(deser_start.elapsed().as_secs_f64());
 
         if all_block_refs.is_empty() {
             info!(
@@ -312,6 +316,7 @@ impl RustSyncNode {
                         authority_idx
                     );
 
+                    let block_deser_start = Instant::now();
                     for serialized in &serialized_blocks {
                         match bcs::from_bytes::<SignedBlock>(serialized) {
                             Ok(signed_block) => {
@@ -324,6 +329,9 @@ impl RustSyncNode {
                             }
                         }
                     }
+                    self.metrics
+                        .deserialize_duration_seconds
+                        .observe(block_deser_start.elapsed().as_secs_f64());
                 }
                 Err(e) => {
                     warn!(

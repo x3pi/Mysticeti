@@ -9,6 +9,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use std::time::Instant;
+
 use crate::network::peer_rpc::{query_peer_epoch_boundary_data, query_peer_epochs_network};
 
 impl RustSyncNode {
@@ -133,8 +135,12 @@ impl RustSyncNode {
     /// 3. Drain ready commits from queue → send to Go sequentially
     async fn sync_once(&mut self) -> Result<()> {
         // Get current state from Go - this is the AUTHORITATIVE source of truth
+        let go_query_start = Instant::now();
         let go_last_block = self.executor_client.get_last_block_number().await?;
         let go_epoch = self.executor_client.get_current_epoch().await?;
+        self.metrics
+            .go_state_query_seconds
+            .observe(go_query_start.elapsed().as_secs_f64());
 
         let rust_epoch = self.current_epoch.load(Ordering::SeqCst);
         let _epoch_base = self.epoch_base_index.load(Ordering::SeqCst);
@@ -276,6 +282,13 @@ impl RustSyncNode {
                 "📥 [RUST-SYNC] Sent {} blocks to Go (queue-based)",
                 blocks_sent
             );
+            // Update throughput gauge
+            let round_elapsed = go_query_start.elapsed().as_secs_f64();
+            if round_elapsed > 0.0 {
+                self.metrics
+                    .blocks_per_second
+                    .set(blocks_sent as f64 / round_elapsed);
+            }
         }
         // =============================================================================
         // PHASE 4: Check pending epoch transitions (from deferred AdvanceEpoch)

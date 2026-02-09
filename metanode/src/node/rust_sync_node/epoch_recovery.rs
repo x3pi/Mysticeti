@@ -7,7 +7,7 @@ use super::RustSyncNode;
 use anyhow::Result;
 use consensus_core::{CommitAPI, CommitRef, CommittedSubDag};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::network::peer_rpc::query_peer_epoch_boundary_data;
@@ -15,12 +15,20 @@ use crate::network::peer_rpc::query_peer_epoch_boundary_data;
 impl RustSyncNode {
     /// Process queue - drain ready commits and send to Go sequentially (Phase 3)
     pub(super) async fn process_queue(&self) -> Result<u32> {
+        let pq_timer = self.metrics.process_queue_total_seconds.start_timer();
+
         let mut ready_commits = {
+            let drain_start = Instant::now();
             let mut queue = self.block_queue.lock().await;
-            queue.drain_ready()
+            let drained = queue.drain_ready();
+            self.metrics
+                .queue_drain_duration_seconds
+                .observe(drain_start.elapsed().as_secs_f64());
+            drained
         };
 
         if ready_commits.is_empty() {
+            pq_timer.observe_duration();
             return Ok(0);
         }
 
@@ -49,6 +57,7 @@ impl RustSyncNode {
             let leader_author_index = subdag.leader.author.value() as usize;
 
             let mut retry_count = 0;
+            let resolve_start = Instant::now();
             let leader_address = loop {
                 // 1. Try to resolve from cache
                 {
@@ -170,8 +179,12 @@ impl RustSyncNode {
 
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             };
+            self.metrics
+                .leader_resolve_duration_seconds
+                .observe(resolve_start.elapsed().as_secs_f64());
 
             // Send to Go executor - DIRECT SEND (bypass buffer)
+            let send_start = Instant::now();
             match self
                 .executor_client
                 .send_committed_subdag_direct(
@@ -183,6 +196,9 @@ impl RustSyncNode {
                 .await
             {
                 Ok(_) => {
+                    self.metrics
+                        .go_send_per_commit_seconds
+                        .observe(send_start.elapsed().as_secs_f64());
                     debug!(
                         "✅ [RUST-SYNC] Sent block {} (commit {}) to Go",
                         commit_data.commit.global_exec_index(),
@@ -191,6 +207,9 @@ impl RustSyncNode {
                     blocks_sent += 1;
                 }
                 Err(e) => {
+                    self.metrics
+                        .go_send_per_commit_seconds
+                        .observe(send_start.elapsed().as_secs_f64());
                     warn!(
                         "⚠️ [RUST-SYNC] Failed to send block {} to Go: {}. Re-queuing {} commits.",
                         commit_data.commit.global_exec_index(),
