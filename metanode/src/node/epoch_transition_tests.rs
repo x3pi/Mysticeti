@@ -627,3 +627,300 @@ fn test_sync_metrics_creation() {
     metrics.current_epoch.set(5.0);
     assert_eq!(metrics.current_epoch.get(), 5.0);
 }
+
+// ============================================================================
+// Group 8: StateTransitionManager Edge Cases
+// ============================================================================
+
+#[tokio::test]
+async fn test_debounce_prevents_rapid_transitions() {
+    let manager = Arc::new(StateTransitionManager::new(1, true));
+
+    // First transition succeeds
+    manager.try_start_epoch_transition(2, "test").await.unwrap();
+    manager.complete_epoch_transition(2).await;
+    assert_eq!(manager.current_epoch(), 2);
+
+    // Immediate second transition should be debounced (within 3s window)
+    let result = manager.try_start_epoch_transition(3, "test").await;
+    assert!(
+        matches!(result, Err(TransitionError::Debouncing { .. })),
+        "Expected Debouncing error, got {:?}",
+        result
+    );
+
+    // Epoch should still be 2
+    assert_eq!(manager.current_epoch(), 2);
+}
+
+#[test]
+fn test_set_current_state_force_update() {
+    let manager = StateTransitionManager::new(1, true);
+    assert_eq!(manager.current_epoch(), 1);
+    assert!(manager.is_validator());
+
+    // Force update to epoch 10, SyncOnly
+    manager.set_current_state(10, false);
+    assert_eq!(manager.current_epoch(), 10);
+    assert!(!manager.is_validator());
+
+    // Force update back to Validator
+    manager.set_current_state(10, true);
+    assert!(manager.is_validator());
+
+    // Force skip to epoch 100
+    manager.set_current_state(100, true);
+    assert_eq!(manager.current_epoch(), 100);
+}
+
+#[tokio::test]
+async fn test_concurrent_epoch_and_mode_transitions() {
+    let manager = Arc::new(StateTransitionManager::new(1, false));
+
+    // Start epoch transition
+    manager
+        .try_start_epoch_transition(2, "epoch")
+        .await
+        .unwrap();
+    assert!(manager.is_transition_in_progress());
+
+    // Mode transition should be blocked while epoch in progress
+    let result = manager.try_start_mode_transition(true, "mode").await;
+    assert!(
+        matches!(result, Err(TransitionError::TransitionInProgress { .. })),
+        "Expected TransitionInProgress, got {:?}",
+        result
+    );
+
+    // Complete epoch, then mode should work (after debounce)
+    manager.complete_epoch_transition(2).await;
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    manager
+        .try_start_mode_transition(true, "mode")
+        .await
+        .unwrap();
+    manager.complete_mode_transition(true).await;
+    assert!(manager.is_validator());
+}
+
+#[tokio::test]
+async fn test_epoch_skip_allowed() {
+    let manager = Arc::new(StateTransitionManager::new(1, true));
+
+    // Skip from epoch 1 → 5 (should be accepted)
+    manager.try_start_epoch_transition(5, "skip").await.unwrap();
+    manager.complete_epoch_transition(5).await;
+    assert_eq!(manager.current_epoch(), 5);
+}
+
+// ============================================================================
+// Group 9: CommitteeSource Validation
+// ============================================================================
+
+use crate::node::committee_source::CommitteeSource;
+
+#[test]
+fn test_committee_source_validate_epoch_match() {
+    let source = CommitteeSource {
+        socket_path: "/dev/null".to_string(),
+        epoch: 5,
+        last_block: 1000,
+        is_peer: false,
+        peer_rpc_addresses: vec![],
+    };
+
+    assert!(source.validate_epoch(5));
+}
+
+#[test]
+fn test_committee_source_validate_epoch_mismatch() {
+    let source = CommitteeSource {
+        socket_path: "/dev/null".to_string(),
+        epoch: 5,
+        last_block: 1000,
+        is_peer: false,
+        peer_rpc_addresses: vec![],
+    };
+
+    assert!(!source.validate_epoch(3));
+    assert!(!source.validate_epoch(6));
+}
+
+#[test]
+fn test_committee_source_create_executor_client() {
+    let source = CommitteeSource {
+        socket_path: "/tmp/test_recv.sock".to_string(),
+        epoch: 1,
+        last_block: 0,
+        is_peer: true,
+        peer_rpc_addresses: vec!["10.0.0.1:8080".to_string()],
+    };
+
+    let client = source.create_executor_client("/tmp/test_send.sock");
+    // Client is created successfully (Arc<ExecutorClient>)
+    // ExecutorClient::new passes enabled=true by default
+    assert!(client.is_enabled());
+}
+
+// ============================================================================
+// Group 10: CheckpointManager Resume Instructions
+// ============================================================================
+
+#[test]
+fn test_resume_instructions_all_states() {
+    let cases = vec![
+        (TransitionState::NotStarted, "No action needed"),
+        (
+            TransitionState::AdvancedEpochToGo {
+                epoch: 1,
+                boundary_block: 0,
+                timestamp_ms: 0,
+            },
+            "fetch_committee",
+        ),
+        (
+            TransitionState::CommitteeFetched {
+                epoch: 1,
+                committee_hash: [0u8; 32],
+                validator_count: 4,
+            },
+            "stop_authority",
+        ),
+        (
+            TransitionState::AuthorityStopped {
+                epoch: 2,
+                previous_epoch: 1,
+            },
+            "start_new_epoch",
+        ),
+        (
+            TransitionState::Completed {
+                epoch: 2,
+                completed_at_ms: 1700000000000,
+            },
+            "No action needed",
+        ),
+    ];
+
+    for (state, expected_substr) in cases {
+        let instructions = CheckpointManager::get_resume_instructions(&state);
+        assert!(
+            instructions.contains(expected_substr),
+            "State '{}': expected instruction containing '{}', got: '{}'",
+            state.name(),
+            expected_substr,
+            instructions
+        );
+    }
+}
+
+// ============================================================================
+// Group 11: TransitionType Display
+// ============================================================================
+
+use crate::node::epoch_transition_manager::TransitionType;
+
+#[test]
+fn test_transition_type_display_epoch() {
+    let t = TransitionType::EpochChange {
+        from_epoch: 1,
+        to_epoch: 2,
+    };
+    assert_eq!(format!("{}", t), "Epoch(1 → 2)");
+}
+
+#[test]
+fn test_transition_type_display_mode() {
+    let t = TransitionType::ModeChange {
+        from_mode: "SyncOnly".to_string(),
+        to_mode: "Validator".to_string(),
+    };
+    assert_eq!(format!("{}", t), "Mode(SyncOnly → Validator)");
+}
+
+#[test]
+fn test_transition_type_display_epoch_and_mode() {
+    let t = TransitionType::EpochAndModeChange {
+        from_epoch: 3,
+        to_epoch: 4,
+        from_mode: "Validator".to_string(),
+        to_mode: "SyncOnly".to_string(),
+    };
+    assert_eq!(
+        format!("{}", t),
+        "Epoch(3 → 4) + Mode(Validator → SyncOnly)"
+    );
+}
+
+// ============================================================================
+// Group 12: TransitionError Display
+// ============================================================================
+
+#[test]
+fn test_transition_error_display_all_variants() {
+    let err1 = TransitionError::EpochAlreadyCurrent {
+        current: 5,
+        requested: 3,
+    };
+    assert!(format!("{}", err1).contains("5"));
+    assert!(format!("{}", err1).contains("3"));
+
+    let err2 = TransitionError::ModeAlreadyCurrent;
+    assert!(format!("{}", err2).contains("Mode already current"));
+
+    let err3 = TransitionError::TransitionInProgress {
+        current: Some("Epoch(1 → 2) by monitor".to_string()),
+        requested: "Mode(SyncOnly → Validator) by api".to_string(),
+    };
+    let display = format!("{}", err3);
+    assert!(display.contains("in progress"));
+
+    let err4 = TransitionError::Debouncing { remaining_ms: 2500 };
+    assert!(format!("{}", err4).contains("2500"));
+}
+
+// ============================================================================
+// Group 13: TransitionState Helpers
+// ============================================================================
+
+#[test]
+fn test_transition_state_epoch_and_name() {
+    // NotStarted: no epoch, name = "NotStarted"
+    let s = TransitionState::NotStarted;
+    assert_eq!(s.epoch(), None);
+    assert_eq!(s.name(), "NotStarted");
+
+    // AdvancedEpochToGo
+    let s = TransitionState::AdvancedEpochToGo {
+        epoch: 5,
+        boundary_block: 1000,
+        timestamp_ms: 1700000000000,
+    };
+    assert_eq!(s.epoch(), Some(5));
+    assert_eq!(s.name(), "AdvancedEpochToGo");
+
+    // CommitteeFetched
+    let s = TransitionState::CommitteeFetched {
+        epoch: 5,
+        committee_hash: [42u8; 32],
+        validator_count: 4,
+    };
+    assert_eq!(s.epoch(), Some(5));
+    assert_eq!(s.name(), "CommitteeFetched");
+
+    // AuthorityStopped
+    let s = TransitionState::AuthorityStopped {
+        epoch: 5,
+        previous_epoch: 4,
+    };
+    assert_eq!(s.epoch(), Some(5));
+    assert_eq!(s.name(), "AuthorityStopped");
+
+    // Completed
+    let s = TransitionState::Completed {
+        epoch: 5,
+        completed_at_ms: 1700000060000,
+    };
+    assert_eq!(s.epoch(), Some(5));
+    assert_eq!(s.name(), "Completed");
+}
