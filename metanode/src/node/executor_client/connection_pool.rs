@@ -181,4 +181,59 @@ mod tests {
         assert_eq!(pool.next_index.fetch_add(1, Ordering::Relaxed) % 3, 2);
         assert_eq!(pool.next_index.fetch_add(1, Ordering::Relaxed) % 3, 0); // wraps
     }
+
+    #[tokio::test]
+    async fn test_pool_reset_all() {
+        let addr = SocketAddress::Unix("/tmp/test_reset.sock".to_string());
+        let pool = ConnectionPool::new(addr, 4, 30);
+
+        // All slots should be None initially
+        for conn in &pool.connections {
+            let guard = conn.lock().await;
+            assert!(guard.is_none());
+        }
+
+        // Reset should not panic even when all slots are None
+        pool.reset_all().await;
+
+        // After reset, all slots should still be None
+        for conn in &pool.connections {
+            let guard = conn.lock().await;
+            assert!(guard.is_none());
+        }
+    }
+
+    #[test]
+    fn test_pool_size_one() {
+        let addr = SocketAddress::Unix("/tmp/test_pool1.sock".to_string());
+        let pool = ConnectionPool::new(addr, 1, 30);
+        assert_eq!(pool.size(), 1);
+        assert_eq!(pool.connections.len(), 1);
+
+        // Round-robin with pool_size=1 should always return index 0
+        assert_eq!(pool.next_index.fetch_add(1, Ordering::Relaxed) % 1, 0);
+        assert_eq!(pool.next_index.fetch_add(1, Ordering::Relaxed) % 1, 0);
+        assert_eq!(pool.next_index.fetch_add(1, Ordering::Relaxed) % 1, 0);
+    }
+
+    #[test]
+    fn test_round_robin_large_counter() {
+        let addr = SocketAddress::Unix("/tmp/test_large.sock".to_string());
+        let pool = ConnectionPool::new(addr, 4, 30);
+
+        // Simulate many calls by setting counter to a large value
+        pool.next_index.store(1_000_000, Ordering::Relaxed);
+
+        // Should still correctly wrap around
+        let idx = pool.next_index.fetch_add(1, Ordering::Relaxed) % 4;
+        assert!(idx < 4);
+    }
+
+    #[test]
+    fn test_pool_timeout_config() {
+        let addr = SocketAddress::Unix("/tmp/test_timeout.sock".to_string());
+        let pool = ConnectionPool::new(addr, 2, 60);
+        assert_eq!(pool.connect_timeout_secs, 60);
+        assert_eq!(pool.size(), 2);
+    }
 }

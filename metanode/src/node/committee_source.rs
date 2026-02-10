@@ -454,9 +454,65 @@ impl CommitteeSource {
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn test_committee_source_local_only() {
-        // Test with empty peer list - should use local
-        // This is a placeholder - actual test would need mock clients
+    use super::*;
+
+    fn make_source(epoch: u64, last_block: u64, is_peer: bool) -> CommitteeSource {
+        CommitteeSource {
+            socket_path: "/tmp/test_recv.sock".to_string(),
+            epoch,
+            last_block,
+            is_peer,
+            peer_rpc_addresses: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_validate_epoch_matching() {
+        let source = make_source(5, 100, false);
+        assert!(source.validate_epoch(5));
+    }
+
+    #[test]
+    fn test_validate_epoch_mismatch() {
+        let source = make_source(5, 100, false);
+        assert!(!source.validate_epoch(6));
+        assert!(!source.validate_epoch(0));
+    }
+
+    #[test]
+    fn test_committee_source_local() {
+        let source = make_source(0, 0, false);
+        assert!(!source.is_peer);
+        assert_eq!(source.epoch, 0);
+        assert_eq!(source.last_block, 0);
+    }
+
+    #[test]
+    fn test_committee_source_peer() {
+        let source = make_source(3, 500, true);
+        assert!(source.is_peer);
+        assert_eq!(source.epoch, 3);
+        assert_eq!(source.last_block, 500);
+    }
+
+    #[test]
+    fn test_create_executor_client() {
+        let source = make_source(1, 50, false);
+        let client = source.create_executor_client("/tmp/test_send.sock");
+        assert!(client.is_enabled());
+        assert!(!client.can_commit());
+    }
+
+    #[test]
+    fn test_committee_source_with_peer_addresses() {
+        let source = CommitteeSource {
+            socket_path: "/tmp/test.sock".to_string(),
+            epoch: 2,
+            last_block: 200,
+            is_peer: true,
+            peer_rpc_addresses: vec!["127.0.0.1:9000".to_string(), "127.0.0.1:9001".to_string()],
+        };
+        assert_eq!(source.peer_rpc_addresses.len(), 2);
+        assert!(source.validate_epoch(2));
     }
 }

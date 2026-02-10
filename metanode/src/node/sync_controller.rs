@@ -257,4 +257,53 @@ mod tests {
         assert!(!controller.is_enabled());
         assert!(!controller.is_transitioning());
     }
+
+    #[test]
+    fn test_sync_state_display() {
+        assert_eq!(format!("{}", SyncState::Disabled), "Disabled");
+        assert_eq!(format!("{}", SyncState::Enabled), "Enabled");
+        assert_eq!(format!("{}", SyncState::Stopping), "Stopping");
+        assert_eq!(format!("{}", SyncState::Starting), "Starting");
+    }
+
+    #[test]
+    fn test_shutdown_receiver_initial_value() {
+        let controller = SyncController::new();
+        let rx = controller.get_shutdown_receiver();
+        // Initial shutdown signal should be false
+        assert_eq!(*rx.borrow(), false);
+    }
+
+    #[test]
+    fn test_default_trait() {
+        let controller = SyncController::default();
+        assert!(controller.is_disabled());
+        assert!(!controller.is_enabled());
+    }
+
+    #[test]
+    fn test_is_transitioning_states() {
+        let controller = SyncController::new();
+
+        // Starting state should be transitioning
+        controller
+            .state
+            .store(SyncState::Starting as u8, Ordering::SeqCst);
+        assert!(controller.is_transitioning());
+        assert!(!controller.is_enabled());
+        assert!(!controller.is_disabled());
+
+        // Stopping state should be transitioning
+        controller
+            .state
+            .store(SyncState::Stopping as u8, Ordering::SeqCst);
+        assert!(controller.is_transitioning());
+
+        // Enabled state should NOT be transitioning
+        controller
+            .state
+            .store(SyncState::Enabled as u8, Ordering::SeqCst);
+        assert!(!controller.is_transitioning());
+        assert!(controller.is_enabled());
+    }
 }

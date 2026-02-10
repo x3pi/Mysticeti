@@ -406,3 +406,138 @@ impl ExecutorClient {
 // Persistence functions are in persistence.rs
 // Block sync methods are in block_sync.rs
 // Socket abstraction is in socket_stream.rs
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_executor_client_creation_defaults() {
+        let client = ExecutorClient::new(
+            true,
+            true,
+            "/tmp/test_send.sock".to_string(),
+            "/tmp/test_recv.sock".to_string(),
+            None,
+        );
+        assert!(client.is_enabled());
+        assert!(client.can_commit());
+    }
+
+    #[test]
+    fn test_executor_client_disabled() {
+        let client = ExecutorClient::new(
+            false,
+            false,
+            "/tmp/test_send.sock".to_string(),
+            "/tmp/test_recv.sock".to_string(),
+            None,
+        );
+        assert!(!client.is_enabled());
+        assert!(!client.can_commit());
+    }
+
+    #[test]
+    fn test_executor_client_enabled_no_commit() {
+        let client = ExecutorClient::new(
+            true,
+            false,
+            "/tmp/test_send.sock".to_string(),
+            "/tmp/test_recv.sock".to_string(),
+            None,
+        );
+        assert!(client.is_enabled());
+        assert!(!client.can_commit());
+    }
+
+    #[tokio::test]
+    async fn test_executor_client_buffer_empty_on_creation() {
+        let client = ExecutorClient::new(
+            true,
+            true,
+            "/tmp/test_send.sock".to_string(),
+            "/tmp/test_recv.sock".to_string(),
+            None,
+        );
+        let buffer = client.send_buffer.lock().await;
+        assert!(buffer.is_empty(), "Send buffer should be empty on creation");
+    }
+
+    #[tokio::test]
+    async fn test_executor_client_initial_next_expected() {
+        // Default constructor starts at 1
+        let client = ExecutorClient::new(
+            true,
+            true,
+            "/tmp/test_send.sock".to_string(),
+            "/tmp/test_recv.sock".to_string(),
+            None,
+        );
+        let idx = client.next_expected_index.lock().await;
+        assert_eq!(*idx, 1, "Default next_expected_index should be 1");
+    }
+
+    #[tokio::test]
+    async fn test_executor_client_custom_initial_index() {
+        let client = ExecutorClient::new_with_initial_index(
+            true,
+            true,
+            "/tmp/test_send.sock".to_string(),
+            "/tmp/test_recv.sock".to_string(),
+            42,
+            None,
+        );
+        let idx = client.next_expected_index.lock().await;
+        assert_eq!(*idx, 42, "Custom next_expected_index should be 42");
+
+        // Buffer should still be empty even with custom index
+        let buffer = client.send_buffer.lock().await;
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_executor_client_circuit_breaker_initialized() {
+        let client = ExecutorClient::new(
+            true,
+            true,
+            "/tmp/test_send.sock".to_string(),
+            "/tmp/test_recv.sock".to_string(),
+            None,
+        );
+        // Circuit breaker should be accessible and in closed state
+        let cb = client.circuit_breaker();
+        assert!(cb.check("any_method").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_executor_client_reset_connections() {
+        let client = ExecutorClient::new(
+            true,
+            true,
+            "/tmp/test_send.sock".to_string(),
+            "/tmp/test_recv.sock".to_string(),
+            None,
+        );
+        // Reset should not panic even without active connections
+        client.reset_connections().await;
+
+        // Connections should be None after reset
+        let conn = client.connection.lock().await;
+        assert!(conn.is_none());
+        let req_conn = client.request_connection.lock().await;
+        assert!(req_conn.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_executor_client_sent_indices_empty() {
+        let client = ExecutorClient::new(
+            true,
+            true,
+            "/tmp/test_send.sock".to_string(),
+            "/tmp/test_recv.sock".to_string(),
+            None,
+        );
+        let sent = client.sent_indices.lock().await;
+        assert!(sent.is_empty(), "Sent indices should be empty on creation");
+    }
+}

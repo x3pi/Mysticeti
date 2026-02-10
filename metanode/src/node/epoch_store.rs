@@ -101,3 +101,54 @@ pub(super) fn load_legacy_epoch_stores(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_local_epoch_no_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = detect_local_epoch(tmp.path());
+        assert_eq!(result, 0, "No epochs dir should return 0");
+    }
+
+    #[test]
+    fn test_detect_local_epoch_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("epochs")).unwrap();
+        let result = detect_local_epoch(tmp.path());
+        assert_eq!(result, 0, "Empty epochs dir should return 0");
+    }
+
+    #[test]
+    fn test_detect_local_epoch_finds_max() {
+        let tmp = tempfile::tempdir().unwrap();
+        let epochs_dir = tmp.path().join("epochs");
+        std::fs::create_dir_all(&epochs_dir).unwrap();
+
+        // Create epoch directories
+        std::fs::create_dir_all(epochs_dir.join("epoch_0")).unwrap();
+        std::fs::create_dir_all(epochs_dir.join("epoch_3")).unwrap();
+        std::fs::create_dir_all(epochs_dir.join("epoch_7")).unwrap();
+        std::fs::create_dir_all(epochs_dir.join("epoch_2")).unwrap();
+
+        let result = detect_local_epoch(tmp.path());
+        assert_eq!(result, 7, "Should find highest epoch number");
+    }
+
+    #[test]
+    fn test_detect_local_epoch_ignores_non_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let epochs_dir = tmp.path().join("epochs");
+        std::fs::create_dir_all(&epochs_dir).unwrap();
+
+        // Non-epoch directories should be ignored
+        std::fs::create_dir_all(epochs_dir.join("not_epoch")).unwrap();
+        std::fs::create_dir_all(epochs_dir.join("epoch_abc")).unwrap();
+        std::fs::create_dir_all(epochs_dir.join("epoch_5")).unwrap();
+
+        let result = detect_local_epoch(tmp.path());
+        assert_eq!(result, 5, "Should ignore non-epoch directories");
+    }
+}
