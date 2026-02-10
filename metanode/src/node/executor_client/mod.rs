@@ -274,6 +274,20 @@ impl ExecutorClient {
         } else {
             warn!("⚠️  [INIT] Could not determine last block number. Keeping current next_expected_index. Rust will continue sending blocks, Go will buffer and process sequentially.");
         }
+
+        // ─── Readiness Signal ────────────────────────────────────────
+        let final_next_expected = *self.next_expected_index.lock().await;
+        let go_conn_status = if last_block_number_opt.is_some() {
+            "connected"
+        } else {
+            "unknown"
+        };
+        info!(
+            "✅ [READY] Rust executor: go_connection={}, next_expected={}, go_last_block={}",
+            go_conn_status,
+            final_next_expected,
+            last_block_number_opt.map_or("unknown".to_string(), |n| n.to_string())
+        );
     }
 
     /// Connect to executor socket (lazy connection with persistent retry)

@@ -723,7 +723,9 @@ pub(super) async fn stop_authority_and_poll_go(
 }
 
 /// Handle deferred epoch transition when Go hasn't synced to the required boundary yet.
-/// Updates sync-related state (NOT current_epoch!) and queues the transition.
+/// IMPROVED: Instead of just queuing (which causes deadlock if no consensus is running),
+/// poll Go with a timeout. If Go catches up, return Ok so the caller can proceed inline.
+/// Falls back to queue only after timeout.
 pub(super) async fn handle_deferred_epoch_transition(
     node: &mut ConsensusNode,
     new_epoch: u64,
@@ -732,8 +734,83 @@ pub(super) async fn handle_deferred_epoch_transition(
     go_current_block: u64,
 ) -> Result<()> {
     info!(
-        "📋 [DEFERRED EPOCH] Go block {} < required boundary {}. Queuing epoch {} transition.",
+        "📋 [DEFERRED EPOCH] Go block {} < required boundary {}. Polling Go for epoch {} (timeout=30s).",
         go_current_block, required_boundary, new_epoch
+    );
+
+    // IMPROVED: Poll Go with timeout instead of just queuing
+    // This prevents deadlock when consensus authority is already stopped
+    let poll_timeout = Duration::from_secs(30);
+    let poll_interval = Duration::from_millis(200);
+    let start = std::time::Instant::now();
+
+    // Try to use the node's existing executor client for polling
+    let mut go_caught_up = false;
+    if let Some(ref exec_client) = node.executor_client {
+        loop {
+            match exec_client.get_last_block_number().await {
+                Ok(last_block) => {
+                    if last_block >= required_boundary {
+                        info!(
+                            "✅ [DEFERRED EPOCH] Go caught up! block {} >= boundary {} (waited {:?})",
+                            last_block, required_boundary, start.elapsed()
+                        );
+                        go_caught_up = true;
+                        break;
+                    }
+                    if start.elapsed() > poll_timeout {
+                        warn!(
+                            "⚠️ [DEFERRED EPOCH] Timeout waiting for Go: block {} < boundary {} after {:?}. \
+                             This may cause DEADLOCK if no consensus authority is running!",
+                            last_block, required_boundary, start.elapsed()
+                        );
+                        break;
+                    }
+                    if start.elapsed().as_secs() % 5 == 0
+                        && start.elapsed().as_millis() % 5000 < 200
+                    {
+                        info!(
+                            "⏳ [DEFERRED EPOCH] Waiting for Go: block {} / {} (elapsed {:?})",
+                            last_block,
+                            required_boundary,
+                            start.elapsed()
+                        );
+                    }
+                }
+                Err(e) => {
+                    if start.elapsed() > poll_timeout {
+                        warn!("⚠️ [DEFERRED EPOCH] Timeout + error polling Go: {}", e);
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    if go_caught_up {
+        // Go has caught up - update state and return Ok so caller can proceed
+        info!(
+            "✅ [DEFERRED EPOCH] Go synced to boundary {}. Proceeding with epoch {} inline.",
+            required_boundary, new_epoch
+        );
+        // Don't queue - just update sync state and let caller handle the rest
+        // The caller should re-check go_current_block and proceed past the deferred block
+        node.current_commit_index.store(0, Ordering::SeqCst);
+        {
+            let mut g = node.shared_last_global_exec_index.lock().await;
+            *g = required_boundary;
+        }
+        node.last_global_exec_index = required_boundary;
+        node.is_transitioning.store(false, Ordering::SeqCst);
+        return Ok(());
+    }
+
+    // Fallback: Queue transition for later processing
+    warn!(
+        "🚨 [DEFERRED EPOCH] Go did NOT catch up to boundary {} within timeout. Queuing epoch {}. \
+         If no consensus is running, this will cause DEADLOCK!",
+        required_boundary, new_epoch
     );
 
     {

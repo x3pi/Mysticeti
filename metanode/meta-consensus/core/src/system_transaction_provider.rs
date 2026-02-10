@@ -86,18 +86,33 @@ impl DefaultSystemTransactionProvider {
             time_based_enabled
         );
 
-        if time_based_enabled && elapsed_seconds >= epoch_duration_seconds {
+        // RESTART FIX: If epoch_start_timestamp is significantly in the past (elapsed >= duration),
+        // reset to now() to prevent immediate EndOfEpoch trigger on restart.
+        // Without this fix, restarting after downtime > epoch_duration causes:
+        // 1. Immediate EndOfEpoch system tx creation
+        // 2. A few blocks committed before Go catches up
+        // 3. Deferred transition deadlock (Go behind, no consensus to send blocks)
+        // This mirrors the same logic in update_epoch() (line 122-130).
+        let effective_epoch_start = if time_based_enabled
+            && elapsed_seconds >= epoch_duration_seconds
+        {
             warn!(
-                "⚠️  SystemTransactionProvider: Epoch start timestamp is {}s old (>= duration {}s). System transaction should be created on next leader round.",
+                "⚠️  SystemTransactionProvider: Epoch start timestamp is {}s old (>= duration {}s). \
+                 RESETTING to now() to prevent immediate EndOfEpoch on restart. \
+                 Next epoch change will trigger after {}s from now.",
                 elapsed_seconds,
+                epoch_duration_seconds,
                 epoch_duration_seconds
             );
-        }
+            now_ms
+        } else {
+            epoch_start_timestamp_ms
+        };
 
         Self {
             current_epoch: Arc::new(RwLock::new(current_epoch)),
             epoch_duration_seconds,
-            epoch_start_timestamp_ms: Arc::new(RwLock::new(epoch_start_timestamp_ms)),
+            epoch_start_timestamp_ms: Arc::new(RwLock::new(effective_epoch_start)),
             time_based_enabled,
             last_checked_commit_index: Arc::new(RwLock::new(0)),
             commit_index_buffer,

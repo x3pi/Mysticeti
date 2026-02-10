@@ -23,6 +23,27 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Helper: Wait for a Unix socket file to exist (indicates Go process is ready)
+wait_for_socket() {
+    local socket=$1
+    local name=$2
+    local timeout=${3:-120}
+    local start=$(date +%s)
+    while true; do
+        if [ -S "$socket" ]; then
+            local elapsed=$(( $(date +%s) - start ))
+            print_info "✅ $name ready: $socket (${elapsed}s)"
+            return 0
+        fi
+        local elapsed=$(( $(date +%s) - start ))
+        if [ $elapsed -ge $timeout ]; then
+            print_info "⚠️ Timeout waiting for $name: $socket (${timeout}s). Continuing anyway..."
+            return 1
+        fi
+        sleep 1
+    done
+}
+
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 METANODE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -78,7 +99,19 @@ print_info "✅ Tất cả configs và binary tồn tại"
 # ==============================================================================
 print_step "Bước 2: Dừng tất cả nodes cũ..."
 
-# Stop all tmux sessions
+# ⚠️ CRITICAL: Send SIGTERM FIRST to trigger graceful LevelDB flush
+# tmux kill-session sends SIGHUP which Go doesn't handle → LevelDB data lost!
+# Must SIGTERM before killing tmux so Go's App.Stop() → storageManager.CloseAll() runs.
+print_info "📤 Sending SIGTERM to Go processes for graceful LevelDB flush..."
+pkill -f "simple_chain" 2>/dev/null || true
+pkill -f "metanode start" 2>/dev/null || true
+pkill -f "metanode run" 2>/dev/null || true
+
+print_info "⏳ Waiting 5s for LevelDB to flush WAL to disk..."
+sleep 5  # Give Go time to run App.Stop() → CloseAll() → LevelDB Close()
+
+# NOW kill tmux sessions (processes should already be dead from SIGTERM)
+print_info "🗑️ Cleaning up tmux sessions..."
 tmux kill-session -t go-master 2>/dev/null || true
 tmux kill-session -t go-sub 2>/dev/null || true
 tmux kill-session -t go-master-1 2>/dev/null || true
@@ -90,8 +123,9 @@ for i in 0 1 2 3 4; do
 done
 tmux kill-session -t metanode-1-sep 2>/dev/null || true
 
-# Force Kill Processes
+# Force kill any stragglers
 print_info "🔪 Force killing any lingering processes..."
+pkill -9 -f "simple_chain" 2>/dev/null || true
 pkill -9 -f "metanode start" 2>/dev/null || true
 pkill -9 -f "metanode run" 2>/dev/null || true
 
@@ -100,8 +134,14 @@ kill_port() {
     local port=$1
     local pids=$(lsof -ti :$port 2>/dev/null || true)
     if [ -n "$pids" ]; then
-        print_warn "Killing process on port $port: $pids"
-        kill -9 $pids 2>/dev/null || true
+        print_warn "Gracefully stopping process on port $port: $pids"
+        kill $pids 2>/dev/null || true
+        sleep 1
+        # Force kill if still running
+        local remaining=$(lsof -ti :$port 2>/dev/null || true)
+        if [ -n "$remaining" ]; then
+            kill -9 $remaining 2>/dev/null || true
+        fi
     fi
 }
 kill_port 9000; kill_port 9001; kill_port 9002; kill_port 9003; kill_port 9004
@@ -151,8 +191,9 @@ print_info "🚀 Starting Node 1 Go Sub (go-sub-1)..."
 tmux new-session -d -s go-sub-1 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
     "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data-write/data/xapian_node' && go run . -config=config-sub-node1.json >> \"$LOG_DIR/node_1/go-sub-stdout.log\" 2>&1"
 
-print_info "⏳ Waiting for Go nodes to stabilize (10s)..."
-sleep 10
+print_info "⏳ Waiting for Go Master executor sockets to be ready..."
+wait_for_socket "/tmp/rust-go-standard-master.sock" "Go Master 0" 120
+wait_for_socket "/tmp/rust-go-node1-master.sock" "Go Master 1" 120
 
 # ==============================================================================
 # Step 5: Start Rust Nodes (Standard: 0, 2, 3)
@@ -188,8 +229,8 @@ print_info "🚀 Starting Node 4 Go Sub (go-sub-4)..."
 tmux new-session -d -s go-sub-4 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
     "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node4/data-write/data/xapian_node' && go run . -config=config-sub-node4.json >> \"$LOG_DIR/node_4/go-sub-stdout.log\" 2>&1"
 
-print_info "⏳ Đợi Go Master và Sub 4 khởi động (5s)..."
-sleep 5
+print_info "⏳ Waiting for Node 4 Go Master executor socket..."
+wait_for_socket "/tmp/rust-go-node4-master.sock" "Go Master 4" 120
 
 # ==============================================================================
 # Step 7: Start Rust Metanode Node 4
@@ -203,6 +244,90 @@ tmux new-session -d -s metanode-4 -c "$METANODE_ROOT" \
 
 print_info "⏳ Đợi Rust Node 4 khởi động (3s)..."
 sleep 3
+
+# ==============================================================================
+# Step 8: Verify System Health
+# ==============================================================================
+print_step "Bước 8: Kiểm tra sức khỏe hệ thống..."
+
+verify_system_health() {
+    local all_ok=true
+    echo ""
+    echo -e "${BLUE}─── Internal Connection Readiness Check ───${NC}"
+
+    # Check tmux sessions are alive
+    local sessions=("metanode-0" "metanode-2" "metanode-3" "metanode-4" "metanode-1-sep" "go-master" "go-sub" "go-master-1" "go-sub-1" "go-master-4" "go-sub-4")
+    local alive=0
+    local dead=0
+    for s in "${sessions[@]}"; do
+        if tmux has-session -t "$s" 2>/dev/null; then
+            alive=$((alive + 1))
+        else
+            dead=$((dead + 1))
+            echo -e "  ${RED}✗ tmux session missing: $s${NC}"
+            all_ok=false
+        fi
+    done
+    echo -e "  ${GREEN}✓ tmux sessions: $alive alive, $dead missing${NC}"
+
+    # Check executor sockets exist
+    local sockets=("/tmp/rust-go-standard-master.sock" "/tmp/rust-go-node4-master.sock")
+    for sock in "${sockets[@]}"; do
+        if [ -S "$sock" ]; then
+            echo -e "  ${GREEN}✓ Socket ready: $sock${NC}"
+        else
+            echo -e "  ${RED}✗ Socket missing: $sock${NC}"
+            all_ok=false
+        fi
+    done
+
+    # Check [READY] signals in logs (wait up to 30s for them to appear)
+    echo -e "  ${YELLOW}⏳ Waiting for [READY] signals (up to 30s)...${NC}"
+    local ready_timeout=30
+    local ready_found=0
+    local ready_targets=3  # Go Master, Go Sub, Rust
+    for i in $(seq 1 $ready_timeout); do
+        ready_found=0
+        # Go Master [READY]
+        if grep -q "\[READY\].*fully operational" "$LOG_DIR"/node_0/go-master-stdout.log 2>/dev/null || \
+           grep -qr "\[READY\].*fully operational" "$GO_SIMPLE_ROOT"/sample/simple/data/data/logs/ 2>/dev/null; then
+            ready_found=$((ready_found + 1))
+        fi
+        # Go Sub [READY]
+        if grep -q "\[READY\].*Go Sub synced" "$LOG_DIR"/node_0/go-sub-stdout.log 2>/dev/null || \
+           grep -qr "\[READY\].*Go Sub synced" "$GO_SIMPLE_ROOT"/sample/simple/data-write/data/logs/ 2>/dev/null; then
+            ready_found=$((ready_found + 1))
+        fi
+        # Rust [READY]
+        if grep -q "\[READY\].*Rust executor" "$LOG_DIR"/node_0/rust.log 2>/dev/null; then
+            ready_found=$((ready_found + 1))
+        fi
+
+        if [ "$ready_found" -ge "$ready_targets" ]; then
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$ready_found" -ge "$ready_targets" ]; then
+        echo -e "  ${GREEN}✓ All [READY] signals received ($ready_found/$ready_targets)${NC}"
+    else
+        echo -e "  ${YELLOW}⚠ Only $ready_found/$ready_targets [READY] signals found (some components may still be starting)${NC}"
+        all_ok=false
+    fi
+
+    echo -e "${BLUE}────────────────────────────────────────────${NC}"
+    if $all_ok; then
+        echo -e "  ${GREEN}🟢 System health: ALL OK${NC}"
+    else
+        echo -e "  ${YELLOW}🟡 System health: PARTIAL (check warnings above)${NC}"
+    fi
+    echo ""
+}
+
+# Run health check in background (non-blocking), display results after summary
+verify_system_health &
+HEALTH_PID=$!
 
 # ==============================================================================
 # Summary
@@ -228,4 +353,9 @@ print_info "  - Go Master: tmux attach -t go-master-4"
 print_info "  - Go Sub:    tmux attach -t go-sub-4"
 echo ""
 print_info "📁 Log files: $LOG_DIR/node_N/"
+print_info "🔍 Check readiness: grep '[READY]' $LOG_DIR/node_*/go-*-stdout.log $LOG_DIR/node_*/rust.log"
 echo ""
+
+# Wait for health check to complete
+wait $HEALTH_PID 2>/dev/null
+
