@@ -28,7 +28,6 @@ pub struct PeerGoClient {
     timeout_secs: u64,
 }
 
-#[allow(dead_code)]
 impl PeerGoClient {
     /// Create a new PeerGoClient
     pub fn new(peer_addr: SocketAddr) -> Self {
@@ -47,6 +46,7 @@ impl PeerGoClient {
     }
 
     /// Set connection timeout
+    #[allow(dead_code)]
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
         self
@@ -125,6 +125,7 @@ impl PeerGoClient {
     }
 
     /// Get peer's current epoch
+    #[allow(dead_code)]
     pub async fn get_current_epoch(&self) -> Result<u64> {
         let connect_timeout = Duration::from_secs(self.timeout_secs);
         let mut stream = timeout(connect_timeout, TcpStream::connect(self.peer_addr))
@@ -160,6 +161,7 @@ impl PeerGoClient {
     }
 
     /// Get peer's last block number
+    #[allow(dead_code)]
     pub async fn get_last_block_number(&self) -> Result<u64> {
         let connect_timeout = Duration::from_secs(self.timeout_secs);
         let mut stream = timeout(connect_timeout, TcpStream::connect(self.peer_addr))
@@ -197,6 +199,7 @@ impl PeerGoClient {
     }
 
     /// Get epoch boundary data from peer
+    #[allow(dead_code)]
     pub async fn get_epoch_boundary_data(
         &self,
         epoch: u64,

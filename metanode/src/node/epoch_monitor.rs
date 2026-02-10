@@ -302,32 +302,3 @@ pub async fn stop_epoch_monitor(handle: Option<JoinHandle<()>>) {
         info!("🛑 [EPOCH MONITOR] Stopped unified epoch monitor");
     }
 }
-
-// ============================================================================
-// LEGACY FUNCTIONS (kept for backwards compatibility, delegate to unified)
-// ============================================================================
-
-/// Legacy function - now delegates to unified monitor
-/// Kept for backwards compatibility with existing code
-#[allow(dead_code)]
-#[deprecated(note = "Use start_unified_epoch_monitor instead")]
-pub fn start_epoch_monitor(
-    _node_mode: crate::node::NodeMode,
-    executor_client: &Option<Arc<crate::node::executor_client::ExecutorClient>>,
-    _current_epoch: u64,
-    config: &NodeConfig,
-) -> Result<Option<JoinHandle<()>>> {
-    start_unified_epoch_monitor(executor_client, config)
-}
-
-/// Legacy function - now delegates to unified monitor
-/// Kept for backwards compatibility
-#[allow(dead_code)]
-#[deprecated(note = "Use start_unified_epoch_monitor instead")]
-pub fn start_validator_epoch_watchdog(
-    executor_client: &Option<Arc<crate::node::executor_client::ExecutorClient>>,
-    _current_epoch: u64,
-    config: &NodeConfig,
-) -> Result<Option<JoinHandle<()>>> {
-    start_unified_epoch_monitor(executor_client, config)
-}

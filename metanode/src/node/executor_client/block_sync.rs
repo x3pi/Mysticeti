@@ -77,7 +77,6 @@ impl ExecutorClient {
 
     /// Sync blocks to local Go Master
     /// Used by SyncOnly nodes to write blocks received from peers
-    #[allow(dead_code)] // API reserved for future SyncOnly block sync flow
     pub async fn sync_blocks(&self, blocks: Vec<proto::BlockData>) -> Result<(u64, u64)> {
         if !self.is_enabled() {
             return Err(anyhow::anyhow!("Executor client is not enabled"));

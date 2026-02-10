@@ -51,7 +51,9 @@ struct JsonRpcResponse {
 /// Validator info extracted from contract
 #[derive(Debug, Clone)]
 pub struct ValidatorInfo {
+    #[allow(dead_code)]
     pub address: String,
+    #[allow(dead_code)]
     pub hostname: String,
     pub primary_address: String,
     pub name: String,
@@ -105,6 +107,7 @@ impl PeerDiscoveryService {
     }
 
     /// Get current peer addresses (snapshot)
+    #[allow(dead_code)]
     pub async fn get_addresses(&self) -> Vec<String> {
         self.peer_addresses.read().await.clone()
     }

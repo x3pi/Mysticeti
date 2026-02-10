@@ -26,6 +26,7 @@ pub enum CircuitState {
     /// Normal operation — all calls pass through
     Closed,
     /// Failures exceeded threshold — calls rejected immediately
+    #[allow(dead_code)]
     Open,
     /// Cooldown expired — one probe call allowed
     HalfOpen,
@@ -43,13 +44,14 @@ impl std::fmt::Display for CircuitState {
 
 /// Configuration for the circuit breaker
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CircuitBreakerConfig {
     /// Number of consecutive failures before opening the circuit
+    #[allow(dead_code)]
     pub failure_threshold: u32,
     /// Duration to wait before transitioning from Open → HalfOpen
     pub cooldown_duration: Duration,
     /// Number of consecutive successes in HalfOpen to close the circuit
+    #[allow(dead_code)]
     pub success_threshold: u32,
 }
 
@@ -64,11 +66,11 @@ impl Default for CircuitBreakerConfig {
 }
 
 /// Per-method circuit state
-#[allow(dead_code)]
 struct MethodCircuit {
     state: CircuitState,
     consecutive_failures: u32,
     consecutive_successes: u32,
+    #[allow(dead_code)]
     last_failure_time: Option<Instant>,
     opened_at: Option<Instant>,
     total_rejections: u64,
@@ -96,7 +98,6 @@ pub struct RpcCircuitBreaker {
     config: CircuitBreakerConfig,
 }
 
-#[allow(dead_code)]
 impl RpcCircuitBreaker {
     /// Create a new circuit breaker with default configuration
     pub fn new() -> Self {
@@ -107,6 +108,7 @@ impl RpcCircuitBreaker {
     }
 
     /// Create with custom configuration
+    #[allow(dead_code)]
     pub fn with_config(config: CircuitBreakerConfig) -> Self {
         Self {
             circuits: std::sync::Mutex::new(HashMap::new()),
@@ -160,6 +162,7 @@ impl RpcCircuitBreaker {
     }
 
     /// Record a successful call
+    #[allow(dead_code)]
     pub fn record_success(&self, method: &str) {
         let mut circuits = self.circuits.lock().unwrap();
         let circuit = circuits
@@ -192,6 +195,7 @@ impl RpcCircuitBreaker {
     }
 
     /// Record a failed call
+    #[allow(dead_code)]
     pub fn record_failure(&self, method: &str) {
         let mut circuits = self.circuits.lock().unwrap();
         let circuit = circuits
@@ -229,6 +233,7 @@ impl RpcCircuitBreaker {
     }
 
     /// Get the current state of a method's circuit
+    #[allow(dead_code)]
     pub fn state(&self, method: &str) -> CircuitState {
         let circuits = self.circuits.lock().unwrap();
         circuits
@@ -238,6 +243,7 @@ impl RpcCircuitBreaker {
     }
 
     /// Get total rejections for a method
+    #[allow(dead_code)]
     pub fn total_rejections(&self, method: &str) -> u64 {
         let circuits = self.circuits.lock().unwrap();
         circuits
@@ -247,6 +253,7 @@ impl RpcCircuitBreaker {
     }
 
     /// Get failure count for a method
+    #[allow(dead_code)]
     pub fn failure_count(&self, method: &str) -> u32 {
         let circuits = self.circuits.lock().unwrap();
         circuits

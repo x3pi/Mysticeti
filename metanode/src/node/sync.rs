@@ -10,7 +10,6 @@
 //! - CommitProcessor handles transition callback
 
 use crate::config::NodeConfig;
-use crate::node::executor_client::ExecutorClient;
 use crate::node::{ConsensusNode, NodeMode};
 use anyhow::Result;
 use tracing::{info, warn};

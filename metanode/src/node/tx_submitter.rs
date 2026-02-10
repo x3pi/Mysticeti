@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use consensus_core::BlockStatus;
 use consensus_core::TransactionClient;
 use tokio::sync::RwLock;
-use consensus_core::BlockStatus;
 
 // Forward declaration to avoid circular import
 // We'll use super::ConsensusNode
@@ -94,5 +94,3 @@ impl TransactionSubmitter for TransactionClientProxy {
         Ok((block_ref, indices, status))
     }
 }
-
-

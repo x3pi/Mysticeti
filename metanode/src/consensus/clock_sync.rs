@@ -3,11 +3,11 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::{SystemTime, Duration};
+use std::time::{Duration, SystemTime};
+use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tokio::process::Command;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 /// Manager for clock synchronization with NTP servers
 pub struct ClockSyncManager {
@@ -57,7 +57,10 @@ impl ClockSyncManager {
         let offset_ms = self.query_chrony_offset_ms().await?;
         self.last_sync_time = Some(SystemTime::now());
         self.clock_offset_ms = offset_ms;
-        info!("Clock sync completed (chrony): offset={}ms", self.clock_offset_ms);
+        info!(
+            "Clock sync completed (chrony): offset={}ms",
+            self.clock_offset_ms
+        );
         Ok(())
     }
 
@@ -74,7 +77,9 @@ impl ClockSyncManager {
             .arg("tracking")
             .output()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to execute chronyc (is chrony installed?): {}", e))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to execute chronyc (is chrony installed?): {}", e)
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -83,7 +88,9 @@ impl ClockSyncManager {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         self.parse_chronyc_tracking_offset_ms(&stdout)
-            .ok_or_else(|| anyhow::anyhow!("Unable to parse clock offset from `chronyc tracking` output"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Unable to parse clock offset from `chronyc tracking` output")
+            })
     }
 
     fn parse_chronyc_tracking_offset_ms(&self, tracking_output: &str) -> Option<i64> {
@@ -126,13 +133,13 @@ impl ClockSyncManager {
     }
 
     /// Get synchronized time (local time + offset)
-    #[allow(dead_code)] // Reserved for future use (time-based epoch change)
+    #[allow(dead_code)]
     pub fn get_synced_time(&self) -> SystemTime {
         let local_time = SystemTime::now();
         if self.clock_offset_ms == 0 {
             return local_time;
         }
-        
+
         // Adjust time by offset
         if self.clock_offset_ms > 0 {
             local_time - Duration::from_millis(self.clock_offset_ms as u64)
@@ -145,14 +152,17 @@ impl ClockSyncManager {
     pub fn check_clock_drift(&self) -> Result<()> {
         let drift_ms = self.clock_offset_ms.unsigned_abs();
         if drift_ms > self.max_clock_drift_ms {
-            anyhow::bail!("Clock drift too large: {}ms > {}ms", 
-                drift_ms, self.max_clock_drift_ms);
+            anyhow::bail!(
+                "Clock drift too large: {}ms > {}ms",
+                drift_ms,
+                self.max_clock_drift_ms
+            );
         }
         Ok(())
     }
 
     /// Get current clock offset
-    #[allow(dead_code)] // Reserved for future use (monitoring, debugging)
+    #[allow(dead_code)]
     pub fn clock_offset_ms(&self) -> i64 {
         self.clock_offset_ms
     }
@@ -166,7 +176,7 @@ impl ClockSyncManager {
                     m.sync_interval_seconds
                 };
                 tokio::time::sleep(Duration::from_secs(sync_interval)).await;
-                
+
                 let mut m = manager.write().await;
                 if let Err(e) = m.sync_with_ntp().await {
                     error!("NTP sync failed: {}", e);
@@ -180,7 +190,7 @@ impl ClockSyncManager {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                
+
                 let m = manager.read().await;
                 if let Err(e) = m.check_clock_drift() {
                     error!("Clock drift check failed: {}", e);
@@ -190,27 +200,26 @@ impl ClockSyncManager {
     }
 
     /// Check if clock sync is healthy
-    #[allow(dead_code)] // Reserved for future use (health checks, monitoring)
+    #[allow(dead_code)]
     pub fn is_healthy(&self) -> bool {
         if !self.enabled {
             return true; // If disabled, consider it healthy
         }
-        
+
         // Check if we've synced recently (within 2x sync interval)
         if let Some(last_sync) = self.last_sync_time {
             let elapsed = SystemTime::now()
                 .duration_since(last_sync)
                 .unwrap_or(Duration::from_secs(0));
-            
+
             if elapsed.as_secs() > self.sync_interval_seconds * 2 {
                 return false; // Haven't synced in too long
             }
         } else {
             return false; // Never synced
         }
-        
+
         // Check drift
         self.check_clock_drift().is_ok()
     }
 }
-

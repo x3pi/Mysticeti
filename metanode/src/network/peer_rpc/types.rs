@@ -21,8 +21,8 @@ pub struct PeerInfoResponse {
 }
 
 /// Request for /get_blocks endpoint
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct GetBlocksRequest {
     /// Start block number (inclusive)
     pub from_block: u64,

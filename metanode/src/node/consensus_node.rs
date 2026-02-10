@@ -35,6 +35,7 @@ impl ConsensusNode {
         Self::new_with_registry(config, Registry::new()).await
     }
 
+    #[allow(dead_code)]
     pub async fn new_with_registry(config: NodeConfig, registry: Registry) -> Result<Self> {
         Self::new_with_registry_and_service(config, registry).await
     }

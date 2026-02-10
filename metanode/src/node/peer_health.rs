@@ -37,7 +37,6 @@ const BACKOFF_THRESHOLD_1: u32 = 3; // 3 failures → 10s backoff
 const BACKOFF_THRESHOLD_2: u32 = 5; // 5 failures → 30s backoff
 const BACKOFF_THRESHOLD_3: u32 = 10; // 10 failures → 60s backoff
 
-#[allow(dead_code)]
 impl PeerHealthTracker {
     pub fn new() -> Self {
         Self {
@@ -101,6 +100,7 @@ impl PeerHealthTracker {
     }
 
     /// Get the number of consecutive failures for a peer
+    #[allow(dead_code)]
     pub fn failure_count(&self, peer_index: u32) -> u32 {
         self.peers
             .get(&peer_index)
@@ -109,6 +109,7 @@ impl PeerHealthTracker {
     }
 
     /// Get indices of all healthy peers from a list
+    #[allow(dead_code)]
     pub fn filter_healthy(&self, peer_indices: &[u32]) -> Vec<u32> {
         peer_indices
             .iter()

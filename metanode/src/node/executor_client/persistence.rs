@@ -24,14 +24,6 @@ pub fn write_uvarint(buf: &mut Vec<u8>, mut value: u64) -> Result<()> {
     Ok(())
 }
 
-// Note: Executor is now configured via executor_enabled field in node_X.toml
-// This function is kept for backward compatibility but is no longer used
-#[allow(dead_code)]
-pub fn is_executor_enabled(config_dir: &Path) -> bool {
-    let config_file = config_dir.join("enable_executor.toml");
-    config_file.exists()
-}
-
 // Persist last successfully sent index AND commit_index to file for crash recovery
 // Uses atomic write (temp file + rename) to prevent corruption
 pub async fn persist_last_sent_index(

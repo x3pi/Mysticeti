@@ -40,7 +40,6 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::info;
 
 /// Handle to control the RustSyncNode
-#[allow(dead_code)]
 pub struct RustSyncHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
     pub task_handle: tokio::task::JoinHandle<()>,
@@ -56,7 +55,6 @@ impl RustSyncHandle {
     }
 
     /// Stop the RustSyncNode gracefully
-    #[allow(dead_code)]
     pub async fn stop(mut self) {
         info!("🛑 [RUST-SYNC] Stopping...");
         if let Some(tx) = self.shutdown_tx.take() {
@@ -98,7 +96,6 @@ pub struct RustSyncNode {
     pub(crate) network_client: Option<Arc<TonicClient>>,
     pub(crate) epoch_transition_sender: mpsc::UnboundedSender<(u64, u64, u64)>,
     pub(crate) current_epoch: Arc<AtomicU64>,
-    #[allow(dead_code)]
     pub(crate) last_synced_commit_index: Arc<AtomicU32>,
     pub(crate) committee: Arc<RwLock<Option<Committee>>>,
     pub(crate) config: RustSyncConfig,
