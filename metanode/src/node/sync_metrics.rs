@@ -60,6 +60,14 @@ pub struct SyncMetrics {
     pub go_send_per_commit_seconds: Histogram,
     /// Throughput: blocks sent to Go per second (rolling)
     pub blocks_per_second: Gauge,
+
+    // ── Connection health metrics ───────────────────────────────────────
+    /// Executor connection state (0=disconnected, 1=reconnecting, 2=connected)
+    pub executor_connection_state: Gauge,
+    /// Total reconnection attempts
+    pub executor_reconnect_total: Counter,
+    /// Duration of health check probes
+    pub executor_health_check_seconds: Histogram,
 }
 
 impl SyncMetrics {
@@ -206,6 +214,29 @@ impl SyncMetrics {
             blocks_per_second: register_gauge_with_registry!(
                 "sync_blocks_per_second",
                 "Rolling throughput: blocks sent to Go per second",
+                registry
+            )
+            .unwrap(),
+
+            // ── Connection health ──────────────────────────────────────
+            executor_connection_state: register_gauge_with_registry!(
+                "executor_connection_state",
+                "Executor socket state (0=disconnected 1=reconnecting 2=connected)",
+                registry
+            )
+            .unwrap(),
+
+            executor_reconnect_total: register_counter_with_registry!(
+                "executor_reconnect_total",
+                "Total reconnection attempts to Go executor",
+                registry
+            )
+            .unwrap(),
+
+            executor_health_check_seconds: register_histogram_with_registry!(
+                "executor_health_check_seconds",
+                "Duration of executor health check probes",
+                vec![0.0001, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0],
                 registry
             )
             .unwrap(),

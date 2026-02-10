@@ -23,6 +23,7 @@ pub use persistence::{load_persisted_last_index, read_last_block_number};
 pub use socket_stream::{SocketAddress, SocketStream};
 
 use anyhow::Result;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, trace, warn};
@@ -35,6 +36,30 @@ pub mod proto {
 }
 
 use std::collections::BTreeMap;
+
+// ============================================================================
+// ConnectionState — explicit connection health tracking
+// ============================================================================
+
+/// Connection state for Go ↔ Rust socket link
+/// Exposed via Prometheus gauge (0=disconnected, 1=reconnecting, 2=connected)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConnectionState {
+    Disconnected = 0,
+    Reconnecting = 1,
+    Connected = 2,
+}
+
+impl ConnectionState {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Disconnected,
+            1 => Self::Reconnecting,
+            _ => Self::Connected,
+        }
+    }
+}
 
 // ============================================================================
 // ExecutorClient - Now supports both Unix and TCP sockets
@@ -63,6 +88,10 @@ pub struct ExecutorClient {
     pub(crate) sent_indices: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
     /// Circuit breaker for Go Master RPC calls (read-path only)
     pub(crate) rpc_circuit_breaker: Arc<RpcCircuitBreaker>,
+    /// Connection state tracking (lock-free)
+    connection_state: Arc<AtomicU8>,
+    /// Total reconnection attempts
+    pub(crate) reconnect_count: Arc<AtomicU8>,
 }
 
 /// Production safety constants
@@ -138,6 +167,8 @@ impl ExecutorClient {
             last_verified_go_index: Arc::new(tokio::sync::Mutex::new(0)),
             sent_indices: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             rpc_circuit_breaker: Arc::new(RpcCircuitBreaker::new()),
+            connection_state: Arc::new(AtomicU8::new(ConnectionState::Disconnected as u8)),
+            reconnect_count: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -155,6 +186,31 @@ impl ExecutorClient {
     #[allow(dead_code)]
     pub fn circuit_breaker(&self) -> &RpcCircuitBreaker {
         &self.rpc_circuit_breaker
+    }
+
+    /// Get current connection state
+    pub fn connection_state(&self) -> ConnectionState {
+        ConnectionState::from_u8(self.connection_state.load(Ordering::Relaxed))
+    }
+
+    /// Set connection state (internal)
+    fn set_connection_state(&self, state: ConnectionState) {
+        self.connection_state.store(state as u8, Ordering::Relaxed);
+    }
+
+    /// Check if the send socket is healthy (writable)
+    /// Returns the current ConnectionState after probing
+    pub async fn check_connection_health(&self) -> ConnectionState {
+        let conn = self.connection.lock().await;
+        let state = match conn.as_ref() {
+            Some(stream) => match stream.writable().await {
+                Ok(_) => ConnectionState::Connected,
+                Err(_) => ConnectionState::Disconnected,
+            },
+            None => ConnectionState::Disconnected,
+        };
+        self.set_connection_state(state);
+        state
     }
 
     /// Force reset all connections to Go executor
