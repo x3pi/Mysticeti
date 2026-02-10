@@ -120,7 +120,7 @@ impl RpcCircuitBreaker {
     ///
     /// Returns `Ok(())` if the call should proceed, `Err(reason)` if rejected.
     pub fn check(&self, method: &str) -> Result<(), String> {
-        let mut circuits = self.circuits.lock().unwrap();
+        let mut circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
         let circuit = circuits
             .entry(method.to_string())
             .or_insert_with(MethodCircuit::new);
@@ -164,7 +164,7 @@ impl RpcCircuitBreaker {
     /// Record a successful call
     #[allow(dead_code)]
     pub fn record_success(&self, method: &str) {
-        let mut circuits = self.circuits.lock().unwrap();
+        let mut circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
         let circuit = circuits
             .entry(method.to_string())
             .or_insert_with(MethodCircuit::new);
@@ -197,7 +197,7 @@ impl RpcCircuitBreaker {
     /// Record a failed call
     #[allow(dead_code)]
     pub fn record_failure(&self, method: &str) {
-        let mut circuits = self.circuits.lock().unwrap();
+        let mut circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
         let circuit = circuits
             .entry(method.to_string())
             .or_insert_with(MethodCircuit::new);
@@ -235,7 +235,7 @@ impl RpcCircuitBreaker {
     /// Get the current state of a method's circuit
     #[allow(dead_code)]
     pub fn state(&self, method: &str) -> CircuitState {
-        let circuits = self.circuits.lock().unwrap();
+        let circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
         circuits
             .get(method)
             .map(|c| c.state)
@@ -245,7 +245,7 @@ impl RpcCircuitBreaker {
     /// Get total rejections for a method
     #[allow(dead_code)]
     pub fn total_rejections(&self, method: &str) -> u64 {
-        let circuits = self.circuits.lock().unwrap();
+        let circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
         circuits
             .get(method)
             .map(|c| c.total_rejections)
@@ -255,7 +255,7 @@ impl RpcCircuitBreaker {
     /// Get failure count for a method
     #[allow(dead_code)]
     pub fn failure_count(&self, method: &str) -> u32 {
-        let circuits = self.circuits.lock().unwrap();
+        let circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
         circuits
             .get(method)
             .map(|c| c.consecutive_failures)

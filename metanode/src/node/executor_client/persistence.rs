@@ -140,3 +140,72 @@ pub fn load_persisted_last_index(storage_path: &Path) -> Option<(u64, u32)> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_write_uvarint_small_value() {
+        let mut buf = Vec::new();
+        write_uvarint(&mut buf, 42).unwrap();
+        assert_eq!(buf, vec![42u8]); // Values < 128 fit in one byte
+    }
+
+    #[test]
+    fn test_write_uvarint_large_value() {
+        let mut buf = Vec::new();
+        write_uvarint(&mut buf, 300).unwrap();
+        // 300 = 0b100101100
+        // First byte: 0b00101100 | 0x80 = 0xAC
+        // Second byte: 0b00000010 = 0x02
+        assert_eq!(buf, vec![0xAC, 0x02]);
+    }
+
+    #[tokio::test]
+    async fn test_persist_and_load_last_index() {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        persist_last_sent_index(path, 12345, 67).await.unwrap();
+
+        let result = load_persisted_last_index(path);
+        assert_eq!(result, Some((12345, 67)));
+    }
+
+    #[test]
+    fn test_load_corrupted_file() {
+        let dir = tempdir().unwrap();
+        let persist_dir = dir.path().join("executor_state");
+        std::fs::create_dir_all(&persist_dir).unwrap();
+        let file_path = persist_dir.join("last_sent_index.bin");
+        std::fs::write(&file_path, &[1, 2, 3]).unwrap(); // 3 bytes = corrupted
+
+        let result = load_persisted_last_index(dir.path());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_load_legacy_format() {
+        let dir = tempdir().unwrap();
+        let persist_dir = dir.path().join("executor_state");
+        std::fs::create_dir_all(&persist_dir).unwrap();
+        let file_path = persist_dir.join("last_sent_index.bin");
+        std::fs::write(&file_path, &999u64.to_le_bytes()).unwrap(); // 8 bytes = legacy
+
+        let result = load_persisted_last_index(dir.path());
+        assert_eq!(result, Some((999, 0))); // commit_index defaults to 0
+    }
+
+    #[tokio::test]
+    async fn test_persist_and_read_block_number() {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        persist_last_block_number(path, 42069).await.unwrap();
+
+        let result = read_last_block_number(path).await.unwrap();
+        assert_eq!(result, 42069);
+    }
+}

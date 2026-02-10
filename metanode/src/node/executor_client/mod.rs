@@ -13,12 +13,15 @@
 
 mod block_sending;
 mod block_sync;
+pub mod connection_pool;
 pub mod persistence;
 mod rpc_queries;
+mod rpc_queries_epoch;
 pub mod socket_stream;
 mod transition_handoff;
 
 // Re-export public items from submodules
+pub use connection_pool::ConnectionPool;
 pub use persistence::{load_persisted_last_index, read_last_block_number};
 pub use socket_stream::{SocketAddress, SocketStream};
 
@@ -62,6 +65,8 @@ pub struct ExecutorClient {
     /// This prevents both Consensus and Sync from sending the same block
     pub(crate) sent_indices: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
     pub(crate) rpc_circuit_breaker: Arc<RpcCircuitBreaker>,
+    /// Connection pool for parallel RPC queries to Go Master
+    pub(crate) request_pool: Arc<ConnectionPool>,
 }
 
 /// Production safety constants
@@ -124,6 +129,9 @@ impl ExecutorClient {
         info!("🔧 [EXECUTOR CLIENT] Creating executor client: send={}, receive={}, initial_next_expected={}, storage_path={:?}", 
             socket_address.as_str(), request_socket_address.as_str(), initial_next_expected, storage_path);
 
+        // Create connection pool for parallel RPC queries (pool_size=4, timeout=30s)
+        let request_pool = Arc::new(ConnectionPool::new(request_socket_address.clone(), 4, 30));
+
         Self {
             socket_address,
             connection: Arc::new(Mutex::new(None)),
@@ -137,6 +145,7 @@ impl ExecutorClient {
             last_verified_go_index: Arc::new(tokio::sync::Mutex::new(0)),
             sent_indices: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             rpc_circuit_breaker: Arc::new(RpcCircuitBreaker::new()),
+            request_pool,
         }
     }
 
@@ -179,6 +188,9 @@ impl ExecutorClient {
             }
             *req_conn = None;
         }
+
+        // Reset connection pool
+        self.request_pool.reset_all().await;
 
         info!("✅ [EXECUTOR] All connections reset. Next operation will create fresh connections.");
     }

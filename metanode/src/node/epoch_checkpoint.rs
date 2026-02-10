@@ -78,7 +78,7 @@ impl TransitionCheckpoint {
     pub fn new(state: TransitionState, node_id: &str) -> Self {
         let created_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
 
         Self {
@@ -121,7 +121,7 @@ impl TransitionCheckpoint {
             checkpoint.state.epoch(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis() as u64
                 - checkpoint.created_at_ms
         );
