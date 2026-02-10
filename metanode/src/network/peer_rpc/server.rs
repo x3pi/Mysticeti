@@ -207,7 +207,7 @@ impl PeerRpcServer {
         // Parse epoch from query parameter
         let epoch = Self::parse_epoch_param(request);
 
-        if epoch.is_none() {
+        let Some(target_epoch) = epoch else {
             let response = EpochBoundaryDataResponse {
                 epoch: 0,
                 timestamp_ms: 0,
@@ -222,9 +222,8 @@ impl PeerRpcServer {
             );
             let _ = stream.write_all(http_response.as_bytes()).await;
             return;
-        }
+        };
 
-        let target_epoch = epoch.unwrap();
         info!(
             "🌐 [PEER RPC] /get_epoch_boundary_data request: epoch={}",
             target_epoch
@@ -324,7 +323,7 @@ impl PeerRpcServer {
         // Parse query parameters from request line
         let (from_block, to_block) = Self::parse_block_range(request);
 
-        if from_block.is_none() || to_block.is_none() {
+        let (Some(from), Some(to)) = (from_block, to_block) else {
             let response = GetBlocksResponse {
                 node_id,
                 blocks: std::collections::HashMap::new(),
@@ -338,10 +337,7 @@ impl PeerRpcServer {
             );
             let _ = stream.write_all(http_response.as_bytes()).await;
             return;
-        }
-
-        let from = from_block.unwrap();
-        let to = to_block.unwrap();
+        };
 
         // Limit batch size to prevent DoS
         let max_batch = 100u64;

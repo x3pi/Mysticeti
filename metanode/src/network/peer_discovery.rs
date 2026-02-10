@@ -27,10 +27,6 @@ const VALIDATOR_CONTRACT: &str = "0x0000000000000000000000000000000000001001";
 /// Default refresh interval (5 minutes - only refresh when needed)
 const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
 
-/// Default peer RPC port suffix for discovered validators
-#[allow(dead_code)]
-const DEFAULT_PEER_RPC_PORT: u16 = 6090;
-
 /// JSON-RPC request structure
 #[derive(Debug, Serialize)]
 struct JsonRpcRequest {
@@ -54,7 +50,6 @@ struct JsonRpcResponse {
 
 /// Validator info extracted from contract
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ValidatorInfo {
     pub address: String,
     pub hostname: String,
@@ -110,7 +105,6 @@ impl PeerDiscoveryService {
     }
 
     /// Get current peer addresses (snapshot)
-    #[allow(dead_code)]
     pub async fn get_addresses(&self) -> Vec<String> {
         self.peer_addresses.read().await.clone()
     }
@@ -175,13 +169,11 @@ impl PeerDiscoveryService {
                             if !host.is_empty() {
                                 let peer_addr =
                                     format!("http://{}:{}", host, self.peer_rpc_port + i as u16);
-                                addresses.push(peer_addr);
                                 debug!(
                                     "🔍 [PEER DISCOVERY] Found validator {}: {} -> {}",
-                                    info.name,
-                                    info.primary_address,
-                                    addresses.last().unwrap()
+                                    info.name, info.primary_address, peer_addr
                                 );
+                                addresses.push(peer_addr);
                             }
                         }
                         Err(e) => {

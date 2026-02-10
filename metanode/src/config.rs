@@ -281,7 +281,7 @@ impl NodeConfig {
         // Generate epoch start timestamp (same for all nodes)
         let epoch_start_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::ZERO)
             .as_millis() as u64;
 
         // Save a shared committee with epoch timestamp (template / convenience).
@@ -430,8 +430,12 @@ impl NodeConfig {
             if bytes.len() != 64 {
                 anyhow::bail!("Invalid key length: expected 64 bytes, got {}", bytes.len());
             }
-            let private_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
-            let _public_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
+            let private_bytes: [u8; 32] = bytes[0..32]
+                .try_into()
+                .context("Failed to convert protocol private key bytes to [u8; 32]")?;
+            let _public_bytes: [u8; 32] = bytes[32..64]
+                .try_into()
+                .context("Failed to convert protocol public key bytes to [u8; 32]")?;
             use fastcrypto::ed25519::Ed25519PrivateKey;
             let private_key = Ed25519PrivateKey::from_bytes(&private_bytes)
                 .context("Failed to create private key from bytes")?;
@@ -453,8 +457,12 @@ impl NodeConfig {
             if bytes.len() != 64 {
                 anyhow::bail!("Invalid key length: expected 64 bytes, got {}", bytes.len());
             }
-            let private_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
-            let _public_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
+            let private_bytes: [u8; 32] = bytes[0..32]
+                .try_into()
+                .context("Failed to convert network private key bytes to [u8; 32]")?;
+            let _public_bytes: [u8; 32] = bytes[32..64]
+                .try_into()
+                .context("Failed to convert network public key bytes to [u8; 32]")?;
             use fastcrypto::ed25519::Ed25519PrivateKey;
             let private_key = Ed25519PrivateKey::from_bytes(&private_bytes)
                 .context("Failed to create private key from bytes")?;
