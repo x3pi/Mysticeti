@@ -50,6 +50,7 @@ print_step "Bước 1: Cleanup dữ liệu toàn bộ hệ thống..."
 # 1.1 Clean Standard Data (Logic from run_full_system.sh)
 print_info "🧹 Cleaning Standard Data..."
 mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR/node_0" "$LOG_DIR/node_1" "$LOG_DIR/node_2" "$LOG_DIR/node_3" "$LOG_DIR/node_4"
 rm -f /tmp/metanode-tx-*.sock /tmp/executor*.sock /tmp/rust-go.sock_* 2>/dev/null || true
 rm -rf "$GO_PROJECT_ROOT/cmd/simple_chain/sample/simple"
 rm -rf "$METANODE_ROOT/config/storage"
@@ -263,8 +264,7 @@ else:
 # 4.1 Start Standard Go Master
 print_info "🚀 Starting Standard Go Master (go-master)..."
 tmux new-session -d -s go-master -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data/data/xapian_node' && go run . -config=config-master.json 2>&1 | tee \"$LOG_DIR/go-master.log\""
-sleep 5
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data/data/xapian_node' && go run . -config=config-master.json >> \"$LOG_DIR/node_0/go-master-stdout.log\" 2>&1"
 
 # 4.2 Start Standard Go Sub
 print_info "🚀 Starting Standard Go Sub (go-sub)..."
@@ -274,8 +274,7 @@ print_info "🚀 Starting Standard Go Sub (go-sub)..."
 
 
 tmux new-session -d -s go-sub -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data-write/data/xapian_node' && go run . -config=config-sub-write.json 2>&1 | tee \"$LOG_DIR/go-sub.log\""
-sleep 5
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/simple/data-write/data/xapian_node' && go run . -config=config-sub-write.json >> \"$LOG_DIR/node_0/go-sub-stdout.log\" 2>&1"
 
 # 4.3 Start Node 1 Go Master
 # 4.3b Patch Go Master 1 Config to match Rust Socket
@@ -286,14 +285,12 @@ sed -i 's|"/tmp/rust-go.sock_1"|"/tmp/executor1-sep.sock"|g' "$GO_PROJECT_ROOT/c
 
 print_info "🚀 Starting Node 1 Go Master (go-master-1)..."
 tmux new-session -d -s go-master-1 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data/data/xapian_node' && go run . -config=config-master-node1.json 2>&1 | tee \"$LOG_DIR/go-master-1.log\""
-sleep 5
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data/data/xapian_node' && go run . -config=config-master-node1.json >> \"$LOG_DIR/node_1/go-master-stdout.log\" 2>&1"
 
 # 4.4 Start Node 1 Go Sub
 print_info "🚀 Starting Node 1 Go Sub (go-sub-1)..."
 tmux new-session -d -s go-sub-1 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data-write/data/xapian_node' && go run . -config=config-sub-node1.json 2>&1 | tee \"$LOG_DIR/go-sub-1.log\""
-sleep 5
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data-write/data/xapian_node' && go run . -config=config-sub-node1.json >> \"$LOG_DIR/node_1/go-sub-stdout.log\" 2>&1"
 
 print_info "⏳ Waiting for Go nodes to stabilize (10s)..."
 sleep 10
@@ -309,15 +306,14 @@ cd "$METANODE_ROOT"
 for id in 0 2 3 4; do
     print_info "🚀 Starting Rust Node $id (Standard)..."
     tmux new-session -d -s "metanode-$id" -c "$METANODE_ROOT" \
-        "export RUST_LOG=info,consensus_core=debug; $BINARY start --config config/node_$id.toml 2>&1 | tee \"$LOG_DIR/metanode-$id.log\""
-    sleep 1
+        "export RUST_LOG=info,consensus_core=debug; $BINARY start --config config/node_$id.toml >> \"$LOG_DIR/node_$id/rust.log\" 2>&1"
 done
 
 # 5.2 Start Node 1 (Separate Config)
 print_info "🚀 Starting Rust Node 1 (Separate)..."
 # Uses node_1.toml (patched)
 tmux new-session -d -s "metanode-1-sep" -c "$METANODE_ROOT" \
-    "export RUST_LOG=info,consensus_core=debug; $BINARY start --config config/node_1.toml 2>&1 | tee \"$LOG_DIR/metanode-1-sep.log\""
+    "export RUST_LOG=info,consensus_core=debug; $BINARY start --config config/node_1.toml >> \"$LOG_DIR/node_1/rust.log\" 2>&1"
 
 print_info "⏳ Waiting for Rust nodes to start..."
 sleep 5
@@ -475,7 +471,7 @@ print_info "📊 Node 1 Separate System (Node 1):"
 print_info "  - Rust: tmux attach -t metanode-1-sep"
 print_info "  - Go:   tmux attach -t go-master-1 / go-sub-1"
 echo ""
-print_info "Log files in $LOG_DIR/*.log"
+print_info "Log files in $LOG_DIR/node_N/"
 echo ""
 print_info "📝 To register Node-4 as validator:"
 print_info "  cd $GO_PROJECT_ROOT/cmd/tool/add_validator_node4"

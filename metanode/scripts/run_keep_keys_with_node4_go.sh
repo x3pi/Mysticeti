@@ -210,15 +210,16 @@ cd "$GO_PROJECT_ROOT/cmd/simple_chain"
 tmux kill-session -t go-master-4 2>/dev/null || true
 tmux kill-session -t go-sub-4 2>/dev/null || true
 
+mkdir -p "$LOG_DIR/node_4"
 print_info "🚀 Starting Node 4 Go Master (go-master-4)..."
 tmux new-session -d -s go-master-4 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node4/data/data/xapian_node' && go run . -config=config-master-node4.json 2>&1 | tee \"$LOG_DIR/go-master-4.log\""
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node4/data/data/xapian_node' && go run . -config=config-master-node4.json >> \"$LOG_DIR/node_4/go-master-stdout.log\" 2>&1"
 
 sleep 3
 
 print_info "🚀 Starting Node 4 Go Sub (go-sub-4)..."
 tmux new-session -d -s go-sub-4 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node4/data-write/data/xapian_node' && go run . -config=config-sub-node4.json 2>&1 | tee \"$LOG_DIR/go-sub-4.log\""
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node4/data-write/data/xapian_node' && go run . -config=config-sub-node4.json >> \"$LOG_DIR/node_4/go-sub-stdout.log\" 2>&1"
 
 print_info "⏳ Đợi Go Master và Sub 4 khởi động (5s)..."
 sleep 5
@@ -233,7 +234,7 @@ BINARY="$METANODE_ROOT/target/release/metanode"
 
 print_info "🚀 Starting Rust Node 4..."
 tmux new-session -d -s metanode-4 -c "$METANODE_ROOT" \
-    "export RUST_LOG=info,consensus_core=debug; $BINARY start --config config/node_4.toml 2>&1 | tee \"$LOG_DIR/metanode-4.log\""
+    "export RUST_LOG=info,consensus_core=debug; $BINARY start --config config/node_4.toml >> \"$LOG_DIR/node_4/rust.log\" 2>&1"
 
 print_info "⏳ Đợi Rust Node 4 khởi động (3s)..."
 sleep 3
@@ -262,7 +263,7 @@ print_info "  - Go Sub:    tmux attach -t go-sub-4"
 print_info "  - executor_read_enabled:   TRUE"
 print_info "  - executor_commit_enabled: TRUE"
 echo ""
-print_info "📁 Log files: $LOG_DIR/*.log"
+print_info "📁 Log files: $LOG_DIR/node_N/"
 echo ""
 print_info "📝 Để đăng ký Node 4 làm validator:"
 print_info "  cd $GO_PROJECT_ROOT/cmd/tool/register_validator"

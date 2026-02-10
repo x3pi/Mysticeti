@@ -23,6 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 METANODE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MYSTICETI_ROOT="$(cd "$METANODE_ROOT/.." && pwd)"
 GO_PROJECT_ROOT="$(cd "$METANODE_ROOT/../.." && pwd)/mtn-simple-2025"
+LOG_DIR="$METANODE_ROOT/logs"
 
 print_info() { echo -e "${GREEN}ℹ️  $1${NC}"; }
 print_warn() { echo -e "${YELLOW}⚠️  $1${NC}"; }
@@ -81,8 +82,9 @@ fi
 # Step 5: Start Go Master Node 1
 print_step "Bước 5: Restart Go Master Node 1..."
 cd "$GO_PROJECT_ROOT/cmd/simple_chain"
+mkdir -p "$LOG_DIR/node_1"
 tmux new-session -d -s go-master-1 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data/data/xapian_node' && go run . -config=config-master-node1.json 2>&1 | tee -a /tmp/go-master-1.log"
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data/data/xapian_node' && go run . -config=config-master-node1.json >> \"$LOG_DIR/node_1/go-master-stdout.log\" 2>&1"
 
 print_info "Waiting for Go Master 1 to init..."
 sleep 10
@@ -90,7 +92,7 @@ sleep 10
 # Step 6: Start Go Sub Node 1
 print_step "Bước 6: Restart Go Sub Node 1..."
 tmux new-session -d -s go-sub-1 -c "$GO_PROJECT_ROOT/cmd/simple_chain" \
-    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data-write/data/xapian_node' && go run . -config=config-sub-node1.json 2>&1 | tee -a /tmp/go-sub-1.log"
+    "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='sample/node1/data-write/data/xapian_node' && go run . -config=config-sub-node1.json >> \"$LOG_DIR/node_1/go-sub-stdout.log\" 2>&1"
 
 print_info "Waiting for Go Sub 1 to connect..."
 sleep 5
@@ -99,7 +101,7 @@ sleep 5
 print_step "Bước 7: Restart Rust Node 1..."
 cd "$METANODE_ROOT"
 tmux new-session -d -s metanode-1-sep -c "$METANODE_ROOT" \
-    "$BINARY start --config config/node_1_separate.toml 2>&1 | tee -a /tmp/metanode-1-sep.log"
+    "$BINARY start --config config/node_1_separate.toml >> \"$LOG_DIR/node_1/rust.log\" 2>&1"
 
 print_info "Waiting for Rust Node 1 to start..."
 sleep 5
