@@ -1,13 +1,7 @@
-// Copyright (c) MetaNode Team
-// SPDX-License-Identifier: Apache-2.0
-
-//! Block sync methods for ExecutorClient.
-//! Used by validators to serve blocks and SyncOnly nodes to write blocks.
-
 use anyhow::Result;
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::proto;
 use super::socket_stream::SocketStream;
@@ -43,17 +37,35 @@ impl ExecutorClient {
 
         let mut stream = SocketStream::connect(&self.request_socket_address, 5).await?;
 
-        let len_bytes = (request_bytes.len() as u32).to_le_bytes();
+        let len_bytes = (request_bytes.len() as u32).to_be_bytes();
         stream.write_all(&len_bytes).await?;
         stream.write_all(&request_bytes).await?;
         stream.flush().await?;
 
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let response_len = u32::from_le_bytes(len_buf) as usize;
+        // Read response with 60s timeout (Go may take a while to read+marshal historical blocks)
+        let response_result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
 
-        let mut response_buf = vec![0u8; response_len];
-        stream.read_exact(&mut response_buf).await?;
+            let mut response_buf = vec![0u8; response_len];
+            stream.read_exact(&mut response_buf).await?;
+
+            Ok::<Vec<u8>, std::io::Error>(response_buf)
+        })
+        .await;
+
+        let response_buf = match response_result {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => return Err(anyhow::anyhow!("UDS read error: {}", e)),
+            Err(_) => {
+                warn!(
+                    "⏱️ [BLOCK SYNC] Timeout (60s) reading blocks {}-{} from Go Master",
+                    from_block, to_block
+                );
+                return Err(anyhow::anyhow!("Timeout reading blocks from Go Master"));
+            }
+        };
 
         let response: proto::Response = proto::Response::decode(&*response_buf)?;
 
@@ -105,14 +117,14 @@ impl ExecutorClient {
 
         let mut stream = SocketStream::connect(&self.request_socket_address, 5).await?;
 
-        let len_bytes = (request_bytes.len() as u32).to_le_bytes();
+        let len_bytes = (request_bytes.len() as u32).to_be_bytes();
         stream.write_all(&len_bytes).await?;
         stream.write_all(&request_bytes).await?;
         stream.flush().await?;
 
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
-        let response_len = u32::from_le_bytes(len_buf) as usize;
+        let response_len = u32::from_be_bytes(len_buf) as usize;
 
         let mut response_buf = vec![0u8; response_len];
         stream.read_exact(&mut response_buf).await?;

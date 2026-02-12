@@ -352,11 +352,14 @@ impl PeerRpcServer {
         match executor.get_blocks_range(from, actual_to).await {
             Ok(block_data_list) => {
                 // Convert proto::BlockData to HashMap<u64, String> for response
+                // Encode FULL protobuf BlockData (not just extra_data) so receiver
+                // can reconstruct complete BlockData objects for sync_blocks()
+                use prost::Message;
                 let mut blocks = std::collections::HashMap::new();
                 for block in &block_data_list {
-                    // Encode full block info as hex string for JSON transport
-                    // Using extra_data which contains the serialized block
-                    blocks.insert(block.block_number, hex::encode(&block.extra_data));
+                    // Encode full BlockData as protobuf bytes, then hex for JSON transport
+                    let proto_bytes = block.encode_to_vec();
+                    blocks.insert(block.block_number, hex::encode(&proto_bytes));
                 }
 
                 let count = blocks.len();

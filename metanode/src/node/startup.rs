@@ -228,7 +228,7 @@ impl InitializedNode {
 
         if let Some(cm) = catchup_manager {
             info!("⏳ [STARTUP] Verifying sync status before joining consensus...");
-            let check_interval = std::time::Duration::from_secs(2);
+            let _check_interval = std::time::Duration::from_secs(2); // kept for reference
             let timeout = std::time::Duration::from_secs(600); // 10 minutes timeout
             let start = std::time::Instant::now();
 
@@ -281,6 +281,54 @@ impl InitializedNode {
                                 "🔄 [CATCHUP] Syncing blocks: LocalExec={}, Network={}, Gap={}",
                                 status.go_last_block, status.network_block_height, status.block_gap
                             );
+
+                            // FAST SYNC: For large gaps, loop continuously fetching batches
+                            if status.block_gap > 100 {
+                                let mut remaining = status.block_gap;
+                                let mut current_go_block = status.go_last_block;
+                                let max_blocks_per_cycle = 2000u64;
+                                let mut fetched_total = 0u64;
+
+                                while remaining > 0 && fetched_total < max_blocks_per_cycle {
+                                    let fetch_to = std::cmp::min(
+                                        current_go_block + 50,
+                                        status.network_block_height,
+                                    );
+                                    match cm
+                                        .sync_blocks_from_peers(current_go_block, fetch_to)
+                                        .await
+                                    {
+                                        Ok(synced) => {
+                                            if synced == 0 {
+                                                break;
+                                            }
+                                            current_go_block += synced;
+                                            remaining = remaining.saturating_sub(synced);
+                                            fetched_total += synced;
+                                        }
+                                        Err(e) => {
+                                            warn!("⚠️ [CATCHUP] Fast sync batch failed: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                info!(
+                                    "🚀 [CATCHUP] Fast sync cycle: fetched {} blocks total",
+                                    fetched_total
+                                );
+                                continue; // No delay - immediately re-check
+                            }
+
+                            // Normal sync: small gap, single fetch
+                            if let Err(e) = cm
+                                .sync_blocks_from_peers(
+                                    status.go_last_block,
+                                    status.network_block_height,
+                                )
+                                .await
+                            {
+                                warn!("⚠️ [CATCHUP] Block sync from peers failed: {}", e);
+                            }
                         } else {
                             info!(
                                 "🔄 [CATCHUP] Syncing epoch: Local={}, Network={}",
@@ -293,7 +341,8 @@ impl InitializedNode {
                     }
                 }
 
-                tokio::time::sleep(check_interval).await;
+                // Dynamic delay: 200ms for near-caught-up (much faster than original 2s)
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
 
             // Restore Validator mode

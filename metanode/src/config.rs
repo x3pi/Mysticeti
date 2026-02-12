@@ -259,7 +259,7 @@ fn default_fetch_timeout_secs() -> u64 {
 }
 
 fn default_epochs_to_keep() -> usize {
-    3 // Default: keep 3 most recent epochs
+    5 // Default: keep 5 most recent epochs (current + 4 previous)
 }
 
 impl NodeConfig {

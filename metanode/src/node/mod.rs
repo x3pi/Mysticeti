@@ -176,6 +176,9 @@ pub struct ConsensusNode {
     /// Block Coordinator for dual-stream block production
     /// Handles both Consensus and Sync streams with deduplication and priority
     pub(crate) block_coordinator: Option<Arc<block_coordinator::BlockCoordinator>>,
+
+    /// Peer RPC addresses for cross-node block fetching during epoch transitions
+    pub(crate) peer_rpc_addresses: Vec<String>,
 }
 
 // ConsensusNode constructors are in consensus_node.rs

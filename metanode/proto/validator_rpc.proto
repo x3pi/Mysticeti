@@ -148,6 +148,8 @@ message BlockData {
     uint64 gas_used = 9;             // Total gas used
     uint64 gas_limit = 10;           // Block gas limit
     bytes extra_data = 11;           // Extra data (validator signature, etc.)
+    bytes raw_block_bytes = 12;      // Full serialized block (Go's block.Marshal() output) for sync storage
+    bytes backup_data = 13;          // Full BackUpDb (gob-encoded) for state transfer during sync
 }
 
 // GetBlocksRangeRequest - Request blocks by range for sync

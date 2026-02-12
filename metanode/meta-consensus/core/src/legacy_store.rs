@@ -97,6 +97,6 @@ impl LegacyEpochStoreManager {
 
 impl Default for LegacyEpochStoreManager {
     fn default() -> Self {
-        Self::new(1) // Default: keep only 1 previous epoch
+        Self::new(5) // Default: keep 5 previous epochs for cross-epoch sync
     }
 }

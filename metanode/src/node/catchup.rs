@@ -136,7 +136,9 @@ impl CatchupManager {
         };
 
         // 3. Compare States
-        let epoch_match = local_epoch == network_epoch;
+        // FIX: Use Go's epoch (authoritative) for epoch_match, not local_epoch which
+        // may be stale from when Rust started at epoch 0.
+        let epoch_match = local_go_epoch == network_epoch;
 
         // Calculate gaps
         let commit_gap = if epoch_match { 0 } else { u64::MAX };
@@ -161,8 +163,8 @@ impl CatchupManager {
         };
 
         info!(
-            "📊 [CATCHUP] Sync status: Local[Ep={}, Blk={}, Cmt={}] vs Network[Ep={}, Blk={}] -> Gap={} blocks. Ready={}",
-            local_epoch, local_go_last_block, local_last_commit,
+            "📊 [CATCHUP] Sync status: Local[Ep={}, GoEp={}, Blk={}, Cmt={}] vs Network[Ep={}, Blk={}] -> Gap={} blocks. Ready={}",
+            local_epoch, local_go_epoch, local_go_last_block, local_last_commit,
             network_epoch, network_block,
             if block_gap == u64::MAX { "∞".to_string() } else { block_gap.to_string() },
             ready
@@ -186,5 +188,72 @@ impl CatchupManager {
         *self.state.write().await = new_state;
 
         Ok(status)
+    }
+
+    /// Actively fetch missing blocks from peers and write them to local Go.
+    /// This closes the block gap that passive polling can never close.
+    pub async fn sync_blocks_from_peers(
+        &self,
+        go_last_block: u64,
+        network_block: u64,
+    ) -> Result<u64> {
+        if self.peer_rpc_addresses.is_empty() {
+            return Err(anyhow::anyhow!("No peer_rpc_addresses configured"));
+        }
+
+        let missing_from = go_last_block + 1;
+        if missing_from > network_block {
+            info!(
+                "✅ [CATCHUP SYNC] No blocks to fetch (go={} >= network={})",
+                go_last_block, network_block
+            );
+            return Ok(0);
+        }
+
+        info!(
+            "🔄 [CATCHUP SYNC] Fetching blocks {} to {} from {} peer(s)",
+            missing_from,
+            network_block,
+            self.peer_rpc_addresses.len()
+        );
+
+        match crate::network::peer_rpc::fetch_blocks_from_peer(
+            &self.peer_rpc_addresses,
+            missing_from,
+            network_block,
+        )
+        .await
+        {
+            Ok(blocks) => {
+                if blocks.is_empty() {
+                    warn!("⚠️ [CATCHUP SYNC] Fetched 0 blocks from peers");
+                    return Ok(0);
+                }
+
+                let fetched_count = blocks.len() as u64;
+                info!(
+                    "✅ [CATCHUP SYNC] Fetched {} blocks from peers. Syncing to local Go...",
+                    fetched_count
+                );
+
+                match self.executor_client.sync_blocks(blocks).await {
+                    Ok((synced, last_block)) => {
+                        info!(
+                            "✅ [CATCHUP SYNC] Synced {} blocks to local Go (last: {})",
+                            synced, last_block
+                        );
+                        Ok(synced)
+                    }
+                    Err(e) => {
+                        warn!("⚠️ [CATCHUP SYNC] Failed to sync blocks to local Go: {}", e);
+                        Err(anyhow::anyhow!("Failed to sync blocks: {}", e))
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ [CATCHUP SYNC] Failed to fetch blocks from peers: {}", e);
+                Err(anyhow::anyhow!("Failed to fetch from peers: {}", e))
+            }
+        }
     }
 }

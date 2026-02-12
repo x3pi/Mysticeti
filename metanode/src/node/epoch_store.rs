@@ -40,6 +40,7 @@ pub(super) fn load_legacy_epoch_stores(
     legacy_manager: &std::sync::Arc<consensus_core::LegacyEpochStoreManager>,
     storage_path: &std::path::Path,
     current_epoch: u64,
+    max_epochs: usize,
 ) {
     if current_epoch == 0 {
         // No previous epochs to load
@@ -52,7 +53,23 @@ pub(super) fn load_legacy_epoch_stores(
         return;
     }
 
-    // Load previous epochs (up to max_epochs in LegacyEpochStoreManager)
+    let max_to_load = if max_epochs == 0 {
+        usize::MAX // Archive mode: load all
+    } else {
+        max_epochs
+    };
+
+    info!(
+        "📦 [LEGACY STORE] Loading up to {} previous epoch stores (current_epoch={})",
+        if max_epochs == 0 {
+            "ALL".to_string()
+        } else {
+            max_to_load.to_string()
+        },
+        current_epoch
+    );
+
+    // Load previous epochs (up to max_epochs)
     let mut loaded_count = 0;
     for epoch in (0..current_epoch).rev() {
         let epoch_db_path = epochs_dir
@@ -74,12 +91,11 @@ pub(super) fn load_legacy_epoch_stores(
             loaded_count += 1;
 
             info!(
-                "✅ [LEGACY STORE] Loaded epoch {} store for historical sync",
-                epoch
+                "✅ [LEGACY STORE] Loaded epoch {} store for historical sync ({}/{})",
+                epoch, loaded_count, max_to_load
             );
 
-            // Only load max_epochs number of stores
-            if loaded_count >= 1 {
+            if loaded_count >= max_to_load {
                 break;
             }
         } else {

@@ -27,6 +27,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::NodeConfig;
+use crate::node::epoch_store::load_legacy_epoch_stores;
 use crate::node::executor_client::ExecutorClient;
 use crate::node::tx_submitter::TransactionClientProxy;
 
@@ -138,33 +139,53 @@ impl ConsensusNode {
             }
         };
 
-        // PEER EPOCH DISCOVERY: Query TCP peers to get correct epoch
+        // PEER EPOCH DISCOVERY: Query TCP peers to get correct epoch (with retry)
         let (go_epoch, peer_last_block, best_socket) = if !config.peer_rpc_addresses.is_empty() {
             use crate::network::peer_rpc::query_peer_epochs_network;
-            match query_peer_epochs_network(&config.peer_rpc_addresses).await {
-                Ok(result) => {
-                    info!(
-                        "✅ [PEER EPOCH] Using epoch {} from TCP peer discovery (peer: {})",
-                        result.0, result.2
-                    );
-                    (
-                        result.0,
-                        result.1,
-                        config.executor_receive_socket_path.clone(),
-                    )
+            let max_attempts = 3;
+            let mut peer_result = None;
+            for attempt in 1..=max_attempts {
+                match query_peer_epochs_network(&config.peer_rpc_addresses).await {
+                    Ok(result) => {
+                        info!(
+                            "✅ [PEER EPOCH] Using epoch {} from TCP peer discovery (peer: {}, attempt {})",
+                            result.0, result.2, attempt
+                        );
+                        peer_result = Some(result);
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt < max_attempts {
+                            warn!(
+                                "⚠️ [PEER EPOCH] Attempt {}/{} failed: {}. Retrying in 2s...",
+                                attempt, max_attempts, e
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        } else {
+                            warn!(
+                                "⚠️ [PEER EPOCH] All {} attempts failed. Last error: {}. Falling back to local Go.",
+                                max_attempts, e
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("⚠️ [PEER EPOCH] Failed to query TCP peers, falling back to local Go Master: {}", e);
-                    let epoch = executor_client
-                        .get_current_epoch()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to fetch epoch: {}", e))?;
-                    (
-                        epoch,
-                        latest_block_number,
-                        config.executor_receive_socket_path.clone(),
-                    )
-                }
+            }
+            if let Some(result) = peer_result {
+                (
+                    result.0,
+                    result.1,
+                    config.executor_receive_socket_path.clone(),
+                )
+            } else {
+                let epoch = executor_client
+                    .get_current_epoch()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to fetch epoch: {}", e))?;
+                (
+                    epoch,
+                    latest_block_number,
+                    config.executor_receive_socket_path.clone(),
+                )
             }
         } else {
             let epoch = executor_client
@@ -193,12 +214,29 @@ impl ConsensusNode {
                 local_epoch, go_epoch, go_epoch
             );
             if config.epochs_to_keep > 0 {
-                for epoch in local_epoch..go_epoch {
-                    let epoch_path = storage_path.join("epochs").join(format!("epoch_{}", epoch));
-                    if epoch_path.exists() {
-                        info!("🗑️ [CATCHUP] Clearing stale epoch {} data", epoch);
-                        if let Err(e) = std::fs::remove_dir_all(&epoch_path) {
-                            warn!("⚠️ [CATCHUP] Failed to clear epoch {} data: {}", epoch, e);
+                // Smart cleanup: only delete epochs older than epochs_to_keep
+                // Keep recent epochs so THIS node can serve historical data to lagging peers
+                let keep_from = if go_epoch >= config.epochs_to_keep as u64 {
+                    go_epoch - config.epochs_to_keep as u64
+                } else {
+                    0
+                };
+                let epochs_dir = storage_path.join("epochs");
+                if epochs_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&epochs_dir) {
+                        for entry in entries.flatten() {
+                            if let Some(name) = entry.file_name().to_str() {
+                                if let Some(epoch_str) = name.strip_prefix("epoch_") {
+                                    if let Ok(epoch) = epoch_str.parse::<u64>() {
+                                        if epoch < keep_from {
+                                            info!("🗑️ [CATCHUP] Removing old epoch {} data (older than keep_from={})", epoch, keep_from);
+                                            let _ = std::fs::remove_dir_all(entry.path());
+                                        } else {
+                                            info!("📦 [CATCHUP] Keeping epoch {} data for sync support", epoch);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -819,6 +857,7 @@ impl ConsensusNode {
                 Arc::new(tokio::sync::Mutex::new(map))
             },
             block_coordinator: None,
+            peer_rpc_addresses: config.peer_rpc_addresses.clone(),
         };
 
         // Initialize the global StateTransitionManager
@@ -835,6 +874,15 @@ impl ConsensusNode {
             } else {
                 "SyncOnly"
             }
+        );
+
+        // Load previous epoch stores for cross-epoch sync support
+        // This enables THIS node to serve historical commits to lagging peers
+        load_legacy_epoch_stores(
+            &node.legacy_store_manager,
+            &config.storage_path,
+            storage.current_epoch,
+            config.epochs_to_keep,
         );
 
         crate::consensus::epoch_transition::start_epoch_transition_handler(

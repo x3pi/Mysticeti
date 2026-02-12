@@ -67,8 +67,16 @@ sleep 2
 # Step 2: Check binary
 # ==============================================================================
 echo -e "${BLUE}📋 Step 2: Check binary...${NC}"
+# Always rebuild if source changed (or binary missing)
+NEEDS_BUILD=false
 if [ ! -f "$BINARY" ]; then
     echo "  ⚠️ Binary not found, building..."
+    NEEDS_BUILD=true
+elif [ -n "$(find "$METANODE_ROOT/src" -name '*.rs' -newer "$BINARY" 2>/dev/null | head -1)" ]; then
+    echo "  🔄 Source changed, rebuilding..."
+    NEEDS_BUILD=true
+fi
+if [ "$NEEDS_BUILD" = true ]; then
     cd "$METANODE_ROOT" && cargo build --release --bin metanode
 fi
 echo -e "${GREEN}  ✅ Binary ready${NC}"

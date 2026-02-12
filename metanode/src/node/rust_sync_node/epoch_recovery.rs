@@ -66,84 +66,93 @@ impl RustSyncNode {
                     // Load if missing
                     if !cache.contains_key(&epoch) {
                         info!(
-                            "📥 [RUST-SYNC] Cache miss for epoch {}. Trying local Go...",
+                            "📥 [RUST-SYNC] Cache miss for epoch {}. Trying PEERS FIRST (more reliable for SyncOnly)...",
                             epoch
                         );
 
                         let mut loaded = false;
 
-                        // 1. Try local Go first
-                        match self.executor_client.get_epoch_boundary_data(epoch).await {
-                            Ok((_e, _ts, _boundary, validators)) => {
-                                let mut sorted_validators = validators.clone();
-                                sorted_validators
-                                    .sort_by(|a, b| a.authority_key.cmp(&b.authority_key));
-
-                                let addr_list: Vec<Vec<u8>> = sorted_validators
-                                    .iter()
-                                    .map(|v| {
-                                        hex::decode(&v.address.trim_start_matches("0x"))
-                                            .unwrap_or_default()
-                                    })
-                                    .collect();
-                                cache.insert(epoch, addr_list);
-                                info!(
-                                    "✅ [RUST-SYNC] Cache populated from local Go for epoch {}",
-                                    epoch
-                                );
-                                loaded = true;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "⚠️ [RUST-SYNC] Local Go failed for epoch {}: {}. Trying peer...",
-                                    epoch, e
-                                );
-                            }
-                        }
-
-                        // 2. Fallback to peer if local Go failed
-                        if !loaded {
-                            // Get peer addresses from config
-                            if !self.config.peer_rpc_addresses.is_empty() {
-                                for peer_addr in &self.config.peer_rpc_addresses {
-                                    match query_peer_epoch_boundary_data(peer_addr, epoch).await {
-                                        Ok(response) => {
-                                            if response.error.is_none() {
-                                                let mut sorted = response.validators.clone();
-                                                sorted.sort_by(|a, b| {
-                                                    a.authority_key.cmp(&b.authority_key)
-                                                });
-                                                let addr_list: Vec<Vec<u8>> = sorted
-                                                    .iter()
-                                                    .map(|v| {
-                                                        hex::decode(
-                                                            &v.address.trim_start_matches("0x"),
-                                                        )
+                        // ═══════════════════════════════════════════════════════════════
+                        // FORK FIX: Try PEERS FIRST for SyncOnly nodes!
+                        // Local Go on SyncOnly may have stale StakeStateDB, causing
+                        // GetEpochBoundaryData to return wrong validator set.
+                        // Peers (validators) are authoritative for epoch boundary data.
+                        // ═══════════════════════════════════════════════════════════════
+                        if !self.config.peer_rpc_addresses.is_empty() {
+                            for peer_addr in &self.config.peer_rpc_addresses {
+                                match query_peer_epoch_boundary_data(peer_addr, epoch).await {
+                                    Ok(response) => {
+                                        if response.error.is_none()
+                                            && !response.validators.is_empty()
+                                        {
+                                            let mut sorted = response.validators.clone();
+                                            sorted.sort_by(|a, b| {
+                                                a.authority_key.cmp(&b.authority_key)
+                                            });
+                                            let addr_list: Vec<Vec<u8>> = sorted
+                                                .iter()
+                                                .map(|v| {
+                                                    hex::decode(&v.address.trim_start_matches("0x"))
                                                         .unwrap_or_default()
-                                                    })
-                                                    .collect();
-                                                cache.insert(epoch, addr_list);
-                                                info!("✅ [RUST-SYNC] Cache populated from PEER {} for epoch {}", peer_addr, epoch);
-                                                loaded = true;
-                                                break;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "⚠️ [RUST-SYNC] Peer {} query failed: {}",
-                                                peer_addr, e
+                                                })
+                                                .collect();
+                                            info!(
+                                                "✅ [RUST-SYNC] Cache populated from PEER {} for epoch {} ({} validators)",
+                                                peer_addr, epoch, addr_list.len()
                                             );
+                                            cache.insert(epoch, addr_list);
+                                            loaded = true;
+                                            break;
                                         }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "⚠️ [RUST-SYNC] Peer {} query failed for epoch {}: {}",
+                                            peer_addr, epoch, e
+                                        );
                                     }
                                 }
                             }
+                        }
 
-                            if !loaded {
-                                warn!(
-                                    "⚠️ [RUST-SYNC] All sources failed for epoch {}. Will retry...",
-                                    epoch
-                                );
+                        // 2. Fallback to local Go only if peers failed
+                        if !loaded {
+                            match self.executor_client.get_epoch_boundary_data(epoch).await {
+                                Ok((_e, _ts, _boundary, validators)) => {
+                                    let mut sorted_validators = validators.clone();
+                                    sorted_validators
+                                        .sort_by(|a, b| a.authority_key.cmp(&b.authority_key));
+
+                                    let addr_list: Vec<Vec<u8>> = sorted_validators
+                                        .iter()
+                                        .map(|v| {
+                                            hex::decode(&v.address.trim_start_matches("0x"))
+                                                .unwrap_or_default()
+                                        })
+                                        .collect();
+                                    warn!(
+                                        "⚠️ [RUST-SYNC] Cache populated from LOCAL Go for epoch {} ({} validators). \
+                                         LOCAL Go data may be STALE on SyncOnly nodes!",
+                                        epoch, addr_list.len()
+                                    );
+                                    cache.insert(epoch, addr_list);
+                                    loaded = true;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "⚠️ [RUST-SYNC] Local Go also failed for epoch {}: {}",
+                                        epoch, e
+                                    );
+                                }
                             }
+                        }
+
+                        // All sources failed (peers tried first, then local Go)
+                        if !loaded {
+                            warn!(
+                                "⚠️ [RUST-SYNC] All sources (peers + local Go) failed for epoch {}. Will retry...",
+                                epoch
+                            );
                         }
                     }
 

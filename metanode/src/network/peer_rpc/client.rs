@@ -12,6 +12,9 @@ use tracing::{info, warn};
 
 use super::types::*;
 
+// Re-export executor proto for block data types
+use crate::node::executor_client::proto::BlockData;
+
 /// Query peer info from a remote node via HTTP
 pub async fn query_peer_info(peer_address: &str) -> Result<PeerInfoResponse> {
     use tokio::net::TcpStream;
@@ -352,4 +355,170 @@ pub async fn forward_transaction_to_validators(
     Err(anyhow::anyhow!(
         "Failed to forward transaction to any validator"
     ))
+}
+
+/// Fetch blocks from a peer node via HTTP /get_blocks endpoint.
+/// Batches requests by 100 blocks (server-side limit).
+/// Returns Vec<BlockData> ready for sync_blocks().
+///
+/// Used by Rust to orchestrate block sync during cross-epoch catch-up:
+/// peer Go master → peer Rust → this function → local sync_blocks() → local Go master
+pub async fn fetch_blocks_from_peer(
+    peer_addresses: &[String],
+    from_block: u64,
+    to_block: u64,
+) -> Result<Vec<BlockData>> {
+    if peer_addresses.is_empty() {
+        return Err(anyhow::anyhow!("No peer addresses configured"));
+    }
+
+    let total_blocks = to_block.saturating_sub(from_block) + 1;
+    info!(
+        "🔄 [BLOCK-FETCH] Fetching {} blocks ({} to {}) from {} peer(s)",
+        total_blocks,
+        from_block,
+        to_block,
+        peer_addresses.len()
+    );
+
+    let mut all_blocks = Vec::new();
+    let batch_size = 50u64; // Larger batches to reduce HTTP roundtrip overhead (server supports up to 100)
+    let mut current_from = from_block;
+
+    while current_from <= to_block {
+        let current_to = std::cmp::min(current_from + batch_size - 1, to_block);
+        let mut batch_fetched = false;
+
+        // Try each peer until one succeeds for this batch
+        for peer_addr in peer_addresses {
+            match fetch_block_batch(peer_addr, current_from, current_to).await {
+                Ok(blocks) => {
+                    info!(
+                        "✅ [BLOCK-FETCH] Got {} blocks ({}-{}) from peer {}",
+                        blocks.len(),
+                        current_from,
+                        current_to,
+                        peer_addr
+                    );
+                    all_blocks.extend(blocks);
+                    batch_fetched = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ [BLOCK-FETCH] Peer {} failed for blocks {}-{}: {}",
+                        peer_addr, current_from, current_to, e
+                    );
+                    continue;
+                }
+            }
+        }
+
+        if !batch_fetched {
+            warn!(
+                "⚠️ [BLOCK-FETCH] All peers failed for batch {}-{}. Returning {} blocks fetched so far.",
+                current_from, current_to, all_blocks.len()
+            );
+            break;
+        }
+
+        current_from = current_to + 1;
+    }
+
+    info!(
+        "📦 [BLOCK-FETCH] Total: {} blocks fetched ({} to {})",
+        all_blocks.len(),
+        from_block,
+        from_block + all_blocks.len() as u64 - 1
+    );
+
+    Ok(all_blocks)
+}
+
+/// Fetch a single batch of blocks from one peer via HTTP
+async fn fetch_block_batch(
+    peer_addr: &str,
+    from_block: u64,
+    to_block: u64,
+) -> Result<Vec<BlockData>> {
+    use prost::Message;
+    use tokio::net::TcpStream;
+
+    // Connect with timeout
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(peer_addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Connection timeout to {}", peer_addr))?
+    .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", peer_addr, e))?;
+
+    // Send HTTP GET request
+    let request = format!(
+        "GET /get_blocks?from={}&to={} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        from_block, to_block, peer_addr
+    );
+    stream.write_all(request.as_bytes()).await?;
+
+    // Read response with timeout (block data can be large)
+    let mut buffer = Vec::new();
+    let mut temp = [0u8; 65536]; // 64KB buffer for block data
+    let read_result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            match stream.read(&mut temp).await {
+                Ok(0) => break,
+                Ok(n) => buffer.extend_from_slice(&temp[..n]),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    match read_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to read response: {}", e)),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Timeout reading response from {}",
+                peer_addr
+            ))
+        }
+    }
+
+    // Parse HTTP response
+    let response_str = String::from_utf8_lossy(&buffer);
+
+    // Find JSON body
+    let body_start = response_str
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| response_str.find("\n\n").map(|i| i + 2))
+        .unwrap_or(0);
+
+    let body = &response_str[body_start..];
+
+    // Parse GetBlocksResponse JSON
+    let response: GetBlocksResponse = serde_json::from_str(body.trim())
+        .map_err(|e| anyhow::anyhow!("Failed to parse blocks response JSON: {}", e))?;
+
+    if let Some(error) = &response.error {
+        return Err(anyhow::anyhow!("Peer returned error: {}", error));
+    }
+
+    // Decode protobuf-encoded BlockData from hex strings
+    let mut blocks = Vec::with_capacity(response.blocks.len());
+    for (block_num, hex_data) in &response.blocks {
+        let proto_bytes = hex::decode(hex_data)
+            .map_err(|e| anyhow::anyhow!("Failed to decode hex for block {}: {}", block_num, e))?;
+        let block_data = BlockData::decode(&proto_bytes[..]).map_err(|e| {
+            anyhow::anyhow!("Failed to decode protobuf for block {}: {}", block_num, e)
+        })?;
+        blocks.push(block_data);
+    }
+
+    // Sort blocks by block_number for sequential processing
+    blocks.sort_by_key(|b| b.block_number);
+
+    Ok(blocks)
 }
