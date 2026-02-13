@@ -30,13 +30,26 @@ pub(super) async fn setup_validator_consensus(
         node.epoch_transition_sender.clone(),
     );
 
+    // CRITICAL FIX (2026-02-13): Use node.last_global_exec_index instead of epoch_boundary_block
+    // for initial_next_expected. These values can diverge when get_epoch_boundary_data() overwrites
+    // epoch_boundary_block with a stale stored_boundary (e.g., 294007) while
+    // shared_last_global_exec_index was correctly updated to 294008 by stop_authority_and_poll_go().
+    // CommitProcessor derives epoch_base_index from shared_last_global_exec_index,
+    // so first commit produces global_exec_index = epoch_base_index + 1.
+    // The executor client MUST start at epoch_base_index + 1 to match.
+    let actual_epoch_base = node.last_global_exec_index;
+    let initial_next_expected = actual_epoch_base + 1;
+    info!(
+        "📊 [EXECUTOR INIT] epoch_boundary_block={}, node.last_global_exec_index={}, initial_next_expected={}",
+        epoch_boundary_block, actual_epoch_base, initial_next_expected
+    );
     let exec_client_proc = if node.executor_commit_enabled {
         Some(Arc::new(ExecutorClient::new_with_initial_index(
             true,
             true,
             config.executor_send_socket_path.clone(),
             config.executor_receive_socket_path.clone(),
-            epoch_boundary_block + 1,
+            initial_next_expected,
             Some(node.storage_path.clone()),
         )))
     } else {
@@ -44,15 +57,15 @@ pub(super) async fn setup_validator_consensus(
     };
 
     // Initialize BlockCoordinator for dual-stream block production
+    // Use same initial_next_expected as executor client for consistency
     let coordinator = Arc::new(crate::node::block_coordinator::BlockCoordinator::new(
-        epoch_boundary_block + 1,
+        initial_next_expected,
         crate::node::block_coordinator::CoordinatorConfig::default(),
     ));
     node.block_coordinator = Some(coordinator.clone());
     info!(
         "📦 [COORDINATOR] BlockCoordinator initialized for epoch {} (next_expected={})",
-        new_epoch,
-        epoch_boundary_block + 1
+        new_epoch, initial_next_expected
     );
 
     let mut processor = crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
@@ -67,7 +80,7 @@ pub(super) async fn setup_validator_consensus(
             ),
         )
         .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
-        .with_epoch_info(new_epoch, epoch_boundary_block)
+        .with_epoch_info(new_epoch, actual_epoch_base)
         .with_is_transitioning(node.is_transitioning.clone())
         .with_pending_transactions_queue(node.pending_transactions_queue.clone())
         .with_epoch_transition_callback(epoch_cb)
@@ -143,29 +156,35 @@ pub(super) async fn setup_synconly_sync(
         node.epoch_transition_sender.clone(),
     );
 
+    // CRITICAL FIX (2026-02-13): Same fix as Validator path - use node.last_global_exec_index
+    let actual_epoch_base = node.last_global_exec_index;
+    let initial_next_expected = actual_epoch_base + 1;
+    info!(
+        "📊 [EXECUTOR INIT] SyncOnly: epoch_boundary_block={}, node.last_global_exec_index={}, initial_next_expected={}",
+        epoch_boundary_block, actual_epoch_base, initial_next_expected
+    );
     let exec_client_proc = if node.executor_commit_enabled {
         Some(Arc::new(ExecutorClient::new_with_initial_index(
             true,
             true,
             config.executor_send_socket_path.clone(),
             config.executor_receive_socket_path.clone(),
-            epoch_boundary_block + 1,
+            initial_next_expected,
             Some(node.storage_path.clone()),
         )))
     } else {
         None
     };
 
-    // Initialize BlockCoordinator
+    // Initialize BlockCoordinator - use same initial_next_expected for consistency
     let coordinator = Arc::new(crate::node::block_coordinator::BlockCoordinator::new(
-        epoch_boundary_block + 1,
+        initial_next_expected,
         crate::node::block_coordinator::CoordinatorConfig::default(),
     ));
     node.block_coordinator = Some(coordinator.clone());
     info!(
         "📦 [COORDINATOR] BlockCoordinator initialized for SyncOnly epoch {} (next_expected={})",
-        new_epoch,
-        epoch_boundary_block + 1
+        new_epoch, initial_next_expected
     );
 
     let mut processor = crate::consensus::commit_processor::CommitProcessor::new(commit_receiver)
@@ -180,7 +199,7 @@ pub(super) async fn setup_synconly_sync(
             ),
         )
         .with_shared_last_global_exec_index(node.shared_last_global_exec_index.clone())
-        .with_epoch_info(new_epoch, epoch_boundary_block)
+        .with_epoch_info(new_epoch, actual_epoch_base)
         .with_is_transitioning(node.is_transitioning.clone())
         .with_pending_transactions_queue(node.pending_transactions_queue.clone())
         .with_epoch_transition_callback(epoch_cb)

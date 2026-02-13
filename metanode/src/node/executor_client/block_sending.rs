@@ -210,14 +210,17 @@ impl ExecutorClient {
                 let min_buffered = *buffer.keys().next().unwrap_or(&0);
                 let gap = min_buffered.saturating_sub(*next_expected);
 
-                // If gap is large, sync with Go (SINGLE SOURCE OF TRUTH)
-                // This auto-recovers from desync situations
-                if gap > 100 {
+                // CRITICAL FIX (2026-02-13): Auto-recover from ANY gap, not just large ones (was > 100).
+                // A gap of even 1 block means next_expected is wrong (e.g., from stale epoch boundary).
+                // The off-by-one bug in epoch_boundary_block produces a gap of exactly 1, causing
+                // the buffer to wait forever for a block that was already processed in the previous epoch.
+                // Syncing with Go (SINGLE SOURCE OF TRUTH) immediately recovers from this.
+                if gap > 0 {
                     // Drop locks before async call
                     drop(buffer);
                     drop(next_expected);
 
-                    warn!("⚠️  [SEQUENTIAL-BUFFER] Large gap detected: min_buffered={}, gap={}. Syncing with Go (SOURCE OF TRUTH)...", 
+                    warn!("⚠️  [SEQUENTIAL-BUFFER] Gap detected: min_buffered={}, gap={}. Syncing with Go (SOURCE OF TRUTH)...", 
                         min_buffered, gap);
 
                     // Sync with Go to get correct next_expected
