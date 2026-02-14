@@ -71,3 +71,7 @@ tonic-build = "0.14.2"
 [[bench]]
 name = "commit_finalizer_bench"
 harness = false
+
+[[bench]]
+name = "transaction_throughput_bench"
+harness = false
