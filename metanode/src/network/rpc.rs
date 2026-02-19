@@ -89,103 +89,99 @@ impl RpcServer {
                     "📥 [TX FLOW] Spawned handler for connection from {:?}",
                     peer_addr
                 );
-                // Release permit khi task hoàn thành
                 let _permit = permit;
 
-                // Try to detect protocol: length-prefixed binary or HTTP
-                // Read first 4 bytes to check if it's a length prefix
-                // Wrap với timeout ngắn hơn để tránh connection bị treo và phát hiện connection chết sớm
-                info!(
-                    "📥 [TX FLOW] Waiting to read length prefix (4 bytes) from {:?}...",
-                    peer_addr
-                );
-                let mut len_buf = [0u8; 4];
-                let read_len_result = tokio::time::timeout(
-                    std::time::Duration::from_secs(5), // Giảm từ 30s xuống 5s để phát hiện connection chết sớm
-                    stream.read_exact(&mut len_buf),
-                )
-                .await;
-
-                // SPECIAL TESTING MODE: If first 4 bytes are "TEST", treat as raw text transaction
-                let is_testing_mode = len_buf == [b'T', b'E', b'S', b'T'];
-
-                if is_testing_mode {
-                    // TESTING MODE: Read the rest as raw transaction data
-                    info!("🧪 [TX FLOW] Detected TESTING MODE from {:?}, reading raw transaction data...", peer_addr);
-                    let mut tx_data = Vec::new();
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(0) => break, // EOF
-                            Ok(n) => tx_data.extend_from_slice(&buf[..n]),
-                            Err(e) => {
-                                error!("❌ [TX FLOW] Failed to read testing transaction data from {:?}: {}", peer_addr, e);
-                                return;
-                            }
-                        }
-                    }
-
-                    info!(
-                        "📥 [TX FLOW] Received testing transaction: {} bytes",
-                        tx_data.len()
-                    );
-
-                    // Process as raw transaction data (just use the data as-is)
-                    let is_length_prefixed = false; // Mark as not length-prefixed for testing
-                    if let Err(e) = Self::process_transaction_data(
-                        &client,
-                        &node,
-                        &mut stream,
-                        tx_data,
-                        is_length_prefixed,
+                // Persistent connection loop: read multiple TXs per connection
+                // This enables connection reuse from Go's txsender pool
+                let mut tx_count: u64 = 0;
+                loop {
+                    // Read length prefix (4 bytes) with idle timeout
+                    let mut len_buf = [0u8; 4];
+                    let read_len_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(30), // Idle timeout: close connection after 30s of no data
+                        stream.read_exact(&mut len_buf),
                     )
-                    .await
-                    {
-                        error!("❌ [TX FLOW] Failed to process testing transaction: {}", e);
-                        let _ = Self::send_binary_response(
-                            &mut stream,
-                            false,
-                            "Failed to process testing transaction",
-                        )
-                        .await;
-                    } else {
-                        info!("✅ [TX FLOW] Successfully processed testing transaction");
-                        let _ = Self::send_binary_response(
-                            &mut stream,
-                            true,
-                            "Testing transaction submitted",
-                        )
-                        .await;
-                    }
-                    return;
-                }
+                    .await;
 
-                match read_len_result {
-                    Ok(Ok(_)) => {
-                        let data_len = u32::from_be_bytes(len_buf) as usize;
-                        info!(
-                            "📥 [TX FLOW] Read length prefix: {} bytes from {:?}",
-                            data_len, peer_addr
-                        );
-                        // Check if this looks like a length prefix (reasonable size: 1 byte to 10MB)
-                        if data_len > 0 && data_len <= 10 * 1024 * 1024 {
-                            // Length-prefixed binary protocol (used by Go txsender client)
-                            info!(
-                                "📥 [TX FLOW] Reading {} bytes of transaction data from {:?}...",
-                                data_len, peer_addr
-                            );
+                    match read_len_result {
+                        Ok(Ok(_)) => {
+                            let data_len = u32::from_be_bytes(len_buf) as usize;
 
-                            // Use the new codec module to read the frame with timeout
-                            let tx_data_result =
-                                crate::network::codec::read_length_prefixed_frame_with_timeout(
-                                    &mut stream,
-                                    std::time::Duration::from_secs(10), // Timeout for data reading
-                                )
+                            // Validate length prefix
+                            if data_len == 0 || data_len > 10 * 1024 * 1024 {
+                                // Not a valid length prefix — might be HTTP or garbage
+                                if tx_count == 0 {
+                                    // First message: try HTTP fallback
+                                    let mut buffer = Vec::with_capacity(8192);
+                                    buffer.extend_from_slice(&len_buf);
+                                    let mut remaining = [0u8; 8188];
+                                    let read_remaining_result = tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        stream.read(&mut remaining),
+                                    )
+                                    .await;
+
+                                    match read_remaining_result {
+                                        Ok(Ok(n)) => {
+                                            buffer.extend_from_slice(&remaining[..n]);
+                                            let request = String::from_utf8_lossy(&buffer);
+                                            if request.starts_with("POST /submit") {
+                                                let body_start = request
+                                                    .find("\r\n\r\n")
+                                                    .or_else(|| request.find("\n\n"))
+                                                    .map(|i| i + 4)
+                                                    .unwrap_or(0);
+                                                let body = &request[body_start..];
+                                                let tx_data = if body.starts_with("0x")
+                                                    || body.chars().all(|c| c.is_ascii_hexdigit())
+                                                {
+                                                    hex::decode(
+                                                        body.trim().trim_start_matches("0x"),
+                                                    )
+                                                    .unwrap_or_else(|_| body.as_bytes().to_vec())
+                                                } else {
+                                                    body.trim().as_bytes().to_vec()
+                                                };
+                                                let is_length_prefixed = false;
+                                                if let Err(e) = Self::process_transaction_data(
+                                                    &client,
+                                                    &node,
+                                                    &mut stream,
+                                                    tx_data,
+                                                    is_length_prefixed,
+                                                )
+                                                .await
+                                                {
+                                                    error!(
+                                                        "Failed to process HTTP transaction: {}",
+                                                        e
+                                                    );
+                                                }
+                                            } else {
+                                                let response = "HTTP/1.1 404 Not Found\r\n\r\n";
+                                                let _ = stream.write_all(response.as_bytes()).await;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                // Invalid length on persistent connection — close
+                                break;
+                            }
+
+                            // Valid length-prefixed binary protocol
+                            // Read data directly using the length we already parsed
+                            let read_data_result =
+                                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                                    let mut data = vec![0u8; data_len];
+                                    stream.read_exact(&mut data).await?;
+                                    Ok::<Vec<u8>, std::io::Error>(data)
+                                })
                                 .await;
 
-                            match tx_data_result {
-                                Ok(tx_data) => {
-                                    // Calculate actual transaction hash from protobuf data
+                            match read_data_result {
+                                Ok(Ok(tx_data)) => {
+                                    tx_count += 1;
                                     let tx_hash_preview = calculate_transaction_hash_hex(&tx_data);
                                     let tx_hash_short = if tx_hash_preview.len() >= 16 {
                                         &tx_hash_preview[..16]
@@ -193,11 +189,10 @@ impl RpcServer {
                                         &tx_hash_preview
                                     };
 
-                                    info!("📥 [TX FLOW] Received length-prefixed transaction data via RPC: size={} bytes, hash={}...",
-                                        tx_data.len(), tx_hash_short);
+                                    info!("📥 [TX FLOW] RPC TX #{} from {:?}: size={} bytes, hash={}...",
+                                        tx_count, peer_addr, tx_data.len(), tx_hash_short);
 
-                                    // Process transaction data
-                                    let is_length_prefixed = true; // Mark as length-prefixed protocol
+                                    let is_length_prefixed = true;
                                     if let Err(e) = Self::process_transaction_data(
                                         &client,
                                         &node,
@@ -207,100 +202,53 @@ impl RpcServer {
                                     )
                                     .await
                                     {
-                                        error!("❌ [TX FLOW] Failed to process transaction (size={} bytes, hash_preview={}): {}",
-                                            tx_data.len(), tx_hash_preview, e);
-                                        // Send error response for length-prefixed protocol
-                                        let _ = Self::send_binary_response(
-                                            &mut stream,
-                                            false,
-                                            "Failed to process transaction",
-                                        )
-                                        .await;
+                                        error!(
+                                            "❌ [TX FLOW] Failed to process TX #{}: {}",
+                                            tx_count, e
+                                        );
                                     }
-                                }
-                                Err(e) => {
-                                    error!("❌ [TX FLOW] Failed to read length-prefixed transaction data: {}", e);
-                                    return;
-                                }
-                            }
-                        } else {
-                            // Not a valid length prefix, treat as HTTP
-                            // Reconstruct the 4 bytes we read as part of HTTP request
-                            let mut buffer = Vec::with_capacity(8192);
-                            buffer.extend_from_slice(&len_buf);
-
-                            // Read remaining data with timeout
-                            let mut remaining = [0u8; 8188];
-                            let read_remaining_result = tokio::time::timeout(
-                                std::time::Duration::from_secs(5), // Giảm từ 30s xuống 5s
-                                stream.read(&mut remaining),
-                            )
-                            .await;
-
-                            match read_remaining_result {
-                                Ok(Ok(n)) => {
-                                    buffer.extend_from_slice(&remaining[..n]);
-                                    let request = String::from_utf8_lossy(&buffer);
-
-                                    if request.starts_with("POST /submit") {
-                                        // Extract transaction data from HTTP body
-                                        let body_start = request
-                                            .find("\r\n\r\n")
-                                            .or_else(|| request.find("\n\n"))
-                                            .map(|i| i + 4)
-                                            .unwrap_or(0);
-
-                                        let body = &request[body_start..];
-                                        let tx_data = if body.starts_with("0x")
-                                            || body.chars().all(|c| c.is_ascii_hexdigit())
-                                        {
-                                            hex::decode(body.trim().trim_start_matches("0x"))
-                                                .unwrap_or_else(|_| body.as_bytes().to_vec())
-                                        } else {
-                                            body.trim().as_bytes().to_vec()
-                                        };
-
-                                        info!("📥 [TX FLOW] Received HTTP POST transaction data via RPC: size={} bytes", tx_data.len());
-
-                                        // Process transaction data (HTTP protocol)
-                                        let is_length_prefixed = false;
-                                        if let Err(e) = Self::process_transaction_data(
-                                            &client,
-                                            &node,
-                                            &mut stream,
-                                            tx_data,
-                                            is_length_prefixed,
-                                        )
-                                        .await
-                                        {
-                                            error!("Failed to process transaction: {}", e);
-                                        }
-                                    } else {
-                                        // Return 404 for other requests
-                                        let response = "HTTP/1.1 404 Not Found\r\n\r\n";
-                                        let _ = stream.write_all(response.as_bytes()).await;
-                                    }
+                                    // Continue loop — read next TX on this connection
                                 }
                                 Ok(Err(e)) => {
-                                    error!("❌ [TX FLOW] Failed to read HTTP request: {}", e);
-                                    return;
+                                    error!(
+                                        "❌ [TX FLOW] Failed to read TX data ({} bytes): {}",
+                                        data_len, e
+                                    );
+                                    break;
                                 }
                                 Err(_) => {
-                                    error!("❌ [TX FLOW] Timeout reading HTTP request (timeout after 5s)");
-                                    return;
+                                    error!(
+                                        "❌ [TX FLOW] Timeout reading TX data ({} bytes) from {:?}",
+                                        data_len, peer_addr
+                                    );
+                                    break;
                                 }
                             }
                         }
+                        Ok(Err(e)) => {
+                            // Connection closed by client or read error
+                            if tx_count > 0 {
+                                info!(
+                                    "🔌 [TX FLOW] Connection from {:?} closed after {} TXs: {}",
+                                    peer_addr, tx_count, e
+                                );
+                            } else {
+                                error!("❌ [TX FLOW] Failed to read from {:?}: {}", peer_addr, e);
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            // Idle timeout — close connection
+                            if tx_count > 0 {
+                                info!(
+                                    "🔌 [TX FLOW] Connection from {:?} idle timeout after {} TXs",
+                                    peer_addr, tx_count
+                                );
+                            }
+                            break;
+                        }
                     }
-                    Ok(Err(e)) => {
-                        error!("❌ [TX FLOW] Failed to read length prefix from {:?}: {} (connection may be closed by client)", peer_addr, e);
-                        return;
-                    }
-                    Err(_) => {
-                        error!("❌ [TX FLOW] Timeout reading length prefix from {:?} (timeout after 5s) - connection may be dead or client disconnected", peer_addr);
-                        return;
-                    }
-                }
+                } // end loop
             });
         }
     }

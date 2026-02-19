@@ -148,7 +148,7 @@ impl ExecutorClient {
     /// Get epoch start timestamp from Go state
     /// Used to sync timestamp after epoch transitions
     /// NOTE: This endpoint may not be implemented in Go yet - returns error in that case
-    pub async fn get_epoch_start_timestamp(&self) -> Result<u64> {
+    pub async fn get_epoch_start_timestamp(&self, epoch: u64) -> Result<u64> {
         if !self.is_enabled() {
             return Err(anyhow::anyhow!("Executor client is not enabled"));
         }
@@ -164,7 +164,7 @@ impl ExecutorClient {
         // Create GetEpochStartTimestampRequest
         let request = Request {
             payload: Some(proto::request::Payload::GetEpochStartTimestampRequest(
-                GetEpochStartTimestampRequest {},
+                GetEpochStartTimestampRequest { epoch },
             )),
         };
 

@@ -202,7 +202,10 @@ pub(super) async fn sync_epoch_timestamp_from_go(
         }
 
         // Now get timestamp and validate it's reasonable
-        match executor_client.get_epoch_start_timestamp().await {
+        match executor_client
+            .get_epoch_start_timestamp(expected_epoch)
+            .await
+        {
             Ok(go_timestamp) => {
                 // Validate timestamp is not from old epoch (should be close to expected)
                 // Timestamp should be within reasonable range of expected timestamp
