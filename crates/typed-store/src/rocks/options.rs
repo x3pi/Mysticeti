@@ -10,12 +10,12 @@ use tracing::{info, warn};
 // Write buffer size per RocksDB instance can be set via the env var below.
 // If the env var is not set, use the default value in MiB.
 const ENV_VAR_DB_WRITE_BUFFER_SIZE: &str = "DB_WRITE_BUFFER_SIZE_MB";
-const DEFAULT_DB_WRITE_BUFFER_SIZE: usize = 1024;
+const DEFAULT_DB_WRITE_BUFFER_SIZE: usize = 256;
 
 // Write ahead log size per RocksDB instance can be set via the env var below.
 // If the env var is not set, use the default value in MiB.
 const ENV_VAR_DB_WAL_SIZE: &str = "DB_WAL_SIZE_MB";
-const DEFAULT_DB_WAL_SIZE: usize = 1024;
+const DEFAULT_DB_WAL_SIZE: usize = 256;
 
 // Environment variable to control behavior of write throughput optimized tables.
 const ENV_VAR_L0_NUM_FILES_COMPACTION_TRIGGER: &str = "L0_NUM_FILES_COMPACTION_TRIGGER";
@@ -349,7 +349,7 @@ pub fn default_db_options() -> DBOptions {
 
     // Increase block size to 16KiB.
     // https://github.com/EighteenZi/rocksdb_wiki/blob/master/Memory-usage-in-RocksDB.md#indexes-and-filter-blocks
-    opt.set_block_based_table_factory(&get_block_options(128, 16 << 10));
+    opt.set_block_based_table_factory(&get_block_options(32, 16 << 10));
 
     // Set memtable bloomfilter.
     opt.set_memtable_prefix_bloom_ratio(0.02);

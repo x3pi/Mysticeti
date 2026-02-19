@@ -12,9 +12,9 @@ use consensus_config::AuthorityIndex;
 use consensus_types::block::{BlockDigest, BlockRef, Round, TransactionIndex};
 use meta_macros::fail_point;
 use typed_store::{
-    DBMapUtils, Map as _,
     metrics::SamplingInterval,
-    rocks::{DBMap, DBMapTableConfigMap, MetricConf, default_db_options},
+    rocks::{default_db_options, DBMap, DBMapTableConfigMap, MetricConf},
+    DBMapUtils, Map as _,
 };
 
 use super::{CommitInfo, Store, WriteBatch};
@@ -63,19 +63,18 @@ impl RocksDBStore {
         // However, we MUST enable fsync to ensure durability guarantees and prevent equivocation on crash/restart.
         let mut db_options = default_db_options();
         db_options.options.set_use_fsync(true);
-        
+
         let mut metrics_conf = MetricConf::new("consensus");
         metrics_conf.read_sample_interval = SamplingInterval::new(Duration::from_secs(60), 0);
-        
+
         // Use default options which are safer than optimize_for_write_throughput
         let cf_options = default_db_options();
-        
+
         let column_family_options = DBMapTableConfigMap::new(BTreeMap::from([
             (
                 Self::BLOCKS_CF.to_string(),
                 // For blocks, we can tune block size but should keep default durability settings
-                default_db_options()
-                    .set_block_options(512, 128 << 10),
+                default_db_options().set_block_options(64, 128 << 10),
             ),
             (
                 Self::DIGESTS_BY_AUTHORITIES_CF.to_string(),
@@ -98,7 +97,7 @@ impl RocksDBStore {
     pub fn new(path: &str) -> Self {
         tracing::warn!("Consensus store using tidehunter");
         use typed_store::tidehunter_util::{
-            KeyIndexing, KeySpaceConfig, KeyType, ThConfig, default_mutex_count,
+            default_mutex_count, KeyIndexing, KeySpaceConfig, KeyType, ThConfig,
         };
         let mutexes = default_mutex_count();
         let index_digest_key = KeyIndexing::key_reduction(36, 0..12);
@@ -215,7 +214,6 @@ impl Store for RocksDBStore {
                 )
                 .map_err(ConsensusError::RocksDBFailure)?;
         }
-
 
         batch.write()?;
         fail_point!("consensus-store-after-write");
@@ -395,7 +393,11 @@ impl Store for RocksDBStore {
         Ok(blocks)
     }
 
-    fn write_genesis_blocks(&self, epoch: u64, genesis_blocks: Vec<BlockRef>) -> ConsensusResult<()> {
+    fn write_genesis_blocks(
+        &self,
+        epoch: u64,
+        genesis_blocks: Vec<BlockRef>,
+    ) -> ConsensusResult<()> {
         // Store all genesis block refs for an epoch in a single entry
         self.genesis_blocks.insert(&epoch, &genesis_blocks)?;
         Ok(())

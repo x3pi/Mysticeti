@@ -141,7 +141,7 @@ cd "$METANODE_ROOT"
 for id in 0 1 2 3 4; do
     echo -e "${GREEN}  🚀 Rust Node $id (${RUST_SESSION[$id]})${NC}"
     tmux new-session -d -s "${RUST_SESSION[$id]}" -c "$METANODE_ROOT" \
-        "export RUST_LOG=info,consensus_core=debug; $BINARY start --config ${RUST_CONFIG[$id]} >> \"$LOG_DIR/node_$id/rust.log\" 2>&1"
+        "export RUST_LOG=info,consensus_core=debug; export DB_WRITE_BUFFER_SIZE_MB=256; export DB_WAL_SIZE_MB=256; $BINARY start --config ${RUST_CONFIG[$id]} >> \"$LOG_DIR/node_$id/rust.log\" 2>&1"
     
     sleep 1
 done

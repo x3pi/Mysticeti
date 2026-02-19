@@ -138,7 +138,7 @@ echo -e "${BLUE}📋 Step 6: Start Rust Metanode...${NC}"
 cd "$METANODE_ROOT"
 
 tmux new-session -d -s "${RUST_SESSION[$NODE_ID]}" -c "$METANODE_ROOT" \
-    "export RUST_LOG=info,consensus_core=debug; $BINARY start --config ${RUST_CONFIG[$NODE_ID]} >> \"$LOG_DIR/node_$NODE_ID/rust.log\" 2>&1"
+    "export RUST_LOG=info,consensus_core=debug; export DB_WRITE_BUFFER_SIZE_MB=256; export DB_WAL_SIZE_MB=256; $BINARY start --config ${RUST_CONFIG[$NODE_ID]} >> \"$LOG_DIR/node_$NODE_ID/rust.log\" 2>&1"
 
 echo -e "${GREEN}  🚀 Rust Metanode started (${RUST_SESSION[$NODE_ID]})${NC}"
 
