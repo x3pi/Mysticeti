@@ -57,6 +57,7 @@ metanode/monitoring/venv/
 
 # Log files
 **/logs/
+!metanode/scripts/logs/
 *.log
 **/*.log
 **/*.log.*
