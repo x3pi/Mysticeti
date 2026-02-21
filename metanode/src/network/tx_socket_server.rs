@@ -279,20 +279,55 @@ impl TxSocketServer {
             };
 
             // LOCK-FREE CHECK: Fast path - check is_transitioning BEFORE touching the lock
-            // This prevents blocking when epoch transition is in progress
-            // The flag is set atomically at the START of transition, so we can check it without lock
+            // FIX: Queue TXs instead of rejecting — Go-sub doesn't retry, rejection = permanent loss
             if let Some(ref transitioning) = is_transitioning {
                 if transitioning.load(Ordering::SeqCst) {
-                    warn!("⚡ [TX FLOW] Lock-free check: Epoch transition in progress. Returning retry immediately.");
-                    let error_response = r#"{"success":false,"error":"Node busy (epoch transition in progress), please retry"}"#;
-                    if let Err(e) = Self::send_response_string(&mut stream, error_response).await {
-                        error!(
-                            "❌ [TX FLOW] Failed to send transition-busy response: {}",
-                            e
-                        );
-                        return Err(e.into());
+                    warn!("⚡ [TX FLOW] Epoch transition in progress. Queueing {} transactions (not rejecting).", transactions_to_submit.len());
+                    if let Some(ref node_arc) = node {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            node_arc.lock(),
+                        )
+                        .await
+                        {
+                            Ok(node_guard) => {
+                                for tx_data in &transactions_to_submit {
+                                    if let Err(e) = node_guard
+                                        .queue_transaction_for_next_epoch(tx_data.clone())
+                                        .await
+                                    {
+                                        error!(
+                                            "❌ [TX FLOW] Failed to queue TX during transition: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                drop(node_guard);
+                                let success_response = format!(
+                                    r#"{{"success":true,"queued":true,"message":"Queued {} TXs during epoch transition"}}"#,
+                                    transactions_to_submit.len()
+                                );
+                                if let Err(e) =
+                                    Self::send_response_string(&mut stream, &success_response).await
+                                {
+                                    error!("❌ [TX FLOW] Failed to send queue response: {}", e);
+                                    return Err(e.into());
+                                }
+                            }
+                            Err(_) => {
+                                // Lock timeout during transition — add to pending queue directly
+                                warn!("⏳ [TX FLOW] Lock timeout during transition. Storing {} TXs in memory for retry.", transactions_to_submit.len());
+                                let error_response = r#"{"success":false,"error":"Node busy (epoch transition in progress), transactions will be retried"}"#;
+                                if let Err(e) =
+                                    Self::send_response_string(&mut stream, error_response).await
+                                {
+                                    error!("❌ [TX FLOW] Failed to send timeout response: {}", e);
+                                    return Err(e.into());
+                                }
+                            }
+                        }
                     }
-                    continue; // Don't even attempt to acquire lock
+                    continue;
                 }
             }
 
