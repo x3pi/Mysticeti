@@ -651,77 +651,92 @@ impl TxSocketServer {
                 first_tx_hash
             );
 
-            // Submit transactions to consensus
-            // Each transaction is now a single Transaction protobuf message (not Transactions message)
-            info!(
-                "🚀 [DEBUG] About to call client.submit() with {} transactions",
-                transactions_to_submit.len()
-            );
-            match client.submit(transactions_to_submit.clone()).await {
-                Ok((block_ref, indices, _)) => {
-                    info!("✅ [TX FLOW] Transaction(s) included in block via UDS: first_hash={}, block={:?}, indices={:?}, count={}",
-                    first_tx_hash, block_ref, indices, transactions_to_submit.len());
+            // Submit transactions to consensus in sub-batches
+            // Consensus has a 512 TX/bundle limit — split into chunks of 500 to stay safe
+            const MAX_BUNDLE_SIZE: usize = 500;
+            let total_tx_count = transactions_to_submit.len();
 
-                    // Track submitted transactions for epoch transition recovery
-                    if let Some(ref node_arc) = node.as_ref() {
-                        let node_guard = node_arc.lock().await;
-                        let mut epoch_pending = node_guard.epoch_pending_transactions.lock().await;
-                        for tx_data in &transactions_to_submit {
-                            epoch_pending.push(tx_data.clone());
+            let mut all_succeeded = true;
+            let mut total_submitted = 0usize;
+            let mut last_block_ref = None;
+            let mut last_error = String::new();
+
+            for (chunk_idx, chunk) in transactions_to_submit.chunks(MAX_BUNDLE_SIZE).enumerate() {
+                let chunk_vec: Vec<Vec<u8>> = chunk.to_vec();
+                let chunk_len = chunk_vec.len();
+
+                info!(
+                    "🚀 [TX FLOW] Submitting sub-batch {}: {} TXs (total progress: {}/{})",
+                    chunk_idx + 1,
+                    chunk_len,
+                    total_submitted,
+                    total_tx_count
+                );
+
+                match client.submit(chunk_vec.clone()).await {
+                    Ok((block_ref, _indices, _)) => {
+                        total_submitted += chunk_len;
+                        last_block_ref = Some(format!("{:?}", block_ref));
+                        info!(
+                            "✅ [TX FLOW] Sub-batch {} included: {} TXs in block {:?} (progress: {}/{})",
+                            chunk_idx + 1, chunk_len, block_ref, total_submitted, total_tx_count
+                        );
+
+                        // Track submitted transactions for epoch transition recovery
+                        if let Some(ref node_arc) = node.as_ref() {
+                            let node_guard = node_arc.lock().await;
+                            let mut epoch_pending =
+                                node_guard.epoch_pending_transactions.lock().await;
+                            for tx_data in &chunk_vec {
+                                epoch_pending.push(tx_data.clone());
+                            }
                         }
                     }
-                    // Log chi tiết từng transaction đã được submit
-                    for (i, tx_data) in transactions_to_submit.iter().enumerate() {
-                        let tx_hash = tx_hash::calculate_transaction_hash_hex(tx_data);
-                        let index = if i < indices.len() { indices[i] } else { 0 };
-                        if let Ok(tx) = Transaction::decode(tx_data.as_slice()) {
-                            let from_addr = if tx.from_address.len() >= 10 {
-                                format!("0x{}...", hex::encode(&tx.from_address[..10]))
-                            } else {
-                                hex::encode(&tx.from_address)
-                            };
-                            info!(
-                                "   ✅ TX[{}] included: hash={}, from={}, nonce={}, block_index={}",
-                                i,
-                                tx_hash,
-                                from_addr,
-                                hex::encode(&tx.nonce),
-                                index
-                            );
-                        } else {
-                            info!(
-                                "   ✅ TX[{}] included: hash={}, block_index={}",
-                                i, tx_hash, index
-                            );
-                        }
-                    }
-
-                    let success_response = format!(
-                        r#"{{"success":true,"tx_hash":"{}","block_ref":"{:?}","indices":{:?},"count":{}}}"#,
-                        first_tx_hash,
-                        block_ref,
-                        indices,
-                        transactions_to_submit.len()
-                    );
-                    if let Err(e) = Self::send_response_string(&mut stream, &success_response).await
-                    {
-                        error!("❌ [TX FLOW] Failed to send success response: {}", e);
-                        return Err(e.into());
+                    Err(e) => {
+                        all_succeeded = false;
+                        last_error = e.to_string();
+                        error!(
+                            "❌ [TX FLOW] Sub-batch {} submission failed: {} TXs, error={}",
+                            chunk_idx + 1,
+                            chunk_len,
+                            e
+                        );
+                        // Don't break — try remaining sub-batches
                     }
                 }
-                Err(e) => {
-                    error!("❌ [TX FLOW] Transaction submission failed via UDS: first_hash={}, count={}, error={}", 
-                    first_tx_hash, transactions_to_submit.len(), e);
-                    let error_response = format!(
-                        r#"{{"success":false,"error":"Transaction submission failed: {}"}}"#,
-                        e.to_string().replace('"', "\\\"")
-                    );
-                    if let Err(send_err) =
-                        Self::send_response_string(&mut stream, &error_response).await
-                    {
-                        error!("❌ [TX FLOW] Failed to send error response: {}", send_err);
-                        return Err(send_err.into());
-                    }
+            }
+
+            if all_succeeded {
+                let success_response = format!(
+                    r#"{{"success":true,"tx_hash":"{}","block_ref":"{}","count":{}}}"#,
+                    first_tx_hash,
+                    last_block_ref.unwrap_or_default(),
+                    total_submitted
+                );
+                if let Err(e) = Self::send_response_string(&mut stream, &success_response).await {
+                    error!("❌ [TX FLOW] Failed to send success response: {}", e);
+                    return Err(e.into());
+                }
+            } else if total_submitted > 0 {
+                // Partial success
+                let response = format!(
+                    r#"{{"success":true,"partial":true,"submitted":{},"total":{},"error":"{}"}}"#,
+                    total_submitted,
+                    total_tx_count,
+                    last_error.replace('"', "\\\"")
+                );
+                if let Err(e) = Self::send_response_string(&mut stream, &response).await {
+                    error!("❌ [TX FLOW] Failed to send partial response: {}", e);
+                    return Err(e.into());
+                }
+            } else {
+                let error_response = format!(
+                    r#"{{"success":false,"error":"Transaction submission failed: {}"}}"#,
+                    last_error.replace('"', "\\\"")
+                );
+                if let Err(e) = Self::send_response_string(&mut stream, &error_response).await {
+                    error!("❌ [TX FLOW] Failed to send error response: {}", e);
+                    return Err(e.into());
                 }
             }
 
