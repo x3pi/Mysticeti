@@ -117,11 +117,11 @@ pub struct VerifierConfig {
     pub sanity_check_with_regex_reference_safety: Option<u128>,
     pub deprecate_global_storage_ops: bool,
 }
-use serde::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
 use meta_protocol_config_macros::{
     ProtocolConfigAccessors, ProtocolConfigFeatureFlagsGetters, ProtocolConfigOverride,
 };
+use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 use tracing::{info, warn};
 
 /// The minimum and maximum protocol versions supported by this build.
@@ -2259,7 +2259,7 @@ impl ProtocolConfig {
             256 * 1024
         } else {
             self.consensus_max_transactions_in_block_bytes
-                .unwrap_or(512 * 1024)
+                .unwrap_or(20 * 1024 * 1024)
         }
     }
 
@@ -2267,7 +2267,8 @@ impl ProtocolConfig {
         if cfg!(msim) {
             8
         } else {
-            self.consensus_max_num_transactions_in_block.unwrap_or(512)
+            self.consensus_max_num_transactions_in_block
+                .unwrap_or(20000)
         }
     }
 
