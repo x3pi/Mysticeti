@@ -652,8 +652,8 @@ impl TxSocketServer {
             );
 
             // Submit transactions to consensus in sub-batches
-            // Consensus has a 512 TX/bundle limit — split into chunks of 500 to stay safe
-            const MAX_BUNDLE_SIZE: usize = 500;
+            // Consensus limits have been increased to 10,000
+            const MAX_BUNDLE_SIZE: usize = 10000;
             let total_tx_count = transactions_to_submit.len();
 
             let mut all_succeeded = true;

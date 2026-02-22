@@ -4,10 +4,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use consensus_config::Epoch;
 use consensus_types::block::{
-    BlockRef, NUM_RESERVED_TRANSACTION_INDICES, PING_TRANSACTION_INDEX, Round, TransactionIndex,
+    BlockRef, Round, TransactionIndex, NUM_RESERVED_TRANSACTION_INDICES, PING_TRANSACTION_INDEX,
 };
 use mysten_common::debug_fatal;
-use mysten_metrics::monitored_mpsc::{Receiver, Sender, channel};
+use mysten_metrics::monitored_mpsc::{channel, Receiver, Sender};
 use parking_lot::Mutex;
 use tap::TapFallible;
 use thiserror::Error;
@@ -17,7 +17,7 @@ use tracing::{error, warn};
 use crate::{block::Transaction, context::Context};
 
 /// The maximum number of transactions pending to the queue to be pulled for block proposal
-const MAX_PENDING_TRANSACTIONS: usize = 2_000;
+const MAX_PENDING_TRANSACTIONS: usize = 10_000;
 
 /// The guard acts as an acknowledgment mechanism for the inclusion of the transactions to a block.
 /// When its last transaction is included to a block then `included_in_block_ack` will be signalled.
@@ -88,12 +88,19 @@ impl TransactionConsumer {
             context.protocol_config.max_num_transactions_in_block()
         );
 
+        let max_transactions_in_block_bytes =
+            context.protocol_config.max_transactions_in_block_bytes();
+        let max_num_transactions_in_block = context.protocol_config.max_num_transactions_in_block();
+        tracing::info!(
+            "TransactionConsumer initialized with max_num_transactions_in_block: {}, max_transactions_in_block_bytes: {}",
+            max_num_transactions_in_block,
+            max_transactions_in_block_bytes
+        );
+
         Self {
             tx_receiver,
-            max_transactions_in_block_bytes: context
-                .protocol_config
-                .max_transactions_in_block_bytes(),
-            max_num_transactions_in_block: context.protocol_config.max_num_transactions_in_block(),
+            max_transactions_in_block_bytes,
+            max_num_transactions_in_block,
             pending_transactions: None,
             block_status_subscribers: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -164,6 +171,15 @@ impl TransactionConsumer {
             } else {
                 break;
             }
+        }
+
+        if !transactions.is_empty() {
+            tracing::info!(
+                "Proposing block with {} transactions ({} bytes). Limit reached: {:?}",
+                transactions.len(),
+                total_bytes,
+                limit_reached
+            );
         }
 
         let block_status_subscribers = self.block_status_subscribers.clone();
@@ -439,10 +455,10 @@ mod tests {
 
     use consensus_config::AuthorityIndex;
     use consensus_types::block::{
-        BlockDigest, BlockRef, NUM_RESERVED_TRANSACTION_INDICES, PING_TRANSACTION_INDEX,
-        TransactionIndex,
+        BlockDigest, BlockRef, TransactionIndex, NUM_RESERVED_TRANSACTION_INDICES,
+        PING_TRANSACTION_INDEX,
     };
-    use futures::{StreamExt, stream::FuturesUnordered};
+    use futures::{stream::FuturesUnordered, StreamExt};
     use meta_protocol_config::ProtocolConfig;
     use tokio::time::timeout;
 
