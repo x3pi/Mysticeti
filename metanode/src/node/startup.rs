@@ -109,9 +109,13 @@ impl InitializedNode {
             let tx_client_uds = tx_client.clone();
             let node_for_uds = node.clone();
             // Get is_transitioning flag for lock-free epoch transition detection
-            let is_transitioning_for_uds = {
+            let (is_transitioning_for_uds, pending_tx_queue, storage_path) = {
                 let node_guard = node.lock().await;
-                node_guard.is_transitioning.clone()
+                (
+                    node_guard.is_transitioning.clone(),
+                    node_guard.pending_transactions_queue.clone(),
+                    node_guard.storage_path.clone(),
+                )
             };
 
             // Start PeerDiscoveryService if enabled
@@ -147,6 +151,8 @@ impl InitializedNode {
                 tx_client_uds,
                 node_for_uds,
                 is_transitioning_for_uds,
+                pending_tx_queue,
+                storage_path,
                 node_config.peer_rpc_addresses.clone(),
             );
 

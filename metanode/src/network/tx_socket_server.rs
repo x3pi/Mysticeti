@@ -21,6 +21,10 @@ pub struct TxSocketServer {
     node: Option<Arc<Mutex<ConsensusNode>>>,
     /// Lock-free flag to check epoch transition status without acquiring node lock
     is_transitioning: Option<Arc<AtomicBool>>,
+    /// Direct access to the pending transactions queue for lock-free queuing during transitions
+    pending_transactions_queue: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
+    /// Storage path for persistence during lock-free queuing
+    storage_path: Option<std::path::PathBuf>,
     /// Static peer RPC addresses for forwarding transactions (SyncOnly mode)
     peer_rpc_addresses: Vec<String>,
     /// Dynamic peer addresses from PeerDiscoveryService (takes precedence if set)
@@ -34,6 +38,8 @@ impl TxSocketServer {
         transaction_client: Arc<dyn TransactionSubmitter>,
         node: Arc<Mutex<ConsensusNode>>,
         is_transitioning: Arc<AtomicBool>,
+        pending_transactions_queue: Arc<Mutex<Vec<Vec<u8>>>>,
+        storage_path: std::path::PathBuf,
         peer_rpc_addresses: Vec<String>,
     ) -> Self {
         Self {
@@ -41,6 +47,8 @@ impl TxSocketServer {
             transaction_client,
             node: Some(node),
             is_transitioning: Some(is_transitioning),
+            pending_transactions_queue: Some(pending_transactions_queue),
+            storage_path: Some(storage_path),
             peer_rpc_addresses,
             peer_discovery_addresses: None,
         }
@@ -90,14 +98,10 @@ impl TxSocketServer {
                     let client = self.transaction_client.clone();
                     let node = self.node.clone();
                     let is_transitioning = self.is_transitioning.clone();
-
-                    // Prefer dynamic addresses from PeerDiscoveryService, fallback to static config
-                    let peer_addresses =
-                        if let Some(ref dynamic_addrs) = self.peer_discovery_addresses {
-                            dynamic_addrs.read().await.clone()
-                        } else {
-                            self.peer_rpc_addresses.clone()
-                        };
+                    let pending_transactions_queue = self.pending_transactions_queue.clone();
+                    let storage_path = self.storage_path.clone();
+                    let peer_rpc_addresses = self.peer_rpc_addresses.clone();
+                    let peer_discovery_addresses = self.peer_discovery_addresses.clone();
 
                     tokio::spawn(async move {
                         info!("🔌 [DEBUG] Spawned handler for UDS connection");
@@ -106,7 +110,10 @@ impl TxSocketServer {
                             client,
                             node,
                             is_transitioning,
-                            peer_addresses,
+                            pending_transactions_queue,
+                            storage_path,
+                            peer_rpc_addresses,
+                            peer_discovery_addresses,
                         )
                         .await
                         {
@@ -127,7 +134,10 @@ impl TxSocketServer {
         client: Arc<dyn TransactionSubmitter>,
         node: Option<Arc<Mutex<ConsensusNode>>>,
         is_transitioning: Option<Arc<AtomicBool>>,
+        pending_transactions_queue: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
+        storage_path: Option<std::path::PathBuf>,
         peer_rpc_addresses: Vec<String>,
+        peer_discovery_addresses: Option<Arc<RwLock<Vec<String>>>>,
     ) -> Result<()> {
         // PERSISTENT CONNECTION: Xử lý multiple requests trên cùng một connection
         // Điều này cho phép Go client gửi nhiều batches qua cùng một connection
@@ -282,10 +292,36 @@ impl TxSocketServer {
             // FIX: Queue TXs instead of rejecting — Go-sub doesn't retry, rejection = permanent loss
             if let Some(ref transitioning) = is_transitioning {
                 if transitioning.load(Ordering::SeqCst) {
-                    warn!("⚡ [TX FLOW] Epoch transition in progress. Queueing {} transactions (not rejecting).", transactions_to_submit.len());
-                    if let Some(ref node_arc) = node {
+                    warn!("⚡ [TX FLOW] Epoch transition in progress. Queueing {} transactions (LOCK-FREE).", transactions_to_submit.len());
+
+                    // TRULY LOCK-FREE PATH: Use direct access to queue if available
+                    if let (Some(ref queue), Some(ref path)) =
+                        (&pending_transactions_queue, &storage_path)
+                    {
+                        for tx_data in &transactions_to_submit {
+                            if let Err(e) =
+                                crate::node::queue::queue_transaction(queue, path, tx_data.clone())
+                                    .await
+                            {
+                                error!("❌ [TX FLOW] Failed to queue TX during transition (lock-free): {}", e);
+                            }
+                        }
+
+                        let success_response = format!(
+                            r#"{{"success":true,"queued":true,"message":"Queued {} TXs during epoch transition (lock-free)"}}"#,
+                            transactions_to_submit.len()
+                        );
+                        if let Err(e) =
+                            Self::send_response_string(&mut stream, &success_response).await
+                        {
+                            error!("❌ [TX FLOW] Failed to send queue response: {}", e);
+                            return Err(e.into());
+                        }
+                        return Ok(());
+                    } else if let Some(ref node_arc) = node {
+                        // Fallback to locking node if direct queue access is not available
                         match tokio::time::timeout(
-                            std::time::Duration::from_millis(500),
+                            std::time::Duration::from_millis(100), // reduced timeout
                             node_arc.lock(),
                         )
                         .await
@@ -313,6 +349,7 @@ impl TxSocketServer {
                                     error!("❌ [TX FLOW] Failed to send queue response: {}", e);
                                     return Err(e.into());
                                 }
+                                return Ok(());
                             }
                             Err(_) => {
                                 // Lock timeout during transition — add to pending queue directly
@@ -324,10 +361,10 @@ impl TxSocketServer {
                                     error!("❌ [TX FLOW] Failed to send timeout response: {}", e);
                                     return Err(e.into());
                                 }
+                                return Ok(());
                             }
                         }
                     }
-                    continue;
                 }
             }
 
