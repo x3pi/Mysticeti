@@ -32,7 +32,8 @@ impl ConsensusNode {
         if self.last_transition_hash.is_some() {
             return (
                 false,
-                false,
+                true, // CRITICAL FIX: Queue TXs for next epoch instead of rejecting outright.
+                // Previously false → Go channel workers got "not ready" and retried forever.
                 format!(
                     "Epoch transition in progress: epoch {} -> {}",
                     self.current_epoch,
