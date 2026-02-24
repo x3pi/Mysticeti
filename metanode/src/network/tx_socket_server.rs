@@ -375,7 +375,7 @@ impl TxSocketServer {
                 // Lock-free check passed, now try to acquire lock
                 // Use short timeout as safety net (should rarely trigger since we checked flag)
                 let lock_result =
-                    tokio::time::timeout(std::time::Duration::from_secs(1), node.lock()).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(5), node.lock()).await;
 
                 match lock_result {
                     Ok(node_guard) => {
@@ -528,14 +528,13 @@ impl TxSocketServer {
                         drop(node_guard);
                     }
                     Err(_) => {
-                        // Lock acquisition timeout - epoch transition is likely in progress
-                        // Queue transactions instead of blocking indefinitely
-                        warn!("⏳ [TX FLOW] Lock timeout (1s) - epoch transition likely in progress. Queueing {} transactions.", 
+                        // Lock acquisition timeout - node is busy processing other transactions
+                        warn!("⏳ [TX FLOW] Lock timeout (5s) - node busy. Asking client to retry {} transactions.", 
                         transactions_to_submit.len());
 
-                        // We couldn't get the lock, so we can't call queue_transaction_for_next_epoch
-                        // Return an error asking client to retry
-                        let error_response = r#"{"success":false,"error":"Node busy (epoch transition in progress), please retry"}"#;
+                        // Return a retry-able error that does NOT contain "epoch transition"
+                        // to avoid Go channel workers treating this as permanent rejection
+                        let error_response = r#"{"success":false,"error":"Node busy processing requests, please retry"}"#;
                         if let Err(e) =
                             Self::send_response_string(&mut stream, error_response).await
                         {
