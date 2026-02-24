@@ -467,7 +467,7 @@ impl ExecutorClient {
             // Send with retry logic if write fails
             // CRITICAL: Add timeout to prevent commit processor from getting stuck
             use tokio::time::{timeout, Duration};
-            const SEND_TIMEOUT: Duration = Duration::from_secs(2); // 2 seconds timeout (was 10s — too slow for recovery)
+            const SEND_TIMEOUT: Duration = Duration::from_secs(30); // 30 seconds — prevent premature timeout for large blocks (was 2s — too aggressive, caused reconnect cycles)
 
             let send_result = timeout(SEND_TIMEOUT, async {
                 stream.write_all(&len_buf).await?;
