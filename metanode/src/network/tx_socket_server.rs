@@ -1,6 +1,7 @@
 // Copyright (c) MetaNode Team
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::consensus::tx_recycler::TxRecycler;
 use crate::node::tx_submitter::TransactionSubmitter;
 use crate::node::ConsensusNode;
 use anyhow::Result;
@@ -29,6 +30,8 @@ pub struct TxSocketServer {
     peer_rpc_addresses: Vec<String>,
     /// Dynamic peer addresses from PeerDiscoveryService (takes precedence if set)
     peer_discovery_addresses: Option<Arc<RwLock<Vec<String>>>>,
+    /// TX recycler for tracking submitted TXs and re-submitting stale ones
+    tx_recycler: Option<Arc<TxRecycler>>,
 }
 
 impl TxSocketServer {
@@ -51,12 +54,19 @@ impl TxSocketServer {
             storage_path: Some(storage_path),
             peer_rpc_addresses,
             peer_discovery_addresses: None,
+            tx_recycler: None,
         }
     }
 
     /// Set dynamic peer discovery addresses (takes precedence over static config)
     pub fn with_peer_discovery(mut self, addresses: Arc<RwLock<Vec<String>>>) -> Self {
         self.peer_discovery_addresses = Some(addresses);
+        self
+    }
+
+    /// Set TX recycler for tracking and re-submitting stale TXs
+    pub fn with_tx_recycler(mut self, recycler: Arc<TxRecycler>) -> Self {
+        self.tx_recycler = Some(recycler);
         self
     }
 
@@ -102,6 +112,7 @@ impl TxSocketServer {
                     let storage_path = self.storage_path.clone();
                     let peer_rpc_addresses = self.peer_rpc_addresses.clone();
                     let peer_discovery_addresses = self.peer_discovery_addresses.clone();
+                    let tx_recycler = self.tx_recycler.clone();
 
                     tokio::spawn(async move {
                         info!("🔌 [DEBUG] Spawned handler for UDS connection");
@@ -114,6 +125,7 @@ impl TxSocketServer {
                             storage_path,
                             peer_rpc_addresses,
                             peer_discovery_addresses,
+                            tx_recycler,
                         )
                         .await
                         {
@@ -137,7 +149,8 @@ impl TxSocketServer {
         pending_transactions_queue: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
         storage_path: Option<std::path::PathBuf>,
         peer_rpc_addresses: Vec<String>,
-        peer_discovery_addresses: Option<Arc<RwLock<Vec<String>>>>,
+        _peer_discovery_addresses: Option<Arc<RwLock<Vec<String>>>>,
+        tx_recycler: Option<Arc<TxRecycler>>,
     ) -> Result<()> {
         // PERSISTENT CONNECTION: Xử lý multiple requests trên cùng một connection
         // Điều này cho phép Go client gửi nhiều batches qua cùng một connection
@@ -178,35 +191,10 @@ impl TxSocketServer {
 
             let data_len = tx_data.len();
 
-            // 🔍 HASH INTEGRITY CHECK: Calculate actual transaction hash from protobuf data
-            use crate::types::tx_hash;
-            let tx_hash_preview = tx_hash::calculate_transaction_hash_hex(&tx_data);
-            let tx_hash_short = if tx_hash_preview.len() >= 16 {
-                &tx_hash_preview[..16]
-            } else {
-                &tx_hash_preview
-            };
-
+            // Batch-level logging only (per-TX hash logging removed for performance)
             info!(
-                "📥 [TX FLOW] Received transaction data via UDS: size={} bytes, hash={}...",
-                data_len, tx_hash_short
-            );
-            info!(
-                "🔍 [TX HASH] Rust received from Go-sub: full_hash={}, size={} bytes",
-                tx_hash_preview, data_len
-            );
-
-            // DEBUG: Log raw bytes received
-            info!(
-                "🔍 [DEBUG] Raw data preview (first 50 bytes): {}",
-                hex::encode(&tx_data[..tx_data.len().min(50)])
-            );
-            info!(
-                "🔍 [DEBUG] Data starts with: 0x{:02x} 0x{:02x} 0x{:02x} 0x{:02x}",
-                tx_data.get(0).unwrap_or(&0),
-                tx_data.get(1).unwrap_or(&0),
-                tx_data.get(2).unwrap_or(&0),
-                tx_data.get(3).unwrap_or(&0)
+                "📥 [TX FLOW] Received transaction batch via UDS: size={} bytes",
+                data_len
             );
 
             // THỐNG NHẤT: Go LUÔN gửi pb.Transactions (nhiều transactions)
@@ -217,7 +205,7 @@ impl TxSocketServer {
             mod proto {
                 include!(concat!(env!("OUT_DIR"), "/transaction.rs"));
             }
-            use proto::{Transaction, Transactions};
+            use proto::Transactions;
 
             // Go LUÔN gửi Transactions message
             let transactions_to_submit = match Transactions::decode(&tx_data[..]) {
@@ -327,16 +315,16 @@ impl TxSocketServer {
                         .await
                         {
                             Ok(node_guard) => {
-                                for tx_data in &transactions_to_submit {
-                                    if let Err(e) = node_guard
-                                        .queue_transaction_for_next_epoch(tx_data.clone())
-                                        .await
-                                    {
-                                        error!(
-                                            "❌ [TX FLOW] Failed to queue TX during transition: {}",
-                                            e
-                                        );
-                                    }
+                                if let Err(e) = node_guard
+                                    .queue_transactions_for_next_epoch(
+                                        transactions_to_submit.clone(),
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        "❌ [TX FLOW] Failed to queue TXs during transition: {}",
+                                        e
+                                    );
                                 }
                                 drop(node_guard);
                                 let success_response = format!(
@@ -361,27 +349,30 @@ impl TxSocketServer {
                                     error!("❌ [TX FLOW] Failed to send timeout response: {}", e);
                                     return Err(e.into());
                                 }
-                                return Ok(());
+                                continue;
                             }
                         }
                     }
                 }
             }
 
-            // Check if node is ready to accept transactions or should queue them
-            // Only acquire lock after the lock-free check passed
-            info!("🔍 [DEBUG] About to check initial transaction acceptance");
+            // Check if node is ready (lock-free fast path already passed)
+            info!(
+                "🔍 [TX FLOW] Checking transaction acceptance for {} TXs",
+                transactions_to_submit.len()
+            );
             if let Some(ref node) = node {
                 // Lock-free check passed, now try to acquire lock
                 // Use short timeout as safety net (should rarely trigger since we checked flag)
+                // 🛠 FIX: Epoch transitions (wait_for_commit_processor wait) can block for 10s.
+                // 30s prevents early rejection.
                 let lock_result =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), node.lock()).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(30), node.lock()).await;
 
                 match lock_result {
                     Ok(node_guard) => {
                         let (should_accept, should_queue, reason) =
                             node_guard.check_transaction_acceptance().await;
-                        info!("🔍 [DEBUG] Initial check result: should_accept={}, should_queue={}, reason={}", should_accept, should_queue, reason);
 
                         if should_queue {
                             // Queue transactions for next epoch
@@ -390,19 +381,11 @@ impl TxSocketServer {
                                 transactions_to_submit.len(),
                                 reason
                             );
-                            for tx_data in &transactions_to_submit {
-                                let tx_hash =
-                                    crate::types::tx_hash::calculate_transaction_hash_hex(tx_data);
-                                info!(
-                                    "📦 [TX FLOW] Queueing transaction: hash={}, reason={}",
-                                    tx_hash, reason
-                                );
-                                if let Err(e) = node_guard
-                                    .queue_transaction_for_next_epoch(tx_data.clone())
-                                    .await
-                                {
-                                    error!("❌ [TX FLOW] Failed to queue transaction: hash={}, error={}", tx_hash, e);
-                                }
+                            if let Err(e) = node_guard
+                                .queue_transactions_for_next_epoch(transactions_to_submit.clone())
+                                .await
+                            {
+                                error!("❌ [TX FLOW] Failed to queue transactions: {}", e);
                             }
                             drop(node_guard);
 
@@ -498,17 +481,10 @@ impl TxSocketServer {
                                 continue; // Continue to next request
                             }
 
-                            // Regular rejection (not SyncOnly or no peer addresses)
-                            for tx_data in &transactions_to_submit {
-                                let tx_hash =
-                                    crate::types::tx_hash::calculate_transaction_hash_hex(tx_data);
-                                warn!(
-                                    "🚫 [TX FLOW] Rejecting transaction: hash={}, reason={}",
-                                    tx_hash, reason
-                                );
-                            }
+                            // Regular rejection
                             warn!(
-                                "🚫 Transaction rejected via UDS: node not ready - {}",
+                                "🚫 [TX FLOW] Rejecting {} transactions via UDS: {}",
+                                transactions_to_submit.len(),
                                 reason
                             );
                             drop(node_guard);
@@ -529,7 +505,7 @@ impl TxSocketServer {
                     }
                     Err(_) => {
                         // Lock acquisition timeout - node is busy processing other transactions
-                        warn!("⏳ [TX FLOW] Lock timeout (5s) - node busy. Asking client to retry {} transactions.", 
+                        warn!("⏳ [TX FLOW] Lock timeout (30s) - node busy. Asking client to retry {} transactions.", 
                         transactions_to_submit.len());
 
                         // Return a retry-able error that does NOT contain "epoch transition"
@@ -546,55 +522,11 @@ impl TxSocketServer {
                 }
             }
 
-            // 🔍 HASH INTEGRITY CHECK: Log chi tiết từng transaction trước khi submit
+            // Submit transactions to consensus
             info!(
-                "📤 [TX FLOW] Preparing to submit {} transaction(s) via UDS",
+                "📤 [TX FLOW] Submitting {} transaction(s) to consensus via UDS",
                 transactions_to_submit.len()
             );
-            for (i, tx_data) in transactions_to_submit.iter().enumerate() {
-                let tx_hash = tx_hash::calculate_transaction_hash_hex(tx_data);
-                info!(
-                    "🔍 [TX HASH] Rust preparing to submit TX[{}]: hash={}, size={} bytes",
-                    i,
-                    tx_hash,
-                    tx_data.len()
-                );
-                // Try to decode transaction to get from/to/nonce
-                if let Ok(tx) = Transaction::decode(tx_data.as_slice()) {
-                    let from_addr = if tx.from_address.len() >= 10 {
-                        format!("0x{}...", hex::encode(&tx.from_address[..10]))
-                    } else {
-                        hex::encode(&tx.from_address)
-                    };
-                    let to_addr = if tx.to_address.len() >= 10 {
-                        format!("0x{}...", hex::encode(&tx.to_address[..10]))
-                    } else {
-                        hex::encode(&tx.to_address)
-                    };
-                    info!(
-                        "   📝 TX[{}]: hash={}, from={}, to={}, nonce={}",
-                        i,
-                        tx_hash,
-                        from_addr,
-                        to_addr,
-                        hex::encode(&tx.nonce)
-                    );
-                } else {
-                    info!(
-                        "   📝 TX[{}]: hash={}, size={} bytes (cannot decode protobuf)",
-                        i,
-                        tx_hash,
-                        tx_data.len()
-                    );
-                }
-            }
-
-            // Calculate hash for logging (use first transaction)
-            let first_tx_hash = if !transactions_to_submit.is_empty() {
-                tx_hash::calculate_transaction_hash_hex(&transactions_to_submit[0])
-            } else {
-                "unknown".to_string()
-            };
 
             // CRITICAL: Double-check transaction acceptance RIGHT BEFORE submitting to consensus
             // This prevents race condition where epoch transition starts between initial check and submission
@@ -607,19 +539,15 @@ impl TxSocketServer {
                     Ok(node_guard) => {
                         let (should_accept_final, should_queue_final, reason_final) =
                             node_guard.check_transaction_acceptance().await;
-
-                        info!("🔍 [DEBUG] Final check result: should_accept_final={}, should_queue_final={}, reason_final={}", should_accept_final, should_queue_final, reason_final);
                         if should_queue_final {
                             // Epoch transition started between initial check and submission - queue transaction instead
                             warn!("⚠️ [RACE CONDITION] Epoch transition started between initial check and submission - queueing transaction instead: {}", reason_final);
                             // Queue all transactions (node_guard is still held)
-                            for tx_data in &transactions_to_submit {
-                                if let Err(e) = node_guard
-                                    .queue_transaction_for_next_epoch(tx_data.clone())
-                                    .await
-                                {
-                                    error!("❌ [TX FLOW] Failed to queue transaction after race condition detection: {}", e);
-                                }
+                            if let Err(e) = node_guard
+                                .queue_transactions_for_next_epoch(transactions_to_submit.clone())
+                                .await
+                            {
+                                error!("❌ [TX FLOW] Failed to queue transactions after race condition detection: {}", e);
                             }
                             drop(node_guard);
                             // Send success response (transaction is queued)
@@ -633,7 +561,7 @@ impl TxSocketServer {
                                 error!("❌ [TX FLOW] Failed to send queue response: {}", e);
                                 return Err(e.into());
                             }
-                            return Ok(()); // Don't submit to consensus
+                            continue; // Don't submit to consensus
                         }
 
                         if !should_accept_final {
@@ -650,7 +578,7 @@ impl TxSocketServer {
                                 error!("❌ [TX FLOW] Failed to send error response: {}", e);
                                 return Err(e.into());
                             }
-                            return Ok(()); // Don't submit to consensus
+                            continue; // Don't submit to consensus
                         }
 
                         drop(node_guard);
@@ -666,26 +594,16 @@ impl TxSocketServer {
                             error!("❌ [TX FLOW] Failed to send timeout response: {}", e);
                             return Err(e.into());
                         }
-                        return Ok(()); // Don't submit to consensus
+                        continue; // Don't submit to consensus
                     }
                 }
             } else {
                 false // No node reference, continue with submission
             };
 
-            info!(
-                "🔍 [DEBUG] Final check: should_queue_final={}",
-                should_queue_final
-            );
             if should_queue_final {
                 return Ok(()); // Already handled above
             }
-
-            info!(
-                "📤 [TX FLOW] Submitting {} transaction(s) via UDS: first_hash={}",
-                transactions_to_submit.len(),
-                first_tx_hash
-            );
 
             // Submit transactions to consensus in sub-batches
             // Consensus limits have been increased to 10,000
@@ -694,7 +612,7 @@ impl TxSocketServer {
 
             let mut all_succeeded = true;
             let mut total_submitted = 0usize;
-            let mut last_block_ref = None;
+            let mut _last_block_ref = None;
             let mut last_error = String::new();
 
             for (chunk_idx, chunk) in transactions_to_submit.chunks(MAX_BUNDLE_SIZE).enumerate() {
@@ -712,11 +630,16 @@ impl TxSocketServer {
                 match client.submit(chunk_vec.clone()).await {
                     Ok((block_ref, _indices, _)) => {
                         total_submitted += chunk_len;
-                        last_block_ref = Some(format!("{:?}", block_ref));
+                        _last_block_ref = Some(format!("{:?}", block_ref));
                         info!(
                             "✅ [TX FLOW] Sub-batch {} included: {} TXs in block {:?} (progress: {}/{})",
                             chunk_idx + 1, chunk_len, block_ref, total_submitted, total_tx_count
                         );
+
+                        // Track submitted TXs for recycling (re-submit if not committed)
+                        if let Some(ref recycler) = tx_recycler {
+                            recycler.track_submitted(&chunk_vec).await;
+                        }
 
                         // Track submitted transactions for epoch transition recovery
                         if let Some(ref node_arc) = node.as_ref() {
@@ -743,12 +666,7 @@ impl TxSocketServer {
             }
 
             if all_succeeded {
-                let success_response = format!(
-                    r#"{{"success":true,"tx_hash":"{}","block_ref":"{}","count":{}}}"#,
-                    first_tx_hash,
-                    last_block_ref.unwrap_or_default(),
-                    total_submitted
-                );
+                let success_response = format!(r#"{{"success":true,"count":{}}}"#, total_submitted);
                 if let Err(e) = Self::send_response_string(&mut stream, &success_response).await {
                     error!("❌ [TX FLOW] Failed to send success response: {}", e);
                     return Err(e.into());

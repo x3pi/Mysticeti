@@ -179,6 +179,9 @@ pub struct ConsensusNode {
 
     /// Peer RPC addresses for cross-node block fetching during epoch transitions
     pub(crate) peer_rpc_addresses: Vec<String>,
+
+    /// TX recycler for tracking and re-submitting stale TXs
+    pub(crate) tx_recycler: Option<Arc<crate::consensus::tx_recycler::TxRecycler>>,
 }
 
 // ConsensusNode constructors are in consensus_node.rs

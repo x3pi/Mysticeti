@@ -156,6 +156,15 @@ impl InitializedNode {
                 node_config.peer_rpc_addresses.clone(),
             );
 
+            // ♻️ TX RECYCLER: Inject into UDS server for tracking submitted TXs
+            {
+                let node_guard = node.lock().await;
+                if let Some(ref recycler) = node_guard.tx_recycler {
+                    uds_server = uds_server.with_tx_recycler(recycler.clone());
+                    info!("♻️ [TX RECYCLER] Injected into UDS server");
+                }
+            }
+
             // Inject dynamic peer addresses if discovery is enabled
             if let Some(addrs) = peer_discovery_addresses {
                 uds_server = uds_server.with_peer_discovery(addrs);

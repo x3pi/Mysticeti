@@ -71,6 +71,8 @@ struct ConsensusSetup {
     parameters: consensus_config::Parameters,
     clock: Arc<Clock>,
     transaction_verifier: Arc<NoopTransactionVerifier>,
+    /// TX recycler for tracking and re-submitting uncommitted TXs
+    tx_recycler: Arc<crate::consensus::tx_recycler::TxRecycler>,
 }
 
 // ---------------------------------------------------------------------------
@@ -634,7 +636,15 @@ impl ConsensusNode {
             executor_client_for_init.initialize_from_go().await;
         });
 
-        commit_processor = commit_processor.with_executor_client(executor_client_for_proc.clone());
+        // ♻️ TX Recycler: Create shared instance for tracking and recycling uncommitted TXs
+        let tx_recycler = Arc::new(crate::consensus::tx_recycler::TxRecycler::new());
+        info!("♻️ [TX RECYCLER] Created shared TxRecycler instance");
+
+        commit_processor = commit_processor
+            .with_executor_client(executor_client_for_proc.clone())
+            .with_tx_recycler(tx_recycler.clone());
+
+        // Spawn background recycler is done in setup_epoch_management where tx_client is accessible
 
         tokio::spawn(async move {
             if let Err(e) = commit_processor.run().await {
@@ -744,6 +754,7 @@ impl ConsensusNode {
             parameters,
             clock,
             transaction_verifier,
+            tx_recycler,
         })
     }
 
@@ -805,6 +816,26 @@ impl ConsensusNode {
         consensus_core::epoch_change_provider::init_epoch_change_provider(Box::new(NoOpProvider));
         consensus_core::epoch_change_provider::init_epoch_change_processor(Box::new(NoOpProcessor));
 
+        // ♻️ TX RECYCLER: Background recycler DISABLED — causes duplicate flooding during multi-blast.
+        // Tracking + confirming still active for observability (track_submitted/confirm_committed).
+        // TODO: Re-enable with smarter throttling once root cause of unconfirmed TXs is resolved.
+        // if let Some(ref proxy) = consensus.transaction_client_proxy {
+        //     let recycler_for_bg = consensus.tx_recycler.clone();
+        //     let tx_client_for_recycler: Arc<dyn crate::node::tx_submitter::TransactionSubmitter> =
+        //         proxy.clone();
+        //     tokio::spawn(async move {
+        //         crate::consensus::tx_recycler::start_recycler_background(
+        //             recycler_for_bg,
+        //             tx_client_for_recycler,
+        //         )
+        //         .await;
+        //     });
+        //     info!("♻️ [TX RECYCLER] Background recycler spawned");
+        // } else {
+        //     info!("♻️ [TX RECYCLER] No transaction client proxy - background recycler disabled (SyncOnly mode)");
+        // }
+        info!("♻️ [TX RECYCLER] Tracking + confirming active. Background re-submission DISABLED.");
+
         let mut node = ConsensusNode {
             authority: consensus.authority,
             legacy_store_manager: Arc::new(consensus_core::LegacyEpochStoreManager::new(
@@ -858,6 +889,7 @@ impl ConsensusNode {
             },
             block_coordinator: None,
             peer_rpc_addresses: config.peer_rpc_addresses.clone(),
+            tx_recycler: Some(consensus.tx_recycler),
         };
 
         // Initialize the global StateTransitionManager

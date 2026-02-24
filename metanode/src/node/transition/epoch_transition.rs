@@ -1005,6 +1005,7 @@ async fn get_current_network_epoch(config: &NodeConfig) -> Result<u64> {
 
 /// Get epoch boundary data from any available peer.
 /// Returns (boundary_block, timestamp_ms) for the given epoch.
+#[allow(dead_code)]
 async fn get_epoch_boundary_from_peers(config: &NodeConfig, epoch: u64) -> Result<(u64, u64)> {
     for peer in &config.peer_rpc_addresses {
         let peer_addr: std::net::SocketAddr = match peer.parse() {

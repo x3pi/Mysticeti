@@ -1,0 +1,236 @@
+// Copyright (c) MetaNode Team
+// SPDX-License-Identifier: Apache-2.0
+
+//! TX Recycler: Reclaims transactions from uncommitted DAG proposals.
+//!
+//! Problem: TransactionConsumer.next() POPs TXs from the mpsc channel permanently.
+//! If the proposed block containing those TXs is never committed (GC'd), TXs are lost.
+//!
+//! Solution: Track submitted TXs by hash. When committed sub-DAGs arrive, mark their
+//! TXs as confirmed. Periodically re-submit unconfirmed TXs back to consensus.
+
+use sha3::{Digest, Keccak256};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+/// How long to wait before recycling unconfirmed TXs
+const RECYCLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Maximum number of pending TXs to track (memory safety)
+const MAX_PENDING_TXS: usize = 100_000;
+
+/// A pending TX waiting to be confirmed
+struct PendingTx {
+    /// Raw TX data for re-submission
+    data: Vec<u8>,
+    /// When this TX was submitted
+    submitted_at: Instant,
+    /// How many times this TX has been recycled
+    recycle_count: u32,
+}
+
+/// Shared TX recycler between tx_socket_server and commit_processor
+pub struct TxRecycler {
+    /// TXs submitted but not yet confirmed: tx_hash -> PendingTx
+    pending: Mutex<HashMap<[u8; 32], PendingTx>>,
+    /// Stats
+    total_submitted: Mutex<u64>,
+    total_confirmed: Mutex<u64>,
+    total_recycled: Mutex<u64>,
+}
+
+impl TxRecycler {
+    pub fn new() -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            total_submitted: Mutex::new(0),
+            total_confirmed: Mutex::new(0),
+            total_recycled: Mutex::new(0),
+        }
+    }
+
+    /// Hash TX data using SHA-256 (same as Rust consensus TX identity)
+    fn hash_tx(data: &[u8]) -> [u8; 32] {
+        let mut hasher = Keccak256::new();
+        hasher.update(data);
+        hasher.finalize().into()
+    }
+
+    /// Track submitted TXs. Called by tx_socket_server after client.submit() succeeds.
+    pub async fn track_submitted(&self, tx_data_list: &[Vec<u8>]) {
+        let mut pending = self.pending.lock().await;
+        let mut total = self.total_submitted.lock().await;
+
+        for tx_data in tx_data_list {
+            let hash = Self::hash_tx(tx_data);
+
+            // Don't overwrite if already pending (might be a re-submission)
+            if !pending.contains_key(&hash) {
+                // Memory safety: evict oldest if too many
+                if pending.len() >= MAX_PENDING_TXS {
+                    // Find and remove the oldest entry
+                    if let Some(oldest_key) = pending
+                        .iter()
+                        .min_by_key(|(_, v)| v.submitted_at)
+                        .map(|(k, _)| *k)
+                    {
+                        pending.remove(&oldest_key);
+                    }
+                }
+
+                pending.insert(
+                    hash,
+                    PendingTx {
+                        data: tx_data.clone(),
+                        submitted_at: Instant::now(),
+                        recycle_count: 0,
+                    },
+                );
+            }
+
+            *total += 1;
+        }
+    }
+
+    /// Mark TXs as confirmed (committed). Called by commit_processor when processing sub-DAGs.
+    /// `committed_tx_data` is the raw TX bytes from committed blocks.
+    pub async fn confirm_committed(&self, committed_tx_data: &[Vec<u8>]) {
+        let mut pending = self.pending.lock().await;
+        let mut total_confirmed = self.total_confirmed.lock().await;
+
+        let before = pending.len();
+        for tx_data in committed_tx_data {
+            let hash = Self::hash_tx(tx_data);
+            if pending.remove(&hash).is_some() {
+                *total_confirmed += 1;
+            }
+        }
+        let removed = before - pending.len();
+
+        if removed > 0 {
+            info!(
+                "♻️ [TX RECYCLER] Confirmed {} TXs from committed sub-DAG ({} still pending)",
+                removed,
+                pending.len()
+            );
+        }
+    }
+
+    /// Collect TXs that have been pending too long and need re-submission.
+    /// Returns the raw TX data for re-submission. Max 3 recycle attempts per TX.
+    pub async fn collect_stale(&self) -> Vec<Vec<u8>> {
+        let mut pending = self.pending.lock().await;
+        let mut total_recycled = self.total_recycled.lock().await;
+
+        let now = Instant::now();
+        let mut stale_txs = Vec::new();
+        let mut keys_to_update = Vec::new();
+
+        for (hash, ptx) in pending.iter() {
+            if now.duration_since(ptx.submitted_at) > RECYCLE_TIMEOUT && ptx.recycle_count < 3 {
+                stale_txs.push(ptx.data.clone());
+                keys_to_update.push(*hash);
+            }
+        }
+
+        // Update recycle count and reset timer for re-submitted TXs
+        for hash in &keys_to_update {
+            if let Some(ptx) = pending.get_mut(hash) {
+                ptx.recycle_count += 1;
+                ptx.submitted_at = now; // Reset timer for next recycle attempt
+                *total_recycled += 1;
+            }
+        }
+
+        // Remove TXs that exceeded max retries
+        let mut expired_count = 0;
+        pending.retain(|_, ptx| {
+            if ptx.recycle_count >= 3 && now.duration_since(ptx.submitted_at) > RECYCLE_TIMEOUT {
+                expired_count += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        if !stale_txs.is_empty() || expired_count > 0 {
+            warn!(
+                "♻️ [TX RECYCLER] Recycling {} stale TXs, expired {} (pending: {})",
+                stale_txs.len(),
+                expired_count,
+                pending.len()
+            );
+        }
+
+        stale_txs
+    }
+
+    /// Get current stats
+    pub async fn stats(&self) -> (usize, u64, u64, u64) {
+        let pending = self.pending.lock().await;
+        let submitted = *self.total_submitted.lock().await;
+        let confirmed = *self.total_confirmed.lock().await;
+        let recycled = *self.total_recycled.lock().await;
+        (pending.len(), submitted, confirmed, recycled)
+    }
+}
+
+/// Start background recycler task that periodically re-submits stale TXs
+pub async fn start_recycler_background(
+    recycler: Arc<TxRecycler>,
+    transaction_client: Arc<dyn crate::node::tx_submitter::TransactionSubmitter>,
+) {
+    info!(
+        "♻️ [TX RECYCLER] Background recycler started (timeout={}s, max_retries=3)",
+        RECYCLE_TIMEOUT.as_secs()
+    );
+
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let mut last_stats_log = Instant::now();
+
+    loop {
+        interval.tick().await;
+
+        // Collect stale TXs
+        let stale_txs = recycler.collect_stale().await;
+
+        if !stale_txs.is_empty() {
+            let count = stale_txs.len();
+            info!(
+                "♻️ [TX RECYCLER] Re-submitting {} stale TXs to consensus",
+                count
+            );
+
+            // Re-submit in a single batch
+            match transaction_client.submit(stale_txs).await {
+                Ok((block_ref, _indices, _)) => {
+                    info!(
+                        "♻️ [TX RECYCLER] Successfully recycled {} TXs into block {:?}",
+                        count, block_ref
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "♻️ [TX RECYCLER] Failed to re-submit {} stale TXs: {}",
+                        count, e
+                    );
+                }
+            }
+        }
+
+        // Log stats periodically (every 60s)
+        if last_stats_log.elapsed() > Duration::from_secs(60) {
+            let (pending, submitted, confirmed, recycled) = recycler.stats().await;
+            if pending > 0 || recycled > 0 {
+                info!(
+                    "♻️ [TX RECYCLER STATS] pending={}, submitted={}, confirmed={}, recycled={}",
+                    pending, submitted, confirmed, recycled
+                );
+            }
+            last_stats_log = Instant::now();
+        }
+    }
+}

@@ -14,9 +14,7 @@ const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
 /// - Length prefix cannot be read
 /// - Length is invalid (0 or > MAX_FRAME_SIZE)
 /// - Data cannot be read
-pub async fn read_length_prefixed_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<Vec<u8>> {
+pub async fn read_length_prefixed_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     // Read length prefix (4 bytes, big-endian)
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
@@ -42,6 +40,7 @@ pub async fn read_length_prefixed_frame<R: AsyncRead + Unpin>(
 
 /// Read a length-prefixed frame with timeout.
 /// This is a convenience function that wraps read_length_prefixed_frame with a timeout.
+#[allow(dead_code)]
 pub async fn read_length_prefixed_frame_with_timeout<R: AsyncRead + Unpin>(
     reader: &mut R,
     timeout_duration: std::time::Duration,

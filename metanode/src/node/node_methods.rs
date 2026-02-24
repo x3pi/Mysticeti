@@ -60,6 +60,18 @@ impl ConsensusNode {
         .await
     }
 
+    pub async fn queue_transactions_for_next_epoch(
+        &self,
+        tx_data_list: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        queue::queue_transactions(
+            &self.pending_transactions_queue,
+            &self.storage_path,
+            tx_data_list,
+        )
+        .await
+    }
+
     pub async fn submit_queued_transactions(&mut self) -> Result<usize> {
         queue::submit_queued_transactions(self).await
     }

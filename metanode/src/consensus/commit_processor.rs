@@ -13,6 +13,7 @@ use tokio::time::sleep; // [Added] Import sleep for retry mechanism
 use tracing::{error, info, trace, warn};
 
 use crate::consensus::checkpoint::calculate_global_exec_index;
+use crate::consensus::tx_recycler::TxRecycler;
 use crate::node::block_coordinator::BlockCoordinator;
 use crate::node::executor_client::ExecutorClient;
 use crate::types::tx_hash::calculate_transaction_hash_hex;
@@ -48,6 +49,8 @@ pub struct CommitProcessor {
     epoch_eth_addresses: Arc<tokio::sync::Mutex<std::collections::HashMap<u64, Vec<Vec<u8>>>>>,
     /// Block Coordinator for dual-stream block production (optional)
     block_coordinator: Option<Arc<BlockCoordinator>>,
+    /// TX recycler for confirming committed TXs
+    tx_recycler: Option<Arc<TxRecycler>>,
 }
 
 impl CommitProcessor {
@@ -69,6 +72,7 @@ impl CommitProcessor {
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
             block_coordinator: None,
+            tx_recycler: None,
         }
     }
 
@@ -176,6 +180,12 @@ impl CommitProcessor {
     /// Set block coordinator for dual-stream block production
     pub fn with_block_coordinator(mut self, coordinator: Arc<BlockCoordinator>) -> Self {
         self.block_coordinator = Some(coordinator);
+        self
+    }
+
+    /// Set TX recycler for confirming committed TXs
+    pub fn with_tx_recycler(mut self, recycler: Arc<TxRecycler>) -> Self {
+        self.tx_recycler = Some(recycler);
         self
     }
 
@@ -289,6 +299,20 @@ impl CommitProcessor {
                             self.epoch_eth_addresses.clone(), // Multi-epoch committee cache
                         )
                         .await?;
+
+                        // ♻️ TX RECYCLER: Confirm committed TXs so they aren't re-submitted
+                        if let Some(ref recycler) = self.tx_recycler {
+                            if total_txs_in_commit > 0 {
+                                let committed_tx_data: Vec<Vec<u8>> = subdag
+                                    .blocks
+                                    .iter()
+                                    .flat_map(|b| {
+                                        b.transactions().iter().map(|tx| tx.data().to_vec())
+                                    })
+                                    .collect();
+                                recycler.confirm_committed(&committed_tx_data).await;
+                            }
+                        }
 
                         // NOTE: epoch_base_index is NOT updated after each commit.
                         // It remains constant throughout the epoch.

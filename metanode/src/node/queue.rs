@@ -15,9 +15,26 @@ pub async fn queue_transaction(
     storage_path: &Path,
     tx_data: Vec<u8>,
 ) -> Result<()> {
+    queue_transactions(pending_queue, storage_path, vec![tx_data]).await
+}
+
+pub async fn queue_transactions(
+    pending_queue: &Mutex<Vec<Vec<u8>>>,
+    storage_path: &Path,
+    tx_data_list: Vec<Vec<u8>>,
+) -> Result<()> {
+    if tx_data_list.is_empty() {
+        return Ok(());
+    }
+
     let mut queue = pending_queue.lock().await;
-    queue.push(tx_data);
-    info!("📦 [TX FLOW] Queued transaction: size={}", queue.len());
+    let added_len = tx_data_list.len();
+    queue.extend(tx_data_list);
+    info!(
+        "📦 [TX FLOW] Queued {} transactions: total_size={}",
+        added_len,
+        queue.len()
+    );
 
     if let Err(e) = persist_transaction_queue(&queue, storage_path).await {
         warn!("⚠️ [TX PERSISTENCE] Failed to persist queue: {}", e);

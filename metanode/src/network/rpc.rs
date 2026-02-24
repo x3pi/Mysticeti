@@ -432,16 +432,16 @@ impl RpcServer {
 
                     // Queue all transactions
                     let node_guard = node.lock().await;
-                    for (i, tx_data) in transactions_to_submit.iter().enumerate() {
-                        if let Err(e) = node_guard
-                            .queue_transaction_for_next_epoch(tx_data.clone())
-                            .await
-                        {
-                            error!("❌ [TX FLOW] Failed to queue transaction {}: {}", i, e);
-                        } else {
-                            let tx_hash = calculate_transaction_hash_hex(tx_data);
-                            info!("📦 [TX FLOW] Queued TX[{}]: hash={}", i, tx_hash);
-                        }
+                    if let Err(e) = node_guard
+                        .queue_transactions_for_next_epoch(transactions_to_submit.clone())
+                        .await
+                    {
+                        error!("❌ [TX FLOW] Failed to queue transactions: {}", e);
+                    } else {
+                        info!(
+                            "📦 [TX FLOW] Queued {} transactions",
+                            transactions_to_submit.len()
+                        );
                     }
 
                     if is_length_prefixed {
