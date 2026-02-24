@@ -215,15 +215,17 @@ impl ExecutorClient {
                 // The off-by-one bug in epoch_boundary_block produces a gap of exactly 1, causing
                 // the buffer to wait forever for a block that was already processed in the previous epoch.
                 // Syncing with Go (SINGLE SOURCE OF TRUTH) immediately recovers from this.
-                if gap > 0 {
-                    // Drop locks before async call
+                if gap > 100 {
+                    // PERFORMANCE FIX: Only sync with Go for LARGE gaps (>100).
+                    // Small gaps are normal during high throughput and resolve as blocks arrive.
+                    // Previously this called get_last_block_number() on EVERY gap (even gap=1),
+                    // adding ~5s RPC latency each time — the main cause of 20s block delays.
                     drop(buffer);
                     drop(next_expected);
 
-                    warn!("⚠️  [SEQUENTIAL-BUFFER] Gap detected: min_buffered={}, gap={}. Syncing with Go (SOURCE OF TRUTH)...", 
+                    warn!("⚠️  [SEQUENTIAL-BUFFER] Large gap detected: min_buffered={}, gap={}. Syncing with Go...", 
                         min_buffered, gap);
 
-                    // Sync with Go to get correct next_expected
                     if let Ok(go_last_block) = self.get_last_block_number().await {
                         let go_next_expected = go_last_block + 1;
 
@@ -233,7 +235,6 @@ impl ExecutorClient {
                                 *next_expected_guard, go_next_expected, go_last_block);
                             *next_expected_guard = go_next_expected;
 
-                            // Clear old blocks that Go already has
                             let mut buffer = self.send_buffer.lock().await;
                             let before_clear = buffer.len();
                             buffer.retain(|&k, _| k >= go_next_expected);
@@ -247,6 +248,8 @@ impl ExecutorClient {
                             }
                         }
                     }
+                } else if gap > 0 {
+                    trace!("⏸️  [SEQUENTIAL-BUFFER] Small gap={} (normal during high throughput), waiting for blocks to arrive", gap);
                 }
             }
         }
@@ -464,7 +467,7 @@ impl ExecutorClient {
             // Send with retry logic if write fails
             // CRITICAL: Add timeout to prevent commit processor from getting stuck
             use tokio::time::{timeout, Duration};
-            const SEND_TIMEOUT: Duration = Duration::from_secs(10); // 10 seconds timeout
+            const SEND_TIMEOUT: Duration = Duration::from_secs(2); // 2 seconds timeout (was 10s — too slow for recovery)
 
             let send_result = timeout(SEND_TIMEOUT, async {
                 stream.write_all(&len_buf).await?;
