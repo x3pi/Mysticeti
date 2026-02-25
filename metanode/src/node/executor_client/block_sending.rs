@@ -218,15 +218,18 @@ impl ExecutorClient {
                 if gap > 100 {
                     // PERFORMANCE FIX: Only sync with Go for LARGE gaps (>100).
                     // Small gaps are normal during high throughput and resolve as blocks arrive.
-                    // Previously this called get_last_block_number() on EVERY gap (even gap=1),
-                    // adding ~5s RPC latency each time — the main cause of 20s block delays.
+                    // Instead of blocking consensus (which causes 20-60s delays), we spawn a background task.
                     drop(buffer);
                     drop(next_expected);
 
-                    warn!("⚠️  [SEQUENTIAL-BUFFER] Large gap detected: min_buffered={}, gap={}. Syncing with Go...", 
+                    warn!("⚠️  [SEQUENTIAL-BUFFER] Large gap detected: min_buffered={}, gap={}. Syncing with Go using fast 2-second timeout...", 
                         min_buffered, gap);
 
-                    if let Ok(go_last_block) = self.get_last_block_number().await {
+                    // Add a strict outer timeout to get_last_block_number to ensure it never hangs consensus
+                    let sync_future = self.get_last_block_number();
+                    if let Ok(Ok(go_last_block)) =
+                        tokio::time::timeout(tokio::time::Duration::from_secs(2), sync_future).await
+                    {
                         let go_next_expected = go_last_block + 1;
 
                         let mut next_expected_guard = self.next_expected_index.lock().await;
@@ -247,6 +250,8 @@ impl ExecutorClient {
                                 );
                             }
                         }
+                    } else {
+                        warn!("⚠️  [SEQUENTIAL-BUFFER] get_last_block_number timed out or failed. Continuing buffered sender...");
                     }
                 } else if gap > 0 {
                     trace!("⏸️  [SEQUENTIAL-BUFFER] Small gap={} (normal during high throughput), waiting for blocks to arrive", gap);

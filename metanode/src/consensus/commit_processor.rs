@@ -740,6 +740,7 @@ impl CommitProcessor {
                                     node_guard.committed_transaction_hashes.lock().await;
 
                                 let mut tracked_count = 0;
+                                let mut batch_hashes = Vec::new();
                                 for block in &subdag.blocks {
                                     for tx in block.transactions() {
                                         let tx_hash =
@@ -755,16 +756,19 @@ impl CommitProcessor {
                                         }
 
                                         hashes_guard.insert(tx_hash.clone());
+                                        batch_hashes.push(tx_hash);
                                         tracked_count += 1;
+                                    }
+                                }
 
-                                        // Also save to persistent storage for epoch transition recovery
-                                        if let Err(e) = crate::node::transition::save_committed_transaction_hash(
-                                            &node_guard.storage_path, epoch, &tx_hash
-                                        ).await {
-                                            warn!("⚠️ [TX TRACKING] Failed to persist committed hash after commit: {}", e);
-                                        } else {
-                                            trace!("💾 [TX TRACKING] Persisted committed hash: {} for epoch {}", hash_hex, epoch);
-                                        }
+                                // Also save to persistent storage for epoch transition recovery (in ONE batch!)
+                                if !batch_hashes.is_empty() {
+                                    if let Err(e) = crate::node::transition::save_committed_transaction_hashes_batch(
+                                        &node_guard.storage_path, epoch, &batch_hashes
+                                    ).await {
+                                        warn!("⚠️ [TX TRACKING] Failed to persist committed hashes after commit: {}", e);
+                                    } else {
+                                        trace!("💾 [TX TRACKING] Persisted {} committed hashes for epoch {}", batch_hashes.len(), epoch);
                                     }
                                 }
 

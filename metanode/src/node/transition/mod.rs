@@ -20,4 +20,7 @@ mod verification;
 
 // Re-export public items
 pub use epoch_transition::transition_to_epoch_from_system_tx;
-pub use tx_recovery::{load_committed_transaction_hashes, save_committed_transaction_hash};
+pub use tx_recovery::{
+    load_committed_transaction_hashes, save_committed_transaction_hash,
+    save_committed_transaction_hashes_batch,
+};

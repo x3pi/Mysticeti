@@ -202,6 +202,48 @@ pub async fn save_committed_transaction_hash(
     Ok(())
 }
 
+/// Save multiple committed transaction hashes to registry for duplicate prevention
+pub async fn save_committed_transaction_hashes_batch(
+    storage_path: &std::path::Path,
+    epoch: u64,
+    tx_hashes: &[Vec<u8>],
+) -> Result<()> {
+    if tx_hashes.is_empty() {
+        return Ok(());
+    }
+
+    let epoch_dir = storage_path.join("epochs").join(format!("epoch_{}", epoch));
+
+    // Ensure epoch directory exists
+    std::fs::create_dir_all(&epoch_dir)?;
+
+    let hashes_file = epoch_dir.join("committed_transaction_hashes.bin");
+
+    // Load existing hashes
+    let mut hashes = if hashes_file.exists() {
+        load_transaction_hashes_from_file(&hashes_file)
+            .await
+            .unwrap_or_default()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // Add new hashes
+    for tx_hash in tx_hashes {
+        hashes.insert(tx_hash.clone());
+    }
+
+    // Save back to file
+    save_transaction_hashes_to_file(&hashes_file, &hashes).await?;
+
+    trace!(
+        "💾 [TX HASH REGISTRY] Saved {} committed transaction hashes to epoch {}",
+        tx_hashes.len(),
+        epoch
+    );
+    Ok(())
+}
+
 /// Load transaction hashes from binary file
 async fn load_transaction_hashes_from_file(
     file_path: &std::path::Path,
