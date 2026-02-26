@@ -816,25 +816,14 @@ impl ConsensusNode {
         consensus_core::epoch_change_provider::init_epoch_change_provider(Box::new(NoOpProvider));
         consensus_core::epoch_change_provider::init_epoch_change_processor(Box::new(NoOpProcessor));
 
-        // ♻️ TX RECYCLER: Background recycler DISABLED — causes duplicate flooding during multi-blast.
-        // Tracking + confirming still active for observability (track_submitted/confirm_committed).
-        // TODO: Re-enable with smarter throttling once root cause of unconfirmed TXs is resolved.
-        // if let Some(ref proxy) = consensus.transaction_client_proxy {
-        //     let recycler_for_bg = consensus.tx_recycler.clone();
-        //     let tx_client_for_recycler: Arc<dyn crate::node::tx_submitter::TransactionSubmitter> =
-        //         proxy.clone();
-        //     tokio::spawn(async move {
-        //         crate::consensus::tx_recycler::start_recycler_background(
-        //             recycler_for_bg,
-        //             tx_client_for_recycler,
-        //         )
-        //         .await;
-        //     });
-        //     info!("♻️ [TX RECYCLER] Background recycler spawned");
-        // } else {
-        //     info!("♻️ [TX RECYCLER] No transaction client proxy - background recycler disabled (SyncOnly mode)");
-        // }
-        info!("♻️ [TX RECYCLER] Tracking + confirming active. Background re-submission DISABLED.");
+        // ♻️ TX RECYCLER: Background recycler DISABLED PERMANENTLY.
+        // ARCHITECTURAL REASON: Go broadcasts its mempool to all nodes via LibP2P.
+        // Therefore, MULTIPLE Rust validators will propose the EXACT SAME transactions in their blocks.
+        // Only one of those blocks might get sequenced quickly, while the others might be GarbageCollected.
+        // If a losing validator auto-resubmits its dropped/GC'd transactions (either via timeout or GC events),
+        // it introduces massive duplicate transaction bloat into the DAG, causing State Root forks or performance collapse.
+        // Dropped transactions should only be retried by the original Client/Wallet, NOT the consensus layer.
+        // Tracking + confirming still active solely for metrics and observability.
 
         let mut node = ConsensusNode {
             authority: consensus.authority,

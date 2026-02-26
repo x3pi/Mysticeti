@@ -654,35 +654,18 @@ impl TxSocketServer {
                         let client_clone = client.clone();
                         let chunk_clone = chunk_vec.clone();
                         tokio::spawn(async move {
-                            if let Ok(consensus_core::BlockStatus::GarbageCollected(gc_block)) =
-                                status_receiver.await
-                            {
-                                warn!("♻️ [TX RESUBMIT] Block {:?} was Garbage Collected! Resubmitting {} transactions.", gc_block, chunk_clone.len());
-                                let mut retries = 0;
-                                let current_chunk = chunk_clone;
-                                while retries < 3 {
-                                    match client_clone.submit(current_chunk.clone()).await {
-                                        Ok((new_block_ref, _, new_status_rx)) => {
-                                            warn!("♻️ [TX RESUBMIT] Resubmitted to block {:?}. Waiting for status...", new_block_ref);
-                                            if let Ok(
-                                                consensus_core::BlockStatus::GarbageCollected(
-                                                    new_gc_block,
-                                                ),
-                                            ) = new_status_rx.await
-                                            {
-                                                warn!("♻️ [TX RESUBMIT] Retry {} failed (GC'd in block {:?}).", retries + 1, new_gc_block);
-                                                retries += 1;
-                                            } else {
-                                                info!("✅ [TX RESUBMIT] Successfully sequenced dropped transactions (original block: {:?})", gc_block);
-                                                break;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!("❌ [TX RESUBMIT] Failed to resubmit transactions from block {:?}: {}", gc_block, e);
-                                            break;
-                                        }
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            match status_receiver.await {
+                                Ok(consensus_core::BlockStatus::Sequenced(block)) => {
+                                    info!(
+                                        "✅ [TX STATUS] Block {:?} was sequenced and finalized.",
+                                        block
+                                    );
+                                }
+                                Ok(consensus_core::BlockStatus::GarbageCollected(gc_block)) => {
+                                    warn!("♻️ [TX STATUS] Block {:?} was Garbage Collected. TxRecycler will handle re-submission if necessary.", gc_block);
+                                }
+                                Err(e) => {
+                                    warn!("⚠️ [TX STATUS] Failed to receive block status: {}", e);
                                 }
                             }
                         });

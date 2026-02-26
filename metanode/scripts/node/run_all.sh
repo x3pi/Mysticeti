@@ -8,6 +8,7 @@
 
 set -e
 set -o pipefail
+ulimit -n 100000 || true
 
 # Colors
 GREEN='\033[0;32m'
@@ -155,7 +156,7 @@ for id in 0 1 2 3 4; do
     
     echo -e "${GREEN}  🚀 Starting Go Master $id (${GO_MASTER_SESSION[$id]})...${NC}"
     tmux new-session -d -s "${GO_MASTER_SESSION[$id]}" -c "$GO_SIMPLE_ROOT" \
-        "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='$XAPIAN' && go run . -config=${GO_MASTER_CONFIG[$id]} >> \"$LOG_DIR/node_$id/go-master-stdout.log\" 2>&1"
+        "ulimit -n 100000; export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='$XAPIAN' && go run . -config=${GO_MASTER_CONFIG[$id]} >> \"$LOG_DIR/node_$id/go-master-stdout.log\" 2>&1"
     
     sleep 2  # Brief pause between Go Masters
 done
@@ -178,7 +179,7 @@ for id in 0 1 2 3 4; do
     
     echo -e "${GREEN}  🚀 Starting Go Sub $id (${GO_SUB_SESSION[$id]})...${NC}"
     tmux new-session -d -s "${GO_SUB_SESSION[$id]}" -c "$GO_SIMPLE_ROOT" \
-        "export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='$XAPIAN' && go run . -config=${GO_SUB_CONFIG[$id]} >> \"$LOG_DIR/node_$id/go-sub-stdout.log\" 2>&1"
+        "ulimit -n 100000; export GOTOOLCHAIN=go1.23.5 && export XAPIAN_BASE_PATH='$XAPIAN' && go run . -config=${GO_SUB_CONFIG[$id]} >> \"$LOG_DIR/node_$id/go-sub-stdout.log\" 2>&1"
     
     sleep 1
 done
@@ -195,7 +196,7 @@ cd "$METANODE_ROOT"
 for id in 0 1 2 3 4; do
     echo -e "${GREEN}  🚀 Starting Rust Node $id (${RUST_SESSION[$id]})...${NC}"
     tmux new-session -d -s "${RUST_SESSION[$id]}" -c "$METANODE_ROOT" \
-        "export RUST_LOG=info,consensus_core=debug; export DB_WRITE_BUFFER_SIZE_MB=256; export DB_WAL_SIZE_MB=256; $BINARY start --config ${RUST_CONFIG[$id]} >> \"$LOG_DIR/node_$id/rust.log\" 2>&1"
+        "ulimit -n 100000; export RUST_LOG=info,consensus_core=debug; export DB_WRITE_BUFFER_SIZE_MB=256; export DB_WAL_SIZE_MB=256; $BINARY start --config ${RUST_CONFIG[$id]} >> \"$LOG_DIR/node_$id/rust.log\" 2>&1"
     
     sleep 1
 done
