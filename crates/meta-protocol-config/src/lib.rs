@@ -2691,10 +2691,10 @@ impl ProtocolConfig {
             // All flags are disabled in V1
             feature_flags: Default::default(),
 
-            max_tx_size_bytes: Some(128 * 1024),
+            max_tx_size_bytes: Some(4096 * 1024), // 4MB
             // We need this number to be at least 100x less than `max_serialized_tx_effects_size_bytes`otherwise effects can be huge
-            max_input_objects: Some(2048),
-            max_serialized_tx_effects_size_bytes: Some(512 * 1024),
+            // Or just big enough - bumping from 512KB to 4MB for larger blocks
+            max_serialized_tx_effects_size_bytes: Some(8192 * 1024), // 8MB
             max_serialized_tx_effects_size_bytes_system_tx: Some(512 * 1024 * 16),
             max_gas_payment_objects: Some(256),
             max_modules_in_publish: Some(128),
@@ -3452,7 +3452,7 @@ impl ProtocolConfig {
                     // Enable shared object deletion on all networks.
                     cfg.feature_flags.shared_object_deletion = true;
 
-                    cfg.consensus_max_transaction_size_bytes = Some(256 * 1024); // 256KB
+                    cfg.consensus_max_transaction_size_bytes = Some(4096 * 1024); // 4MB (was 256KB)
                     cfg.consensus_max_transactions_in_block_bytes = Some(6 * 1_024 * 1024);
                     // 6 MB
                 }
