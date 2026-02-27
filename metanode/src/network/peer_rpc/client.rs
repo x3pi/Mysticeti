@@ -231,7 +231,7 @@ pub async fn query_peer_epoch_boundary_data(
 /// Uses round-robin retry logic for fault tolerance
 pub async fn forward_transaction_to_validators(
     peer_addresses: &[String],
-    tx_data: &[u8],
+    tx_batch: &[Vec<u8>],
 ) -> Result<SubmitTransactionResponse> {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
@@ -243,9 +243,9 @@ pub async fn forward_transaction_to_validators(
         ));
     }
 
-    let tx_hex = hex::encode(tx_data);
+    let tx_hexes: Vec<String> = tx_batch.iter().map(|t| hex::encode(t)).collect();
     let request_body = serde_json::to_string(&SubmitTransactionRequest {
-        transactions_hex: tx_hex,
+        transactions_hex: tx_hexes,
     })?;
 
     // Round-robin through peers until one succeeds

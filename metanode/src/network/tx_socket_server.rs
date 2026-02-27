@@ -426,20 +426,22 @@ impl TxSocketServer {
                                 // Forward to validators using peer_rpc
                                 use crate::network::peer_rpc::forward_transaction_to_validators;
 
-                                // Forward each transaction individually
+                                // Forward the entire batch to validators in chunks
                                 let mut forward_success = true;
                                 let mut forward_error = String::new();
 
-                                for tx_data in &transactions_to_submit {
+                                for chunk in transactions_to_submit.chunks(5000) {
                                     match forward_transaction_to_validators(
                                         &peer_rpc_addresses,
-                                        tx_data,
+                                        chunk,
                                     )
                                     .await
                                     {
                                         Ok(resp) if resp.success => {
-                                            let tx_hash = crate::types::tx_hash::calculate_transaction_hash_hex(tx_data);
-                                            info!("✅ [TX FORWARD] Successfully forwarded TX {} to validator", tx_hash);
+                                            info!(
+                                                "✅ [TX FORWARD] Successfully forwarded chunk of {} TXs to validator",
+                                                chunk.len()
+                                            );
                                         }
                                         Ok(resp) => {
                                             forward_success = false;

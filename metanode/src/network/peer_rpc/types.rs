@@ -74,8 +74,8 @@ pub struct EpochBoundaryDataResponse {
 /// Used by SyncOnly nodes to forward transactions to validators
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitTransactionRequest {
-    /// Hex-encoded transaction data (protobuf Transactions message)
-    pub transactions_hex: String,
+    /// Hex-encoded transactions data (batch)
+    pub transactions_hex: Vec<String>,
 }
 
 /// Response for /submit_transaction endpoint
