@@ -88,28 +88,71 @@ impl PeerRpcServer {
             let net_addr = network_address.clone();
 
             tokio::spawn(async move {
-                // Read HTTP request with timeout
-                let mut buffer = [0u8; 1024];
-                let read_result = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    stream.read(&mut buffer),
-                )
-                .await;
+                // Read HTTP request (handle full POST bodies)
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0u8; 8192];
+                let mut expected_len = None;
 
-                let n = match read_result {
-                    Ok(Ok(n)) if n > 0 => n,
-                    Ok(Ok(_)) => return, // Empty read
-                    Ok(Err(e)) => {
-                        warn!("🌐 [PEER RPC] Failed to read from {}: {}", peer_addr, e);
-                        return;
-                    }
-                    Err(_) => {
-                        warn!("🌐 [PEER RPC] Timeout reading from {}", peer_addr);
-                        return;
-                    }
-                };
+                loop {
+                    let read_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        stream.read(&mut buffer),
+                    )
+                    .await;
 
-                let request = String::from_utf8_lossy(&buffer[..n]);
+                    match read_result {
+                        Ok(Ok(0)) => break, // EOF
+                        Ok(Ok(n)) => {
+                            request_bytes.extend_from_slice(&buffer[..n]);
+
+                            if expected_len.is_none() {
+                                if let Some(headers_end) = request_bytes
+                                    .windows(4)
+                                    .position(|window| window == b"\r\n\r\n")
+                                {
+                                    let headers_str =
+                                        String::from_utf8_lossy(&request_bytes[..headers_end]);
+                                    let mut cl_len = 0;
+                                    for line in headers_str.lines() {
+                                        if line.to_lowercase().starts_with("content-length:") {
+                                            if let Some(val) = line.split(':').nth(1) {
+                                                if let Ok(len) = val.trim().parse::<usize>() {
+                                                    cl_len = len;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    expected_len = Some(headers_end + 4 + cl_len);
+                                }
+                            }
+
+                            if let Some(expected) = expected_len {
+                                if request_bytes.len() >= expected {
+                                    break;
+                                }
+                            } else if request_bytes.len() > 4 && !request_bytes.starts_with(b"POST")
+                            {
+                                if request_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            warn!("🌐 [PEER RPC] Failed to read from {}: {}", peer_addr, e);
+                            return;
+                        }
+                        Err(_) => {
+                            warn!("🌐 [PEER RPC] Timeout reading from {}", peer_addr);
+                            return;
+                        }
+                    }
+                }
+
+                if request_bytes.is_empty() {
+                    return;
+                }
+                let request = String::from_utf8_lossy(&request_bytes);
 
                 // Route request
                 if request.starts_with("GET /peer_info") {
