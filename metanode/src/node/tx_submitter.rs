@@ -94,3 +94,24 @@ impl TransactionSubmitter for TransactionClientProxy {
         Ok((block_ref, indices, status))
     }
 }
+
+/// No-op submitter for SyncOnly nodes.
+/// Always returns an error to trigger the forwarding path in TxSocketServer.
+/// SyncOnly nodes cannot submit directly to consensus but can forward to validators.
+pub struct NoOpTransactionSubmitter;
+
+#[async_trait]
+impl TransactionSubmitter for NoOpTransactionSubmitter {
+    async fn submit(
+        &self,
+        _transactions: Vec<Vec<u8>>,
+    ) -> Result<(
+        consensus_types::block::BlockRef,
+        Vec<consensus_types::block::TransactionIndex>,
+        tokio::sync::oneshot::Receiver<BlockStatus>,
+    )> {
+        Err(anyhow::anyhow!(
+            "SyncOnly node cannot submit to consensus directly"
+        ))
+    }
+}

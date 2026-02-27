@@ -89,10 +89,10 @@ impl InitializedNode {
         let tx_client = { node.lock().await.transaction_submitter() };
 
         let mut rpc_server_handle = None;
-        let mut uds_server_handle = None;
+        let uds_server_handle;
         let mut peer_rpc_server_handle = None;
 
-        if let Some(tx_client) = tx_client {
+        if let Some(ref tx_client) = tx_client {
             // Start RPC server for client submissions (HTTP) - only for validator nodes
             let rpc_port = node_config.metrics_port + 1000;
             let node_for_rpc = node.clone();
@@ -103,15 +103,26 @@ impl InitializedNode {
                     error!("RPC server error: {}", e);
                 }
             }));
+            info!("Consensus node started successfully (validator mode)");
+            info!("RPC server available at http://127.0.0.1:{}", rpc_port);
+        } else {
+            info!("Sync-only node started (no RPC server, UDS forwarding enabled)");
+        }
 
-            // Start Unix Domain Socket server for local IPC
+        // Start Unix Domain Socket server for ALL node types (validator + SyncOnly)
+        // Validators submit directly to consensus; SyncOnly forwards to validators via peer RPC
+        {
+            let tx_client_for_uds: Arc<dyn crate::node::tx_submitter::TransactionSubmitter> =
+                match tx_client {
+                    Some(tc) => tc,
+                    None => Arc::new(crate::node::tx_submitter::NoOpTransactionSubmitter),
+                };
+
             let socket_path = node_config
                 .rust_tx_socket_path
                 .clone()
                 .unwrap_or_else(|| format!("/tmp/metanode-tx-{}.sock", node_config.node_id));
-            let tx_client_uds = tx_client.clone();
             let node_for_uds = node.clone();
-            // Get is_transitioning flag for lock-free epoch transition detection
             let (is_transitioning_for_uds, pending_tx_queue, storage_path) = {
                 let node_guard = node.lock().await;
                 (
@@ -151,7 +162,7 @@ impl InitializedNode {
 
             let mut uds_server = TxSocketServer::with_node(
                 socket_path.clone(),
-                tx_client_uds,
+                tx_client_for_uds,
                 node_for_uds,
                 is_transitioning_for_uds,
                 pending_tx_queue,
@@ -179,12 +190,6 @@ impl InitializedNode {
                 }
             }));
             info!("Unix Domain Socket server available at {}", socket_path);
-
-            info!("Consensus node started successfully (validator mode)");
-            info!("RPC server available at http://127.0.0.1:{}", rpc_port);
-        } else {
-            // Sync-only node: no RPC/UDS servers needed
-            info!("Sync-only node started successfully (no transaction submission servers)");
         }
 
         // Start Peer RPC server for WAN-based peer discovery (all node types)
