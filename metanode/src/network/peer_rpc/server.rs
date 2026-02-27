@@ -537,33 +537,36 @@ impl PeerRpcServer {
             }
         };
 
-        // Decode hex to bytes
-        let tx_bytes = match hex::decode(&submit_req.transactions_hex) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                let response = SubmitTransactionResponse {
-                    success: false,
-                    count: 0,
-                    error: Some(format!("Invalid hex: {}", e)),
-                };
-                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-                let http_response = format!(
-                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{}",
-                    json
-                );
-                let _ = stream.write_all(http_response.as_bytes()).await;
-                return;
+        // Decode hex to bytes for all transactions
+        let mut tx_bytes_batch = Vec::new();
+        for tx_hex in &submit_req.transactions_hex {
+            match hex::decode(tx_hex) {
+                Ok(bytes) => tx_bytes_batch.push(bytes),
+                Err(e) => {
+                    let response = SubmitTransactionResponse {
+                        success: false,
+                        count: 0,
+                        error: Some(format!("Invalid hex: {}", e)),
+                    };
+                    let json =
+                        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                    let http_response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{}",
+                        json
+                    );
+                    let _ = stream.write_all(http_response.as_bytes()).await;
+                    return;
+                }
             }
-        };
+        }
 
         info!(
-            "📥 [TX FORWARD] Received {} bytes from SyncOnly node, submitting to consensus",
-            tx_bytes.len()
+            "📥 [TX FORWARD] Received batch of {} transactions from SyncOnly node, submitting to consensus",
+            tx_bytes_batch.len()
         );
 
-        // Submit transaction to consensus via TransactionSubmitter
-        // tx_bytes contains Transactions protobuf message, need to split into individual txs
-        match submitter.submit(vec![tx_bytes]).await {
+        // Submit entire batch to consensus
+        match submitter.submit(tx_bytes_batch).await {
             Ok((block_ref, indices, _status_rx)) => {
                 info!(
                     "✅ [TX FORWARD] Successfully submitted {} tx(s) to block {:?}",
