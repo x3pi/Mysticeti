@@ -53,6 +53,12 @@ impl PeerRpcServer {
         }
     }
 
+    /// Set transaction submitter for forwarding support (validators only)
+    pub fn with_transaction_submitter(mut self, submitter: Arc<dyn TransactionSubmitter>) -> Self {
+        self.transaction_submitter = Some(submitter);
+        self
+    }
+
     /// Start the Peer RPC Server
     pub async fn start(self) -> Result<()> {
         // Listen on all interfaces for WAN access

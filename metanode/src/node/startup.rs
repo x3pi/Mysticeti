@@ -114,7 +114,7 @@ impl InitializedNode {
         {
             let tx_client_for_uds: Arc<dyn crate::node::tx_submitter::TransactionSubmitter> =
                 match tx_client {
-                    Some(tc) => tc,
+                    Some(ref tc) => tc.clone(),
                     None => Arc::new(crate::node::tx_submitter::NoOpTransactionSubmitter),
                 };
 
@@ -200,12 +200,17 @@ impl InitializedNode {
                     node_guard.executor_client.clone()
                 };
                 if let Some(exc) = executor_client_for_peer {
-                    let peer_server = PeerRpcServer::new(
+                    let mut peer_server = PeerRpcServer::new(
                         node_config.node_id,
                         peer_port,
                         node_config.network_address.clone(),
                         exc,
                     );
+                    // Inject transaction submitter so validators can accept forwarded TXs from SyncOnly nodes
+                    if let Some(ref submitter) = tx_client {
+                        peer_server = peer_server.with_transaction_submitter(submitter.clone());
+                        info!("📡 [PEER RPC] Transaction submitter injected for /submit_transaction endpoint");
+                    }
                     peer_rpc_server_handle = Some(tokio::spawn(async move {
                         if let Err(e) = peer_server.start().await {
                             error!("Peer RPC server error: {}", e);
