@@ -168,6 +168,7 @@ pub async fn load_committed_transaction_hashes(
 }
 
 /// Save a committed transaction hash to registry for duplicate prevention
+#[allow(dead_code)]
 pub async fn save_committed_transaction_hash(
     storage_path: &std::path::Path,
     epoch: u64,

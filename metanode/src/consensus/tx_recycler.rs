@@ -9,6 +9,8 @@
 //! Solution: Track submitted TXs by hash. When committed sub-DAGs arrive, mark their
 //! TXs as confirmed. Periodically re-submit unconfirmed TXs back to consensus.
 
+#![allow(dead_code)]
+
 use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use std::sync::Arc;

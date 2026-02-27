@@ -105,7 +105,10 @@ impl InitializedNode {
             }));
 
             // Start Unix Domain Socket server for local IPC
-            let socket_path = format!("/tmp/metanode-tx-{}.sock", node_config.node_id);
+            let socket_path = node_config
+                .rust_tx_socket_path
+                .clone()
+                .unwrap_or_else(|| format!("/tmp/metanode-tx-{}.sock", node_config.node_id));
             let tx_client_uds = tx_client.clone();
             let node_for_uds = node.clone();
             // Get is_transitioning flag for lock-free epoch transition detection

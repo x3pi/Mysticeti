@@ -51,6 +51,7 @@ impl ConsensusNode {
         (true, false, "Node is ready".to_string())
     }
 
+    #[allow(dead_code)]
     pub async fn queue_transaction_for_next_epoch(&self, tx_data: Vec<u8>) -> Result<()> {
         queue::queue_transaction(
             &self.pending_transactions_queue,

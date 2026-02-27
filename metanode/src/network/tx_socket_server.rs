@@ -651,8 +651,8 @@ impl TxSocketServer {
                             }
                         }
 
-                        let client_clone = client.clone();
-                        let chunk_clone = chunk_vec.clone();
+                        let _client_clone = client.clone();
+                        let _chunk_clone = chunk_vec.clone();
                         tokio::spawn(async move {
                             match status_receiver.await {
                                 Ok(consensus_core::BlockStatus::Sequenced(block)) => {

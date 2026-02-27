@@ -2692,6 +2692,7 @@ impl ProtocolConfig {
             feature_flags: Default::default(),
 
             max_tx_size_bytes: Some(4096 * 1024), // 4MB
+            max_input_objects: Some(2048),
             // We need this number to be at least 100x less than `max_serialized_tx_effects_size_bytes`otherwise effects can be huge
             // Or just big enough - bumping from 512KB to 4MB for larger blocks
             max_serialized_tx_effects_size_bytes: Some(8192 * 1024), // 8MB

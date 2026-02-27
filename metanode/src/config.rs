@@ -178,8 +178,13 @@ pub struct NodeConfig {
     pub peer_discovery_refresh_secs: u64,
     /// Number of epochs to keep: 0 = archive mode (keep all), 3 = default
     /// Controls legacy epoch store retention and startup epoch cleanup
+    /// Number of epochs to keep: 0 = archive mode (keep all), 3 = default
+    /// Controls legacy epoch store retention and startup epoch cleanup
     #[serde(default = "default_epochs_to_keep")]
     pub epochs_to_keep: usize,
+    /// Unix Domain Socket path for transaction submission (overrides default /tmp/metanode-tx-{node_id}.sock)
+    #[serde(default)]
+    pub rust_tx_socket_path: Option<String>,
 }
 
 fn default_max_clock_drift_seconds() -> u64 {
@@ -346,6 +351,7 @@ impl NodeConfig {
                 go_rpc_url: None,           // Configure when enable_peer_discovery is true
                 epochs_to_keep: default_epochs_to_keep(),
                 peer_discovery_refresh_secs: default_peer_discovery_refresh_secs(),
+                rust_tx_socket_path: Some(format!("/tmp/metanode-tx-{}.sock", idx)),
             };
 
             // Save keys - use private_key_bytes and public key bytes
