@@ -2259,7 +2259,7 @@ impl ProtocolConfig {
             256 * 1024
         } else {
             self.consensus_max_transactions_in_block_bytes
-                .unwrap_or(20 * 1024 * 1024)
+                .unwrap_or(200 * 1024 * 1024)
         }
     }
 
@@ -2268,7 +2268,7 @@ impl ProtocolConfig {
             8
         } else {
             self.consensus_max_num_transactions_in_block
-                .unwrap_or(20000)
+                .unwrap_or(50000)
         }
     }
 
@@ -3454,7 +3454,7 @@ impl ProtocolConfig {
                     cfg.feature_flags.shared_object_deletion = true;
 
                     cfg.consensus_max_transaction_size_bytes = Some(4096 * 1024); // 4MB (was 256KB)
-                    cfg.consensus_max_transactions_in_block_bytes = Some(6 * 1_024 * 1024);
+                    cfg.consensus_max_transactions_in_block_bytes = Some(200 * 1024 * 1024);
                     // 6 MB
                 }
                 37 => {
@@ -3760,8 +3760,8 @@ impl ProtocolConfig {
                     cfg.move_binary_format_version = Some(7);
 
                     // Tuned for high throughput
-                    cfg.consensus_max_transactions_in_block_bytes = Some(8 * 1024 * 1024);
-                    cfg.consensus_max_num_transactions_in_block = Some(10000);
+                    cfg.consensus_max_transactions_in_block_bytes = Some(200 * 1024 * 1024);
+                    cfg.consensus_max_num_transactions_in_block = Some(50000);
 
                     cfg.feature_flags.rethrow_serialization_type_layout_errors = true;
                 }
