@@ -14,7 +14,7 @@
     },
     {
       "stake": 1000,
-      "address": "/ip4/127.0.0.1/tcp/9011",
+      "address": "/ip4/192.168.1.232/tcp/9011",
       "hostname": "node-1",
       "authority_key": "o/Hivn0pLsOHPpITXpa8erB+tpBdk1rYELr1bcBHz8R4te0SxU3wA9rjn4f/ZrKEERNEurUuMDaGHSNdgqlfwoWoMLo0mFgoburTsUkLpPYm2ch1UXaWv4shtHger7EM",
       "protocol_key": "ngmCtN3emEfN6PD/oOtB4YoBaHRFn1M3GzhdtdnZzLw=",
@@ -22,7 +22,7 @@
     },
     {
       "stake": 1000,
-      "address": "/ip4/127.0.0.1/tcp/9002",
+      "address": "/ip4/192.168.1.232/tcp/9002",
       "hostname": "node-2",
       "authority_key": "q6tzibSFCjBgDb5xZZiIM/j+794bqwq9w540egRSk0f1gKfZFmiPgylFcg//HwzkGAKGlSd/nEYddlnPgzv4oir++a+UaxYjf+U+WrUyQ1i3KEKF29KRjkmE7GxAgSYq",
       "protocol_key": "SJMLmNrKGJHkextl8SN2px1Nq1LBsj6BX6nsnb8gU8Y=",
@@ -30,7 +30,7 @@
     },
     {
       "stake": 1000,
-      "address": "/ip4/127.0.0.1/tcp/9003",
+      "address": "/ip4/192.168.1.232/tcp/9003",
       "hostname": "node-3",
       "authority_key": "tLmqLnJzoiud0W39LJ0w5pSkv7qbQ7J7cSMErw/0Sf5mV9JPa4dirEkx7bRg9yCaD472gQZuZju9uFEzR2T3LUef0Ooo6O6HIeptMAqZvZXxHb5L4Xx3R4DH3Y2vKjAB",
       "protocol_key": "2EhvdGj7yPTg2fPLQOy6ytlApvgpUhgc1nxzsPEkGCA=",
