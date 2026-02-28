@@ -705,124 +705,116 @@ impl CommitProcessor {
 
             let mut retry_count = 0;
             loop {
-                    match client
-                        .send_committed_subdag(
-                            subdag,
-                            epoch,
-                            global_exec_index,
-                            leader_address.clone(),
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            info!("✅ [TX FLOW] Successfully sent committed subdag: global_exec_index={}, commit_index={}",
+                match client
+                    .send_committed_subdag(subdag, epoch, global_exec_index, leader_address.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        info!("✅ [TX FLOW] Successfully sent committed subdag: global_exec_index={}, commit_index={}",
                                 global_exec_index, commit_index);
 
-                            // Update shared last global exec index for monitoring visibility
-                            if let Some(shared_index) = shared_last_global_exec_index.clone() {
-                                let mut index_guard = shared_index.lock().await;
-                                *index_guard = global_exec_index;
-                                info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} after successful send", global_exec_index);
+                        if let Some(shared_index) = shared_last_global_exec_index.clone() {
+                            let mut index_guard = shared_index.lock().await;
+                            *index_guard = global_exec_index;
+                            info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} after successful send", global_exec_index);
+                        }
+
+                        // Track committed transaction hashes to prevent duplicates during epoch transitions
+                        // CRITICAL: Only track when commit is actually processed, not just submitted
+                        //
+                        // FIX 2026-02-06: Use try_lock() to avoid deadlock with transition handler
+                        // The transition handler may hold the node lock while waiting for Go to sync.
+                        // If we block here, CommitProcessor stalls and Go never gets more commits = DEADLOCK.
+                        // If lock is unavailable, skip tracking - next commit will retry.
+                        if let Some(node_arc) = crate::node::get_transition_handler_node().await {
+                            // Use try_lock() instead of lock().await to avoid blocking
+                            let node_guard = match node_arc.try_lock() {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    // Lock held by transition handler - skip TX tracking to avoid deadlock
+                                    trace!("⏭️ [TX TRACKING] Skipping tracking for commit {} - node lock held by transition handler", commit_index);
+                                    break; // Exit the retry loop, commit was sent successfully
+                                }
+                            };
+                            let mut hashes_guard =
+                                node_guard.committed_transaction_hashes.lock().await;
+
+                            let mut tracked_count = 0;
+                            let mut batch_hashes = Vec::new();
+                            for block in &subdag.blocks {
+                                for tx in block.transactions() {
+                                    let tx_hash = crate::types::tx_hash::calculate_transaction_hash(
+                                        tx.data(),
+                                    );
+                                    let hash_hex = hex::encode(&tx_hash);
+
+                                    // Special debug logging for the problematic transaction
+                                    if hash_hex.starts_with("44a535f2") {
+                                        warn!("🔍 [DEBUG] Committing problematic transaction {} in commit #{} (global_exec_index={})",
+                                                  hash_hex, commit_index, global_exec_index);
+                                    }
+
+                                    hashes_guard.insert(tx_hash.clone());
+                                    batch_hashes.push(tx_hash);
+                                    tracked_count += 1;
+                                }
                             }
 
-                            // Track committed transaction hashes to prevent duplicates during epoch transitions
-                            // CRITICAL: Only track when commit is actually processed, not just submitted
-                            //
-                            // FIX 2026-02-06: Use try_lock() to avoid deadlock with transition handler
-                            // The transition handler may hold the node lock while waiting for Go to sync.
-                            // If we block here, CommitProcessor stalls and Go never gets more commits = DEADLOCK.
-                            // If lock is unavailable, skip tracking - next commit will retry.
-                            if let Some(node_arc) = crate::node::get_transition_handler_node().await
-                            {
-                                // Use try_lock() instead of lock().await to avoid blocking
-                                let node_guard = match node_arc.try_lock() {
-                                    Ok(guard) => guard,
-                                    Err(_) => {
-                                        // Lock held by transition handler - skip TX tracking to avoid deadlock
-                                        trace!("⏭️ [TX TRACKING] Skipping tracking for commit {} - node lock held by transition handler", commit_index);
-                                        break; // Exit the retry loop, commit was sent successfully
-                                    }
-                                };
-                                let mut hashes_guard =
-                                    node_guard.committed_transaction_hashes.lock().await;
-
-                                let mut tracked_count = 0;
-                                let mut batch_hashes = Vec::new();
-                                for block in &subdag.blocks {
-                                    for tx in block.transactions() {
-                                        let tx_hash =
-                                            crate::types::tx_hash::calculate_transaction_hash(
-                                                tx.data(),
-                                            );
-                                        let hash_hex = hex::encode(&tx_hash);
-
-                                        // Special debug logging for the problematic transaction
-                                        if hash_hex.starts_with("44a535f2") {
-                                            warn!("🔍 [DEBUG] Committing problematic transaction {} in commit #{} (global_exec_index={})",
-                                                  hash_hex, commit_index, global_exec_index);
-                                        }
-
-                                        hashes_guard.insert(tx_hash.clone());
-                                        batch_hashes.push(tx_hash);
-                                        tracked_count += 1;
-                                    }
-                                }
-
-                                // Also save to persistent storage for epoch transition recovery (in ONE batch!)
-                                if !batch_hashes.is_empty() {
-                                    if let Err(e) = crate::node::transition::save_committed_transaction_hashes_batch(
+                            // Also save to persistent storage for epoch transition recovery (in ONE batch!)
+                            if !batch_hashes.is_empty() {
+                                if let Err(e) = crate::node::transition::save_committed_transaction_hashes_batch(
                                         &node_guard.storage_path, epoch, &batch_hashes
                                     ).await {
                                         warn!("⚠️ [TX TRACKING] Failed to persist committed hashes after commit: {}", e);
                                     } else {
                                         trace!("💾 [TX TRACKING] Persisted {} committed hashes for epoch {}", batch_hashes.len(), epoch);
                                     }
-                                }
-
-                                if tracked_count > 0 {
-                                    info!("💾 [TX TRACKING] Tracked {} committed transaction hashes after processing commit #{} (global_exec_index={})",
-                                          tracked_count, commit_index, global_exec_index);
-                                }
                             }
 
+                            if tracked_count > 0 {
+                                info!("💾 [TX TRACKING] Tracked {} committed transaction hashes after processing commit #{} (global_exec_index={})",
+                                          tracked_count, commit_index, global_exec_index);
+                            }
+                        }
+
+                        break;
+                    }
+                    Err(e) => {
+                        // Case 1: Duplicate index - Critical Fork Safety check
+                        if e.to_string().contains("Duplicate global_exec_index") {
+                            error!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! Skipping commit {} to prevent fork. Error: {}", 
+                                    global_exec_index, commit_index, e);
                             break;
                         }
-                        Err(e) => {
-                            // Case 1: Duplicate index - Critical Fork Safety check
-                            if e.to_string().contains("Duplicate global_exec_index") {
-                                error!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected! Skipping commit {} to prevent fork. Error: {}", 
-                                    global_exec_index, commit_index, e);
-                                break;
-                            }
 
-                            // Case 2: System Transaction (EndOfEpoch) failed - Retry needed
-                            if has_system_tx {
-                                retry_count += 1;
-                                error!("🚨 [CRITICAL] Failed to send commit {} containing EndOfEpoch transaction (Attempt {}). Retrying in 1s... Error: {}", 
+                        // Case 2: System Transaction (EndOfEpoch) failed - Retry needed
+                        if has_system_tx {
+                            retry_count += 1;
+                            error!("🚨 [CRITICAL] Failed to send commit {} containing EndOfEpoch transaction (Attempt {}). Retrying in 1s... Error: {}", 
                                     commit_index, retry_count, e);
 
-                                sleep(Duration::from_secs(1)).await;
-                                continue;
-                            }
-
-                            // Case 3: Regular transaction failure
-                            warn!("⚠️  [TX FLOW] Failed to send committed subdag: {}", e);
-                            if let Some(ref queue) = pending_transactions_queue {
-                                Self::queue_commit_transactions_for_next_epoch(
-                                    subdag,
-                                    queue,
-                                    commit_index,
-                                    global_exec_index,
-                                    epoch,
-                                )
-                                .await;
-                            } else {
-                                warn!("⚠️  [TX FLOW] No pending_transactions_queue - transactions may be lost!");
-                            }
-                            break;
+                            sleep(Duration::from_secs(1)).await;
+                            continue;
                         }
+
+                        // Case 3: Regular transaction failure
+                        warn!("⚠️  [TX FLOW] Failed to send committed subdag: {}", e);
+                        if let Some(ref queue) = pending_transactions_queue {
+                            Self::queue_commit_transactions_for_next_epoch(
+                                subdag,
+                                queue,
+                                commit_index,
+                                global_exec_index,
+                                epoch,
+                            )
+                            .await;
+                        } else {
+                            warn!("⚠️  [TX FLOW] No pending_transactions_queue - transactions may be lost!");
+                        }
+                        break;
                     }
                 }
+            }
         } else {
             info!("ℹ️  [TX FLOW] Executor client not enabled, skipping send");
         }
