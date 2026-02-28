@@ -41,3 +41,9 @@ Các session mong đợi:
 Log nằm tại: `Mysticeti/metanode/logs/node_N/`
 - Rust log: `tail -f logs/node_0/rust.log`
 - Go log: `tail -f logs/node_0/go-master-stdout.log`
+
+## 6. Cấu hình Công cụ (tx_sender, block_hash_checker)
+Đảm bảo các công cụ kết nối đúng IP của Node 0:
+- **tx_sender**: Đã cập nhật `cmd/tool/tx_sender/config.json` để trỏ về `192.168.1.231:4200`.
+- **block_hash_checker**: Nếu chạy từ máy khác, hãy đổi `localhost:8747` thành `192.168.1.231:8747`.
+
