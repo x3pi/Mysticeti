@@ -692,12 +692,19 @@ impl CommitProcessor {
                 "🔷 [Global Index: {}] Executing commit #{} (epoch={}): {} blocks, {} txs, has_system_tx={}",
                 global_exec_index, commit_index, epoch, subdag.blocks.len(), total_transactions, has_system_tx
             );
+        } else {
+            // Still log empty commits but as trace/debug to avoid spam
+            tracing::trace!(
+                "⏭️ [TX FLOW] Forwarding empty commit to Go Master (for sequence sync): global_exec_index={}, commit_index={}",
+                global_exec_index, commit_index
+            );
+        }
 
-            if let Some(ref client) = executor_client {
-                // leader_address already calculated and validated above
+        if let Some(ref client) = executor_client {
+            // leader_address already calculated and validated above
 
-                let mut retry_count = 0;
-                loop {
+            let mut retry_count = 0;
+            loop {
                     match client
                         .send_committed_subdag(
                             subdag,
@@ -816,36 +823,8 @@ impl CommitProcessor {
                         }
                     }
                 }
-            } else {
-                info!("ℹ️  [TX FLOW] Executor client not enabled, skipping send");
-            }
         } else {
-            // Empty commit handling (heartbeat/tick)
-            // CRITICAL FIX: Use calculated leader_address, NOT None!
-            if let Some(ref client) = executor_client {
-                match client
-                    .send_committed_subdag(subdag, epoch, global_exec_index, leader_address.clone())
-                    .await
-                {
-                    Ok(_) => {
-                        info!("✅ [TX FLOW] Successfully sent empty commit: global_exec_index={}, commit_index={}",
-                            global_exec_index, commit_index);
-
-                        if let Some(shared_index) = shared_last_global_exec_index.clone() {
-                            let mut index_guard = shared_index.lock().await;
-                            *index_guard = global_exec_index;
-                            info!("📊 [GLOBAL_EXEC_INDEX] Updated shared last_global_exec_index to {} for empty commit", global_exec_index);
-                        }
-                    }
-                    Err(e) => {
-                        if e.to_string().contains("Duplicate global_exec_index") {
-                            warn!("🚨 [FORK-SAFETY] Duplicate global_exec_index={} detected for empty commit. Skipping.", global_exec_index);
-                        } else {
-                            warn!("⚠️  Failed to send empty subdag: {}", e);
-                        }
-                    }
-                }
-            }
+            info!("ℹ️  [TX FLOW] Executor client not enabled, skipping send");
         }
 
         Ok(())

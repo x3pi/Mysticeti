@@ -497,7 +497,7 @@ impl RustSyncNode {
                 if !peer_addresses.is_empty() {
                     // Query peers for correct epoch boundary
                     match query_peer_epochs_network(&peer_addresses).await {
-                        Ok((peer_epoch, peer_block, best_peer)) => {
+                        Ok((peer_epoch, peer_block, best_peer, _peer_global_exec_index)) => {
                             info!(
                                 "🌐 [PEER-DISCOVERY] Best peer: epoch={}, block={}, addr={}",
                                 peer_epoch, peer_block, best_peer

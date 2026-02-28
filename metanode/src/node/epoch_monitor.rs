@@ -74,7 +74,7 @@ pub fn start_unified_epoch_monitor(
                 if !peer_rpc.is_empty() {
                     // WAN-based discovery (TCP) - recommended for cross-node sync
                     match crate::network::peer_rpc::query_peer_epochs_network(&peer_rpc).await {
-                        Ok((epoch, _block, peer)) => {
+                        Ok((epoch, _block, peer, _global_exec_index)) => {
                             if epoch > local_go_epoch {
                                 info!(
                                     "🌐 [EPOCH MONITOR] Network epoch {} from peer {} is AHEAD of local Go epoch {}",

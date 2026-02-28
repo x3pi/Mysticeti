@@ -167,7 +167,7 @@ pub struct TrustedCommit {
 }
 
 impl TrustedCommit {
-    pub(crate) fn new_trusted(commit: Commit, serialized: Bytes) -> Self {
+    pub fn new_trusted(commit: Commit, serialized: Bytes) -> Self {
         let digest = Self::compute_digest(&serialized);
         Self {
             inner: Arc::new(commit),

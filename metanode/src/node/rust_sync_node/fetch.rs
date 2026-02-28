@@ -344,10 +344,11 @@ impl RustSyncNode {
 
         // Phase 3: Push commits with their blocks to queue
         let mut pushed = 0;
+        let mut write_batch = consensus_core::storage::WriteBatch::default();
         {
             let mut queue = self.block_queue.lock().await;
 
-            for commit in temp_commits {
+            for (commit, serialized_commit) in temp_commits.into_iter().zip(serialized_commits) {
                 // Collect blocks for this commit
                 let mut commit_blocks = Vec::new();
                 for block_ref in commit.blocks() {
@@ -439,12 +440,36 @@ impl RustSyncNode {
                         block_epoch, current_epoch, global_idx
                     );
                 }
+
+                // Prepare storage persistence
+                if will_add {
+                    write_batch.blocks.extend(commit_blocks.clone());
+                    let trusted_commit = consensus_core::TrustedCommit::new_trusted(
+                        commit.clone(),
+                        serialized_commit.into(),
+                    );
+                    write_batch.commits.push(trusted_commit);
+                }
+
                 queue.push(CommitData {
                     commit,
                     blocks: commit_blocks,
                     epoch: block_epoch,
                 });
                 pushed += 1;
+            }
+        }
+
+        // Persist to store if configured
+        if pushed > 0 {
+            if let Some(store) = &self.store {
+                if !write_batch.commits.is_empty() || !write_batch.blocks.is_empty() {
+                    if let Err(e) = store.write(write_batch) {
+                        warn!("⚠️ [RUST-SYNC] Failed to persist fetched blocks/commits to Store: {}", e);
+                    } else {
+                        debug!("💾 [RUST-SYNC] Persisted synced commits and blocks to Store");
+                    }
+                }
             }
         }
 
@@ -584,6 +609,7 @@ impl RustSyncNode {
 
                     // Push commits with their blocks to queue
                     let mut pushed = 0;
+                    let mut chunk_write_batch = consensus_core::storage::WriteBatch::default();
                     {
                         let mut queue = self.block_queue.lock().await;
 
@@ -598,6 +624,17 @@ impl RustSyncNode {
                             let epoch_from_peer = global_info.epoch;
                             let global_idx = global_info.global_exec_index;
 
+                            let will_add = global_idx >= queue.next_expected() && !queue.pending.contains_key(&global_idx);
+
+                            if will_add {
+                                chunk_write_batch.blocks.extend(commit_blocks.clone());
+                                let trusted_commit = consensus_core::TrustedCommit::new_trusted(
+                                    commit.clone(),
+                                    global_info.commit_data.clone(),
+                                );
+                                chunk_write_batch.commits.push(trusted_commit);
+                            }
+
                             info!(
                                 "📋 [GLOBAL-SYNC] Commit: global_exec_index={}, epoch={}, local_commit={}, blocks={}",
                                 global_idx, epoch_from_peer, global_info.local_commit_index, commit_blocks.len()
@@ -609,6 +646,19 @@ impl RustSyncNode {
                                 epoch: epoch_from_peer,
                             });
                             pushed += 1;
+                        }
+                    }
+
+                    // Persist to store if configured
+                    if pushed > 0 {
+                        if let Some(store) = &self.store {
+                            if !chunk_write_batch.commits.is_empty() || !chunk_write_batch.blocks.is_empty() {
+                                if let Err(e) = store.write(chunk_write_batch) {
+                                    warn!("⚠️ [GLOBAL-SYNC] Failed to persist blocks/commits to Store: {}", e);
+                                } else {
+                                    debug!("💾 [GLOBAL-SYNC] Persisted synced commits and blocks to Store");
+                                }
+                            }
                         }
                     }
 

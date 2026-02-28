@@ -34,6 +34,8 @@ pub struct PeerRpcServer {
     executor_client: Arc<ExecutorClient>,
     /// Optional transaction submitter for forwarding transactions to consensus
     transaction_submitter: Option<Arc<dyn TransactionSubmitter>>,
+    /// Shared index to get the last global execution index
+    shared_last_global_exec_index: Arc<tokio::sync::Mutex<u64>>,
 }
 
 impl PeerRpcServer {
@@ -43,6 +45,7 @@ impl PeerRpcServer {
         port: u16,
         network_address: String,
         executor_client: Arc<ExecutorClient>,
+        shared_last_global_exec_index: Arc<tokio::sync::Mutex<u64>>,
     ) -> Self {
         Self {
             node_id,
@@ -50,6 +53,7 @@ impl PeerRpcServer {
             network_address,
             executor_client,
             transaction_submitter: None,
+            shared_last_global_exec_index,
         }
     }
 
@@ -73,6 +77,7 @@ impl PeerRpcServer {
         let transaction_submitter = self.transaction_submitter.clone();
         let node_id = self.node_id;
         let network_address = self.network_address.clone();
+        let shared_index_arc = self.shared_last_global_exec_index.clone();
 
         loop {
             let (mut stream, peer_addr) = match listener.accept().await {
@@ -86,6 +91,7 @@ impl PeerRpcServer {
             let executor = Arc::clone(&executor_client);
             let submitter = transaction_submitter.clone();
             let net_addr = network_address.clone();
+            let shared_exec_index = shared_index_arc.clone();
 
             tokio::spawn(async move {
                 // Read HTTP request (handle full POST bodies)
@@ -156,7 +162,7 @@ impl PeerRpcServer {
 
                 // Route request
                 if request.starts_with("GET /peer_info") {
-                    Self::handle_peer_info(&mut stream, &executor, node_id, &net_addr).await;
+                    Self::handle_peer_info(&mut stream, &executor, node_id, &net_addr, &shared_exec_index).await;
                 } else if request.starts_with("GET /get_epoch_boundary_data") {
                     Self::handle_get_epoch_boundary_data(&mut stream, &executor, &request).await;
                 } else if request.starts_with("GET /get_blocks") {
@@ -181,6 +187,7 @@ impl PeerRpcServer {
         executor: &Arc<ExecutorClient>,
         node_id: usize,
         network_address: &str,
+        shared_exec_index: &Arc<tokio::sync::Mutex<u64>>,
     ) {
         // Query epoch and block from Go Master
         let epoch = match executor.get_current_epoch().await {
@@ -214,10 +221,16 @@ impl PeerRpcServer {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
+        let last_global_exec_index = {
+            let guard = shared_exec_index.lock().await;
+            *guard
+        };
+
         let info = PeerInfoResponse {
             node_id,
             epoch,
             last_block,
+            last_global_exec_index,
             network_address: network_address.to_string(),
             timestamp_ms,
         };
@@ -233,8 +246,8 @@ impl PeerRpcServer {
         }
 
         info!(
-            "🌐 [PEER RPC] Served /peer_info: epoch={}, last_block={}",
-            epoch, last_block
+            "🌐 [PEER RPC] Served /peer_info: epoch={}, last_block={}, global_exec_index={}",
+            epoch, last_block, last_global_exec_index
         );
     }
 
@@ -388,8 +401,8 @@ impl PeerRpcServer {
             return;
         };
 
-        // Limit batch size to prevent DoS
-        let max_batch = 100u64;
+        // Limit batch size to prevent DoS or timeouts on huge blocks (200MB+)
+        let max_batch = 5u64;
         let actual_to = std::cmp::min(to, from + max_batch - 1);
 
         info!(

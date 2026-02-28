@@ -109,7 +109,7 @@ impl CatchupManager {
         };
 
         // 2. Get Network State from Peers (TCP-based only)
-        let (network_epoch, network_block, _best_peer) = if !self.peer_rpc_addresses.is_empty() {
+        let (network_epoch, network_block, _best_peer, network_commit) = if !self.peer_rpc_addresses.is_empty() {
             info!(
                 "🌐 [CATCHUP] Using WAN peer discovery ({} peers configured)",
                 self.peer_rpc_addresses.len()
@@ -117,8 +117,8 @@ impl CatchupManager {
             match query_peer_epochs_network(&self.peer_rpc_addresses).await {
                 Ok(res) => {
                     info!(
-                        "✅ [CATCHUP] WAN peer query success: epoch={}, block={}, peer={}",
-                        res.0, res.1, res.2
+                        "✅ [CATCHUP] WAN peer query success: epoch={}, block={}, global_exec_index={}, peer={}",
+                        res.0, res.1, res.3, res.2
                     );
                     res
                 }
@@ -127,12 +127,12 @@ impl CatchupManager {
                         "⚠️ [CATCHUP] WAN peer query failed ({}), using local state",
                         e
                     );
-                    (local_go_epoch, local_go_last_block, "local".to_string())
+                    (local_go_epoch, local_go_last_block, "local".to_string(), local_last_commit)
                 }
             }
         } else {
             // No peers configured (single node?), assume we are the network
-            (local_go_epoch, local_go_last_block, "local".to_string())
+            (local_go_epoch, local_go_last_block, "local".to_string(), local_last_commit)
         };
 
         // 3. Compare States
@@ -141,7 +141,11 @@ impl CatchupManager {
         let epoch_match = local_go_epoch == network_epoch;
 
         // Calculate gaps
-        let commit_gap = if epoch_match { 0 } else { u64::MAX };
+        let commit_gap = if epoch_match {
+            network_commit.saturating_sub(local_last_commit)
+        } else {
+            u64::MAX
+        };
 
         let block_gap = if epoch_match {
             network_block.saturating_sub(local_go_last_block)
@@ -149,8 +153,8 @@ impl CatchupManager {
             u64::MAX
         };
 
-        // Ready condition: Same Epoch + Block Gap is small
-        let ready = epoch_match && block_gap <= BLOCK_CATCHUP_THRESHOLD;
+        // Ready condition: Same Epoch + Commit Gap AND Block Gap are small
+        let ready = epoch_match && commit_gap <= BLOCK_CATCHUP_THRESHOLD && block_gap <= BLOCK_CATCHUP_THRESHOLD;
 
         let status = SyncStatus {
             go_epoch: network_epoch,
@@ -163,9 +167,10 @@ impl CatchupManager {
         };
 
         info!(
-            "📊 [CATCHUP] Sync status: Local[Ep={}, GoEp={}, Blk={}, Cmt={}] vs Network[Ep={}, Blk={}] -> Gap={} blocks. Ready={}",
+            "📊 [CATCHUP] Sync status: Local[Ep={}, GoEp={}, Blk={}, Cmt={}] vs Network[Ep={}, Blk={}, Cmt={}] -> Gap={} commits, {} blocks. Ready={}",
             local_epoch, local_go_epoch, local_go_last_block, local_last_commit,
-            network_epoch, network_block,
+            network_epoch, network_block, network_commit,
+            if commit_gap == u64::MAX { "∞".to_string() } else { commit_gap.to_string() },
             if block_gap == u64::MAX { "∞".to_string() } else { block_gap.to_string() },
             ready
         );

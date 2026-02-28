@@ -85,8 +85,10 @@ pub async fn query_peer_info(peer_address: &str) -> Result<PeerInfoResponse> {
     Ok(info)
 }
 
-/// Query multiple peers and return the best one (highest epoch/block)
-pub async fn query_peer_epochs_network(peer_addresses: &[String]) -> Result<(u64, u64, String)> {
+/// Query multiple peers and return the best one (highest epoch/block/global_exec_index)
+pub async fn query_peer_epochs_network(
+    peer_addresses: &[String],
+) -> Result<(u64, u64, String, u64)> {
     info!(
         "🌐 [PEER RPC] Querying {} peer(s) over network for epoch discovery...",
         peer_addresses.len()
@@ -95,26 +97,28 @@ pub async fn query_peer_epochs_network(peer_addresses: &[String]) -> Result<(u64
     let mut best_epoch = 0u64;
     let mut best_block = 0u64;
     let mut best_address = String::new();
+    let mut best_global_exec_index = 0u64;
 
     for peer_addr in peer_addresses {
         match query_peer_info(peer_addr).await {
             Ok(info) => {
                 info!(
-                    "🌐 [PEER RPC] Peer ({}): epoch={}, block={}",
-                    peer_addr, info.epoch, info.last_block
+                    "🌐 [PEER RPC] Peer ({}): epoch={}, block={}, global_exec_index={}",
+                    peer_addr, info.epoch, info.last_block, info.last_global_exec_index
                 );
 
-                // Use this peer if it has higher epoch or higher block
+                // Use this peer if it has higher epoch, or same epoch and higher global_exec_index
                 if best_address.is_empty()
                     || info.epoch > best_epoch
-                    || (info.epoch == best_epoch && info.last_block > best_block)
+                    || (info.epoch == best_epoch && info.last_global_exec_index > best_global_exec_index)
                 {
                     best_epoch = info.epoch;
                     best_block = info.last_block;
+                    best_global_exec_index = info.last_global_exec_index;
                     best_address = peer_addr.clone();
                     info!(
-                        "🌐 [PEER RPC] New best peer: epoch={} block={} from {}",
-                        best_epoch, best_block, peer_addr
+                        "🌐 [PEER RPC] New best peer: epoch={} block={} global_exec_index={} from {}",
+                        best_epoch, best_block, best_global_exec_index, peer_addr
                     );
                 }
             }
@@ -129,11 +133,11 @@ pub async fn query_peer_epochs_network(peer_addresses: &[String]) -> Result<(u64
     }
 
     info!(
-        "🌐 [PEER RPC] Best peer found: epoch={} block={} from {}",
-        best_epoch, best_block, best_address
+        "🌐 [PEER RPC] Best peer found: epoch={} block={} global_exec_index={} from {}",
+        best_epoch, best_block, best_global_exec_index, best_address
     );
 
-    Ok((best_epoch, best_block, best_address))
+    Ok((best_epoch, best_block, best_address, best_global_exec_index))
 }
 
 /// Query epoch boundary data from a remote peer via HTTP
@@ -382,7 +386,7 @@ pub async fn fetch_blocks_from_peer(
     );
 
     let mut all_blocks = Vec::new();
-    let batch_size = 50u64; // Larger batches to reduce HTTP roundtrip overhead (server supports up to 100)
+    let batch_size = 5u64; // Smaller batches to avoid 1GB+ JSON payloads
     let mut current_from = from_block;
 
     while current_from <= to_block {
@@ -463,7 +467,7 @@ async fn fetch_block_batch(
     // Read response with timeout (block data can be large)
     let mut buffer = Vec::new();
     let mut temp = [0u8; 65536]; // 64KB buffer for block data
-    let read_result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+    let read_result = tokio::time::timeout(std::time::Duration::from_secs(300), async {
         loop {
             match stream.read(&mut temp).await {
                 Ok(0) => break,

@@ -12,6 +12,7 @@ use consensus_core::Context;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+use consensus_core::storage::rocksdb_store::RocksDBStore;
 
 /// Start the Rust P2P sync task for SyncOnly nodes
 #[allow(dead_code)]
@@ -83,6 +84,9 @@ pub async fn start_rust_sync_task_with_network(
 
     let metrics = SyncMetrics::new(prometheus::default_registry());
 
+    let store_path = context.parameters.db_path.as_path().to_str().unwrap();
+    let store = Arc::new(RocksDBStore::new(store_path));
+
     let sync_node = RustSyncNode::new(
         executor_client,
         epoch_transition_sender,
@@ -92,7 +96,8 @@ pub async fn start_rust_sync_task_with_network(
     )
     .with_network(context, network_keypair, committee)
     .with_peer_rpc_addresses(peer_rpc_addresses)
-    .with_metrics(metrics);
+    .with_metrics(metrics)
+    .with_store(store);
 
     Ok(sync_node.start())
 }

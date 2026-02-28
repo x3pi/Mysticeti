@@ -112,6 +112,8 @@ pub struct RustSyncNode {
     pub(crate) metrics: SyncMetrics,
     /// Peer health tracker for circuit breaker pattern
     pub(crate) peer_health: Arc<Mutex<PeerHealthTracker>>,
+    /// Optional store to persist fetched blocks and commits, bypassing Validator sync
+    pub(crate) store: Option<Arc<dyn consensus_core::storage::Store>>,
 }
 
 impl RustSyncNode {
@@ -147,6 +149,7 @@ impl RustSyncNode {
             network_keypair: None,
             metrics: SyncMetrics::new_for_test(),
             peer_health: Arc::new(Mutex::new(PeerHealthTracker::new())),
+            store: None,
         }
     }
 
@@ -174,6 +177,12 @@ impl RustSyncNode {
     /// Set Prometheus metrics (overrides the default test registry)
     pub fn with_metrics(mut self, metrics: SyncMetrics) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Set an optional Store to persist fetched blocks and commits
+    pub fn with_store(mut self, store: Arc<dyn consensus_core::storage::Store>) -> Self {
+        self.store = Some(store);
         self
     }
 }

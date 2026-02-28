@@ -14,6 +14,9 @@ pub struct PeerInfoResponse {
     pub epoch: u64,
     /// Last executed block number
     pub last_block: u64,
+    /// Last global execution index (Rust consensus index)
+    #[serde(default)]
+    pub last_global_exec_index: u64,
     /// Network address of this node
     pub network_address: String,
     /// Timestamp of response (Unix ms)
