@@ -45,5 +45,12 @@ Log nằm tại: `Mysticeti/metanode/logs/node_N/`
 ## 6. Cấu hình Công cụ (tx_sender, block_hash_checker)
 Đảm bảo các công cụ kết nối đúng IP của Node 0:
 - **tx_sender**: Đã cập nhật `cmd/tool/tx_sender/config.json` để trỏ về `192.168.1.231:4200`.
-- **block_hash_checker**: Nếu chạy từ máy khác, hãy đổi `localhost:8747` thành `192.168.1.231:8747`.
+- **block_hash_checker**: Đổi `localhost:8747` thành `192.168.1.231:8747`.
 
+## 7. Đo TPS riêng trên Node 0
+Sử dụng script tps_blast mới để đo throughput của riêng Node 0:
+```bash
+cd mtn-simple-2025/cmd/tool/tps_blast
+./run_node0_only_load.sh [số_clients] [số_tx_mỗi_client]
+```
+Ví dụ: `./run_node0_only_load.sh 10 20000` sẽ gửi tổng cộng 200,000 TX tới Node 0.
