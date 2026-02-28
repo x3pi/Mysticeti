@@ -83,18 +83,8 @@ rm -f /tmp/executor0.sock /tmp/rust-go-node0-master.sock /tmp/metanode-tx-0.sock
 
 echo -e "${GREEN}  ✅ Node 0 data cleaned${NC}"
 
-# Step 3: Sync committee to genesis (Important to do this ONCE)
-echo -e "${BLUE}📋 Step 3: Sync committee to genesis...${NC}"
-COMMITTEE_FILE="$METANODE_ROOT/config/committee.json"
-GENESIS_FILE="$GO_SIMPLE_ROOT/genesis.json"
-if [ -f "$COMMITTEE_FILE" ] && [ -f "$GENESIS_FILE" ]; then
-    cd "$METANODE_ROOT"
-    python3 scripts/sync_committee_to_genesis.py "$COMMITTEE_FILE" "$GENESIS_FILE"
-    echo -e "${GREEN}  ✅ Committee synced to genesis${NC}"
-fi
-
 # Step 4: Start Go Master 0
-echo -e "${BLUE}📋 Step 4: Start Go Master 0...${NC}"
+echo -e "${BLUE}📋 Step 3: Start Go Master 0...${NC}"
 cd "$GO_SIMPLE_ROOT"
 XAPIAN="sample/$DATA/data/data/xapian_node"
 PPROF_ARG="--pprof-addr=localhost:6060"

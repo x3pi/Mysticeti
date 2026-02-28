@@ -71,35 +71,6 @@ mkdir -p "$LOG_DIR/node_$NODE_ID"
 
 echo -e "${GREEN}  ✅ Data cleaned${NC}"
 
-# ─── Step 3: Reset genesis timestamp ─────────────────────────
-echo -e "${BLUE}📋 Step 3: Reset genesis timestamp...${NC}"
-
-GENESIS_PATH="$GO_SIMPLE_ROOT/genesis.json"
-if [ -f "$GENESIS_PATH" ]; then
-    python3 << PYEOF
-import json, time
-genesis_path = "$GENESIS_PATH"
-current_ms = int(time.time() * 1000)
-try:
-    with open(genesis_path, 'r') as f:
-        genesis = json.load(f)
-    if 'config' not in genesis:
-        genesis['config'] = {}
-    old_ts = genesis['config'].get('epoch_timestamp_ms', 0)
-    genesis['config']['epoch_timestamp_ms'] = current_ms
-    with open(genesis_path, 'w') as f:
-        json.dump(genesis, f, indent=2)
-    print(f"  ✅ Reset epoch_timestamp_ms: {old_ts} -> {current_ms}")
-except Exception as e:
-    print(f"  ⚠️  Could not reset timestamp: {e}")
-PYEOF
-else
-    echo -e "${YELLOW}  ⚠️ genesis.json not found${NC}"
-fi
-
-# Clean epoch backup files
-rm -f /tmp/epoch_data_backup.json /tmp/epoch_data_backup_*.json 2>/dev/null || true
-
-# ─── Step 4: Start via resume_node.sh ────────────────────────
-echo -e "${BLUE}📋 Step 4: Starting node $NODE_ID...${NC}"
+# ─── Step 3: Start via resume_node.sh ────────────────────────
+echo -e "${BLUE}📋 Step 3: Starting node $NODE_ID...${NC}"
 "$SCRIPT_DIR/resume_node.sh" "$NODE_ID"

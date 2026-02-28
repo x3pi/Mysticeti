@@ -123,32 +123,6 @@ rm -f /tmp/epoch_data_backup.json /tmp/epoch_data_backup_*.json 2>/dev/null || t
 echo -e "${GREEN}  ✅ All data cleaned, keys/configs preserved${NC}"
 
 # ==============================================================================
-# Step 4: Sync committee to genesis (CRITICAL)
-# ==============================================================================
-echo -e "${BLUE}📋 Step 4: Sync committee to genesis...${NC}"
-
-COMMITTEE_FILE="$METANODE_ROOT/config/committee.json"
-GENESIS_FILE="$GO_SIMPLE_ROOT/genesis.json"
-
-if [ -f "$COMMITTEE_FILE" ] && [ -f "$GENESIS_FILE" ]; then
-    cd "$METANODE_ROOT"
-    python3 scripts/sync_committee_to_genesis.py "$COMMITTEE_FILE" "$GENESIS_FILE"
-    echo -e "${GREEN}  ✅ Committee synced to genesis${NC}"
-else
-    if [ ! -f "$COMMITTEE_FILE" ]; then
-        echo -e "${RED}  ❌ committee.json not found! Run keygen first.${NC}"
-        exit 1
-    fi
-    if [ ! -f "$GENESIS_FILE" ]; then
-        echo -e "${YELLOW}  ⚠️ genesis.json not found, will be created fresh${NC}"
-    fi
-fi
-
-# ==============================================================================
-# Step 5: Start ALL Go Masters
-# ==============================================================================
-echo -e "${BLUE}📋 Step 5: Start all Go Masters...${NC}"
-cd "$GO_SIMPLE_ROOT"
 
 for id in 0 1 2 3 4; do
     DATA="${GO_DATA_DIR[$id]}"
