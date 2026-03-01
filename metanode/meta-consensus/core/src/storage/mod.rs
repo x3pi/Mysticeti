@@ -13,7 +13,7 @@ use consensus_config::AuthorityIndex;
 use consensus_types::block::{BlockRef, Round, TransactionIndex};
 
 use crate::{
-    CommitIndex,
+    CommitIndex, CommitDigest,
     block::VerifiedBlock,
     commit::{CommitInfo, CommitRange, CommitRef, TrustedCommit},
     error::ConsensusResult,
