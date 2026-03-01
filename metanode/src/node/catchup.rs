@@ -153,8 +153,12 @@ impl CatchupManager {
             u64::MAX
         };
 
-        // Ready condition: Same Epoch + Commit Gap AND Block Gap are small
-        let ready = epoch_match && commit_gap <= BLOCK_CATCHUP_THRESHOLD && block_gap <= BLOCK_CATCHUP_THRESHOLD;
+        // Ready condition: Same Epoch AND Block Gap is small
+        // We DO NOT check commit_gap here. Go only increments block_gap for blocks with TXs.
+        // Rust increments commit_gap for every consensus block (even empty ones).
+        // If we require commit_gap to be small, nodes resuming with large empty commit gaps
+        // will get stuck in an infinite loop and never start CommitSyncer.
+        let ready = epoch_match && block_gap <= BLOCK_CATCHUP_THRESHOLD;
 
         let status = SyncStatus {
             go_epoch: network_epoch,

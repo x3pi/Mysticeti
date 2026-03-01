@@ -20,7 +20,7 @@ use rand::seq::SliceRandom as _;
 use tap::TapFallible;
 use tokio::sync::broadcast;
 use tokio_util::sync::ReusableBoxFuture;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 
 use crate::{
     block::{BlockAPI as _, ExtendedBlock, SignedBlock, VerifiedBlock, GENESIS_ROUND},
@@ -43,7 +43,7 @@ use crate::{
     CommitIndex,
 };
 
-pub(crate) const COMMIT_LAG_MULTIPLIER: u32 = 5;
+pub(crate) const COMMIT_LAG_MULTIPLIER: u32 = 10000;
 
 /// Authority's network service implementation, agnostic to the actual networking stack used.
 pub(crate) struct AuthorityService<C: CoreThreadDispatcher> {
@@ -634,6 +634,7 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
 
         // If current store is empty, try legacy stores (for lagging node sync)
         let mut is_legacy = false;
+        let mut legacy_certifier_blocks = vec![];
         if commits.is_empty() {
             if let Some(ref legacy_manager) = self.legacy_store_manager {
                 for (epoch, legacy_store) in legacy_manager.get_all_stores() {
@@ -647,6 +648,13 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
                                 epoch,
                                 commit_range
                             );
+                            if let Some(c) = legacy_commits.last() {
+                                if let Ok(votes) = legacy_store.read_commit_votes(c.index(), c.digest()) {
+                                    if let Ok(blocks) = legacy_store.read_blocks(&votes) {
+                                        legacy_certifier_blocks = blocks.into_iter().flatten().collect();
+                                    }
+                                }
+                            }
                             commits = legacy_commits;
                             is_legacy = true; // Mark as legacy to skip current-committee validation
                             break;
@@ -687,34 +695,6 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
                     commits.pop();
                 }
             }
-        } else {
-            // For legacy commits, we still need certifier_block_refs to return the blocks of the certifiers?
-            // The return type is (Vec<TrustedCommit>, Vec<VerifiedBlock>).
-            // The 2nd element is `certifier_blocks`.
-            // If we skip the check, `certifier_block_refs` is empty.
-            // But checking the return value... `read_blocks(&certifier_block_refs)`.
-            // If empty, we return empty certifier blocks.
-            // Does the client need certifier blocks for Legacy commits?
-            // Usually SyncOnly client just needs the committed blocks.
-            // The Certifier Blocks are used to "prove" the commit is valid.
-            // But if it's legacy, maybe we trust it?
-
-            // Attempt to get votes for the last commit anyway, just to provide them?
-            // But we can't filter by quorum.
-            if let Some(c) = commits.last() {
-                let _index = c.index();
-                // We don't have the Legacy Store object here easily to read votes...
-                // Wait, we DO have it inside the loop, but now we are outside.
-                // BUT `self.store` is Current Store.
-                // Legacy commits came from `legacy_store`.
-                // We cannot read votes from `self.store` for legacy commit!
-
-                // So actually, for Legacy Commits, we probably can't provide certifier blocks easily
-                // unless we kept the `legacy_store` reference.
-                // But `certifier_blocks` are likely optional for syncing old history?
-                // Let's assume empty certifier blocks is fine for legacy sync.
-                info!("ℹ️ [LEGACY SYNC] Skipping quorum check and certifier blocks for legacy commits.");
-            }
         }
 
         // Log final commits being returned
@@ -728,12 +708,15 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
         } else {
             info!("⚠️ [FETCH-COMMITS] No commits to return after quorum check");
         }
-        let certifier_blocks = self
-            .store
-            .read_blocks(&certifier_block_refs)?
-            .into_iter()
-            .flatten()
-            .collect();
+        let certifier_blocks = if is_legacy {
+            legacy_certifier_blocks
+        } else {
+            self.store
+                .read_blocks(&certifier_block_refs)?
+                .into_iter()
+                .flatten()
+                .collect()
+        };
         Ok((commits, certifier_blocks))
     }
 

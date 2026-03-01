@@ -14,7 +14,7 @@
     },
     {
       "stake": 1000,
-      "address": "/ip4/192.168.1.232/tcp/9011",
+      "address": "/ip4/192.168.1.232/tcp/9001",
       "hostname": "node-1",
       "authority_key": "o/Hivn0pLsOHPpITXpa8erB+tpBdk1rYELr1bcBHz8R4te0SxU3wA9rjn4f/ZrKEERNEurUuMDaGHSNdgqlfwoWoMLo0mFgoburTsUkLpPYm2ch1UXaWv4shtHger7EM",
       "protocol_key": "ngmCtN3emEfN6PD/oOtB4YoBaHRFn1M3GzhdtdnZzLw=",
