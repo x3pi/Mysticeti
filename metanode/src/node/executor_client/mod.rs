@@ -255,7 +255,7 @@ impl ExecutorClient {
                     *next_expected_guard = go_next_expected;
                 }
                 info!("📊 [INIT] Updating next_expected_index from {} to {} (last_block_number={}, go_next_expected={})",
-                    current_next_expected, go_next_expected, last_block_number, go_next_expected);
+                    current_next_expected, go_next_expected, last_global_exec_index, go_next_expected);
 
                 // Clear any buffered commits that Go has already processed
                 let mut buffer = self.send_buffer.lock().await;
@@ -269,7 +269,7 @@ impl ExecutorClient {
             } else {
                 // Perfect match
                 info!("📊 [INIT] next_expected_index matches Go Master: last_block_number={}, next_expected={}", 
-                    last_block_number, current_next_expected);
+                    last_global_exec_index, current_next_expected);
             }
         } else {
             warn!("⚠️  [INIT] Could not determine last block number. Keeping current next_expected_index. Rust will continue sending blocks, Go will buffer and process sequentially.");
@@ -277,7 +277,7 @@ impl ExecutorClient {
 
         // ─── Readiness Signal ────────────────────────────────────────
         let final_next_expected = *self.next_expected_index.lock().await;
-        let go_conn_status = if last_block_number_opt.is_some() {
+        let go_conn_status = if last_global_exec_index_opt.is_some() {
             "connected"
         } else {
             "unknown"
@@ -286,7 +286,7 @@ impl ExecutorClient {
             "✅ [READY] Rust executor: go_connection={}, next_expected={}, go_last_block={}",
             go_conn_status,
             final_next_expected,
-            last_block_number_opt.map_or("unknown".to_string(), |n| n.to_string())
+            last_global_exec_index_opt.map_or("unknown".to_string(), |n| n.to_string())
         );
     }
 

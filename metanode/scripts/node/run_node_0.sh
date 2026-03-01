@@ -61,6 +61,14 @@ tmux kill-session -t "$GO_SUB_SESSION" 2>/dev/null || true
 tmux kill-session -t "$RUST_SESSION" 2>/dev/null || true
 sleep 2
 
+# Step 1.5: Build Rust and Go binaries
+echo -e "${BLUE}📋 Step 1.5: Build Rust and Go binaries...${NC}"
+echo "  🔄 Building Rust metanode..."
+cd "$METANODE_ROOT" && cargo build --release --bin metanode
+echo "  🔄 Building Go simple_chain..."
+cd "$GO_SIMPLE_ROOT" && go build -o simple_chain .
+echo -e "${GREEN}  ✅ Binaries ready${NC}"
+
 # Step 2: Clean Node 0 data
 echo -e "${BLUE}📋 Step 2: Clean Node 0 data...${NC}"
 DATA="$GO_DATA_DIR"

@@ -62,6 +62,14 @@ for id in 1 2 3; do
 done
 sleep 2
 
+# Step 1.5: Build Rust and Go binaries
+echo -e "${BLUE}📋 Step 1.5: Build Rust and Go binaries...${NC}"
+echo "  🔄 Building Rust metanode..."
+cd "$METANODE_ROOT" && cargo build --release --bin metanode
+echo "  🔄 Building Go simple_chain..."
+cd "$GO_SIMPLE_ROOT" && go build -o simple_chain .
+echo -e "${GREEN}  ✅ Binaries ready${NC}"
+
 # Step 2: Clean data for Nodes 1, 2, 3
 echo -e "${BLUE}📋 Step 2: Clean data for Nodes 1, 2, 3...${NC}"
 for id in 1 2 3; do
