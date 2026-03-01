@@ -206,9 +206,9 @@ impl ExecutorClient {
             return;
         }
 
-        // Query Go Master for last block number (only once at startup)
-        let last_block_number_opt = match self.get_last_block_number().await {
-            Ok(n) => Some(n),
+        // Query Go Master for last_global_exec_index (using get_validators_at_block as a carrier)
+        let last_global_exec_index_opt = match self.get_validators_at_block(0).await {
+            Ok((_, _, gei)) => Some(gei),
             Err(e) => {
                 warn!("⚠️  [INIT] Failed to get last block number from Go Master: {}. Attempting to read persisted value.", e);
                 // Fallback to persisted last block number if available
@@ -232,8 +232,8 @@ impl ExecutorClient {
             }
         };
 
-        if let Some(last_block_number) = last_block_number_opt {
-            let go_next_expected = last_block_number + 1;
+        if let Some(last_global_exec_index) = last_global_exec_index_opt {
+            let go_next_expected = last_global_exec_index + 1;
 
             let current_next_expected = {
                 let next_expected_guard = self.next_expected_index.lock().await;
@@ -245,8 +245,8 @@ impl ExecutorClient {
             // - If Go is ahead: Update to Go's state (prevent sending duplicate commits)
             if go_next_expected < current_next_expected {
                 // Go is behind - keep current value (we have commits Go hasn't seen yet)
-                info!("📊 [INIT] Go Master is behind (last_block_number={}, go_next_expected={} < current_next_expected={}). Keeping current value to send pending commits.",
-                    last_block_number, go_next_expected, current_next_expected);
+                info!("📊 [INIT] Go Master is behind (last_global_exec_index={}, go_next_expected={} < current_next_expected={}). Keeping current value to send pending commits.",
+                    last_global_exec_index, go_next_expected, current_next_expected);
             } else if go_next_expected > current_next_expected {
                 // Go is ahead - update to Go's state to prevent sending duplicate commits
                 // Go has already processed commits up to last_block_number, so we should start from go_next_expected

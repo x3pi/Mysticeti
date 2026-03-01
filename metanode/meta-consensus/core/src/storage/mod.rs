@@ -54,7 +54,7 @@ pub trait Store: Send + Sync {
     fn scan_commits(&self, range: CommitRange) -> ConsensusResult<Vec<TrustedCommit>>;
 
     /// Reads all blocks voting on a particular commit.
-    fn read_commit_votes(&self, commit_index: CommitIndex) -> ConsensusResult<Vec<BlockRef>>;
+    fn read_commit_votes(&self, commit_index: CommitIndex, commit_digest: CommitDigest) -> ConsensusResult<Vec<BlockRef>>;
 
     /// Reads the last commit info, written atomically with the last commit.
     fn read_last_commit_info(&self) -> ConsensusResult<Option<(CommitRef, CommitInfo)>>;

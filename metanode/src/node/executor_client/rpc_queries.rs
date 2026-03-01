@@ -21,7 +21,7 @@ use super::persistence::persist_last_block_number;
 impl ExecutorClient {
     /// Get validators at a specific block number from Go state
     /// Used for startup (block 0) and epoch transition (last_global_exec_index)
-    pub async fn get_validators_at_block(&self, block_number: u64) -> Result<(Vec<ValidatorInfo>, u64)> {
+    pub async fn get_validators_at_block(&self, block_number: u64) -> Result<(Vec<ValidatorInfo>, u64, u64)> {
         if !self.is_enabled() {
             return Err(anyhow::anyhow!("Executor client is not enabled"));
         }
@@ -186,7 +186,7 @@ impl ExecutorClient {
                             auth_key_preview, validator.protocol_key, validator.network_key);
                     }
 
-                    return Ok((validator_info_list.validators, validator_info_list.epoch_timestamp_ms));
+                    return Ok((validator_info_list.validators, validator_info_list.epoch_timestamp_ms, validator_info_list.last_global_exec_index));
                 }
                 Some(proto::response::Payload::Error(error_msg)) => {
                     return Err(anyhow::anyhow!("Go returned error: {}", error_msg));

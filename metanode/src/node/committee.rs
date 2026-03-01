@@ -28,7 +28,7 @@ pub async fn build_committee_from_go_validators_at_block_with_epoch(
         attempt += 1;
 
         match executor_client.get_validators_at_block(current_block).await {
-            Ok((validators, _)) => {
+            Ok((validators, _, _)) => {
                 if !validators.is_empty() {
                     tracing::info!(
                         "✅ [COMMITTEE] Successfully got {} validators for block {} (epoch {})",

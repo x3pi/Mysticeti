@@ -324,7 +324,7 @@ impl ConsensusNode {
                                 "⚠️ [STARTUP] No epoch boundary available (local epoch {} error: {}). Using epoch 0 genesis.",
                                 local_epoch, e2
                             );
-                            let (genesis_validators, _genesis_epoch) = executor_client
+                            let (genesis_validators, _genesis_epoch, _) = executor_client
                                 .get_validators_at_block(0)
                                 .await
                                 .map_err(|e| {

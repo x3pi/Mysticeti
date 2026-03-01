@@ -664,7 +664,7 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
         if !is_legacy {
             'commit: while let Some(c) = commits.last() {
                 let index = c.index();
-                let votes = self.store.read_commit_votes(index)?;
+                let votes = self.store.read_commit_votes(index, c.digest())?;
                 let mut stake_aggregator = StakeAggregator::<QuorumThreshold>::new();
                 for v in &votes {
                     stake_aggregator.add(v.author, &self.context.committee);
